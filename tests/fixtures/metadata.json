@@ -1,0 +1,33 @@
+{
+  "profile": {
+    "name": "模拟验收项目",
+    "edition": "central",
+    "organizationId": "test-org",
+    "projectId": "test-project",
+    "businessProfiles": ["测试方向"],
+    "requiredFieldIds": [],
+    "fieldMappings": {},
+    "enableVersions": true,
+    "enableSprints": true,
+    "attachmentWarningMb": 50
+  },
+  "typeId": "bug-type",
+  "types": [{ "id": "bug-type", "name": "缺陷" }],
+  "fields": [
+    {
+      "id": "priority",
+      "name": "优先级",
+      "type": "SystemCustomField",
+      "format": "list",
+      "required": true,
+      "options": [{ "id": "p2", "name": "普通" }]
+    }
+  ],
+  "members": [{ "id": "member-1", "name": "同名成员" }],
+  "versions": [
+    { "id": "version-1", "name": "同名版本" },
+    { "id": "version-2", "name": "同名版本" }
+  ],
+  "sprints": [],
+  "fetchedAt": "2026-10-09T00:00:00Z"
+}

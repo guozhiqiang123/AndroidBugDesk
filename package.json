@@ -1,0 +1,41 @@
+{
+  "name": "android-bug-desk",
+  "productName": "Android Bug Desk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "USB Android evidence collection and personal Yunxiao bug submission",
+  "author": "Android QA Team",
+  "scripts": {
+    "build": "vite build",
+    "dev": "tauri dev",
+    "dev:web": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "tauri": "tauri",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build && cargo test --manifest-path src-tauri/Cargo.toml",
+    "bundle": "tauri build",
+    "schemas": "tsx scripts/schemas.ts",
+    "format": "prettier --write src scripts tests docs profiles schemas .github package.json tsconfig.json vite.config.ts index.html README.md && cargo fmt --manifest-path src-tauri/Cargo.toml"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.2",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.1",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "prettier": "3.9.9",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.4",
+    "vitest": "5.0.3"
+  },
+  "type": "module"
+}

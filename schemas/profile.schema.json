@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "edition": { "type": "string", "const": "central" },
+    "organizationId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+    "projectId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
+    "businessProfiles": {
+      "minItems": 1,
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+    },
+    "requiredFieldIds": {
+      "default": [],
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" }
+    },
+    "fieldMappings": {
+      "default": {},
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]{1,128}$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "enum": [
+          "subject",
+          "description",
+          "assignedTo",
+          "sprint",
+          "versions",
+          "verifier",
+          "participants",
+          "labels",
+          "trackers"
+        ]
+      }
+    },
+    "enableVersions": { "default": true, "type": "boolean" },
+    "enableSprints": { "default": true, "type": "boolean" },
+    "attachmentWarningMb": {
+      "default": 50,
+      "type": "number",
+      "exclusiveMinimum": 0
+    }
+  },
+  "required": [
+    "name",
+    "edition",
+    "organizationId",
+    "projectId",
+    "businessProfiles",
+    "requiredFieldIds",
+    "fieldMappings",
+    "enableVersions",
+    "enableSprints",
+    "attachmentWarningMb"
+  ],
+  "additionalProperties": false
+}

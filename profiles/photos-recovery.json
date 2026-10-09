@@ -1,0 +1,12 @@
+{
+  "name": "照片恢复PR",
+  "edition": "central",
+  "organizationId": "5fa8de6c2f8cc15c287b40c1",
+  "projectId": "cc40cc3869cafd0555428f42df",
+  "businessProfiles": ["照片恢复 · 新马甲包", "照片恢复 · Launcher"],
+  "requiredFieldIds": [],
+  "fieldMappings": {},
+  "enableVersions": true,
+  "enableSprints": true,
+  "attachmentWarningMb": 50
+}

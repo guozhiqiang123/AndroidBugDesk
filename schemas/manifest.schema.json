@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://androidbugdesk.local/schemas/manifest/1.0",
+  "title": "Android Bug Desk evidence manifest 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceId",
+    "sessionId",
+    "clientVersion",
+    "createdAt",
+    "scope",
+    "build",
+    "installedArtifact",
+    "ciArtifacts",
+    "problem",
+    "device",
+    "cloudConfig",
+    "collection",
+    "files",
+    "gaps"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.0"
+    },
+    "evidenceId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sessionId": {
+      "type": ["string", "null"]
+    },
+    "clientVersion": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "organizationId",
+        "projectId",
+        "businessProfile",
+        "versions",
+        "sprint",
+        "multicaParentTaskId"
+      ],
+      "properties": {
+        "organizationId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "businessProfile": {
+          "type": "string"
+        },
+        "versions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sprint": {
+          "type": "string"
+        },
+        "multicaParentTaskId": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "required": [
+        "url",
+        "parsed",
+        "identityStatus",
+        "manifest",
+        "mappingStatus",
+        "parameters"
+      ],
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "parsed": {
+          "type": ["array", "null"]
+        },
+        "identityStatus": {
+          "enum": ["unconfirmed", "manual_confirmed", "verified", "conflict"]
+        },
+        "manifest": {
+          "type": ["object", "null"]
+        },
+        "mappingStatus": {
+          "type": "string"
+        },
+        "parameters": {
+          "type": ["object", "null"]
+        }
+      }
+    },
+    "installedArtifact": {
+      "type": "object",
+      "required": ["identity", "fingerprints", "status"],
+      "properties": {
+        "identity": {
+          "type": "object"
+        },
+        "fingerprints": {
+          "type": ["array", "null"]
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "ciArtifacts": {
+      "type": "object",
+      "required": ["items", "status"],
+      "properties": {
+        "items": {
+          "type": ["array", "null"]
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "problem": {
+      "type": "object",
+      "required": [
+        "kind",
+        "title",
+        "preconditions",
+        "steps",
+        "expected",
+        "actual",
+        "frequency",
+        "event",
+        "network",
+        "data"
+      ]
+    },
+    "device": {
+      "type": "object"
+    },
+    "cloudConfig": {
+      "type": "object"
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status", "at", "detail"],
+        "properties": {
+          "status": {
+            "enum": ["collected", "failed", "manual", "not_applicable"]
+          },
+          "at": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "relativePath",
+          "mime",
+          "size",
+          "sha256",
+          "role",
+          "source",
+          "derivedFrom",
+          "includedInZip",
+          "coverage"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "relativePath": {
+            "type": "string",
+            "pattern": "^(logs|media)/[^\\\\]+$"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "role": {
+            "enum": ["log", "image", "video", "report", "sample"]
+          },
+          "source": {
+            "type": "string"
+          },
+          "derivedFrom": {
+            "type": ["string", "null"]
+          },
+          "includedInZip": {
+            "type": "boolean"
+          },
+          "coverage": {
+            "type": "object",
+            "required": ["start", "end"],
+            "properties": {
+              "start": {
+                "type": "string"
+              },
+              "end": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

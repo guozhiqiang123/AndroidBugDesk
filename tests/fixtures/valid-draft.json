@@ -1,0 +1,82 @@
+{
+  "id": "00000000-0000-4000-8000-000000000001",
+  "sessionId": null,
+  "title": "点击恢复按钮后页面闪退",
+  "kind": "功能",
+  "business": "测试方向",
+  "workitemTypeId": "bug-type",
+  "assignedTo": "member-1",
+  "sprint": "",
+  "versions": ["version-2"],
+  "buildUrl": "https://jenkins.example/job/App/42/",
+  "buildStatus": "manual_confirmed",
+  "buildManifest": null,
+  "app": {
+    "packageName": "com.example.test",
+    "versionName": "1.0",
+    "versionCode": "0",
+    "channel": "internal",
+    "environment": "测试包",
+    "obfuscation": "已混淆，构建配置确认",
+    "hardening": "未加固，构建配置确认"
+  },
+  "device": {
+    "model": "模拟设备",
+    "androidVersion": "14",
+    "totalMemKb": "8000000",
+    "availableMemKb": "2000000",
+    "resolution": "1080x2400",
+    "density": "420"
+  },
+  "event": {
+    "occurredAt": "2026-10-09T08:00:00+08:00",
+    "originalAt": "",
+    "source": "manual",
+    "sourceNote": "测试人员操作记录",
+    "lateCapture": false
+  },
+  "preconditions": "新安装；允许照片权限；Wi-Fi 正常",
+  "steps": "进入照片恢复首页\n点击开始扫描按钮\n选择一张图片并点击恢复",
+  "expected": "图片恢复并显示完成提示",
+  "actual": "页面闪退，回到桌面",
+  "frequency": { "firstDiscovery": true, "attempts": "", "occurrences": "" },
+  "cloud": {
+    "applicability": "no",
+    "reason": "该入口为本地固定功能，应用调试面板确认没有开关",
+    "name": "",
+    "effectiveValue": "",
+    "source": "",
+    "observedAt": "",
+    "override": ""
+  },
+  "network": {
+    "operation": "",
+    "type": "",
+    "error": "",
+    "collectionStatus": ""
+  },
+  "data": { "type": "", "count": "", "source": "" },
+  "customFields": { "priority": "p2" },
+  "sources": {},
+  "manualNote": "设备设置页面，测试人员核对",
+  "collectionErrors": [],
+  "attachments": [
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "logcat.log",
+      "path": "/fixture/logcat.log",
+      "mime": "text/plain",
+      "size": 42,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "role": "log",
+      "source": "导入测试日志",
+      "coverageStart": "2026-10-09T07:59:00+08:00",
+      "coverageEnd": "2026-10-09T08:01:00+08:00",
+      "confirmed": true,
+      "derivedFrom": null
+    }
+  ],
+  "previewConfirmed": true,
+  "createdAt": "2026-10-09T00:00:00Z",
+  "updatedAt": "2026-10-09T00:00:00Z"
+}
