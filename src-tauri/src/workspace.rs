@@ -194,6 +194,38 @@ pub fn current_scope(state: &AppState, type_id: &str) -> Result<String> {
     }
     Ok(scope_key(&user, &p, type_id))
 }
+// Keep the identity, target and credential from the same snapshot. A separate
+// scope check followed by state.api() could accept Alice then use Bob's token.
+pub(crate) fn submission_api(state: &AppState, id: &str) -> Result<Api> {
+    let user = state.user.lock().unwrap();
+    let user = user.as_ref().ok_or("请先验证登录令牌")?;
+    let profile = state.profile.lock().unwrap();
+    let token = state.token.lock().unwrap();
+    let submission = state.store.get::<Submission>("submission", id)?;
+    let scope = state.store.get::<String>("draft_scope", id)?;
+    let Some(scope) = scope else {
+        return Err(if submission.is_some() {
+            "历史提交缺少账号绑定，身份未知；请保留原记录并核对原账号，不能自动恢复或重新创建"
+        } else {
+            "旧草稿缺少账号绑定，请在当前项目新建草稿并核对材料"
+        }
+        .into());
+    };
+    if scope != scope_key(user, &profile, "") {
+        return Err("草稿或提交属于其他账号、组织或项目，请切换回原账号和原项目后恢复".into());
+    }
+    if submission.is_some_and(|s| {
+        s.profile.organization_id != profile.organization_id
+            || s.profile.project_id != profile.project_id
+    }) {
+        return Err("账号绑定与原提交项目不一致，请核对原记录；不会重新创建".into());
+    }
+    Api::with_base(
+        profile.clone(),
+        token.as_deref().ok_or("请填写个人 PAT")?,
+        &state.api_base,
+    )
+}
 pub fn check_metadata_scope(state: &AppState, metadata: &Metadata) -> Result<()> {
     let profile = state.profile.lock().unwrap();
     if metadata.profile.organization_id != profile.organization_id

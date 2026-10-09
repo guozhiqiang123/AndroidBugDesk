@@ -707,6 +707,9 @@ pub async fn export_evidence(
 }
 #[tauri::command]
 pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submission> {
+    submit_with_state(id, &state).await
+}
+pub(crate) async fn submit_with_state(id: String, state: &AppState) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
         if !locks.insert(id.clone()) {
@@ -714,18 +717,13 @@ pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submis
         }
     }
     let result = async {
+        let api = crate::workspace::submission_api(state, &id)?;
         let d = state.store.draft(&id)?;
         state.assert_no_token(&d)?;
-        if state.store.get::<Submission>("submission", &id)?.is_none()
-            && state.store.get::<String>("draft_scope", &id)?.as_deref()
-                != Some(&crate::workspace::current_scope(&state, "")?)
-        {
-            return Err("草稿属于其他账号/项目或来自旧版，请在当前项目新建草稿并核对材料".into());
-        }
         Submitter {
             store: state.store.clone(),
         }
-        .submit(&id, &state.api()?)
+        .submit(&id, &api)
         .await
     }
     .await;
@@ -738,6 +736,13 @@ pub async fn reconcile_submission(
     remote_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Submission> {
+    reconcile_with_state(id, remote_id, &state).await
+}
+pub(crate) async fn reconcile_with_state(
+    id: String,
+    remote_id: Option<String>,
+    state: &AppState,
+) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
         if !locks.insert(id.clone()) {
@@ -745,10 +750,11 @@ pub async fn reconcile_submission(
         }
     }
     let result = async {
+        let api = crate::workspace::submission_api(state, &id)?;
         Submitter {
             store: state.store.clone(),
         }
-        .reconcile(&id, &state.api()?, remote_id)
+        .reconcile(&id, &api, remote_id)
         .await
     }
     .await;

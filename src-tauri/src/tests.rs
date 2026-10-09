@@ -196,12 +196,14 @@ async fn all_four_media_types_upload_and_download_exact_content() {
 struct Remote {
     creates: usize,
     uploads: usize,
+    updates: usize,
     body: Value,
     files: Vec<(String, String, Vec<u8>)>,
     lose_create: bool,
     lose_upload: bool,
     reject_upload: bool,
     unsupported_field: bool,
+    empty_search: bool,
     download_saw_token: bool,
 }
 #[derive(Clone)]
@@ -258,11 +260,13 @@ impl Respond for Simulator {
             return ResponseTemplate::new(200).set_body_json(json!([]));
         }
         if path.ends_with("/workitems:search") {
-            return ResponseTemplate::new(200).set_body_json(if state.creates > 0 {
-                json!([{"id":"real-id"}])
-            } else {
-                json!([])
-            });
+            return ResponseTemplate::new(200).set_body_json(
+                if state.creates > 0 && !state.empty_search {
+                    json!([{"id":"real-id"}])
+                } else {
+                    json!([])
+                },
+            );
         }
         if path.ends_with("/workitems") && method == "POST" {
             state.creates += 1;
@@ -307,6 +311,7 @@ impl Respond for Simulator {
             return ResponseTemplate::new(200).set_body_json(json!({"id":id}));
         }
         if path.ends_with("/workitems/real-id") && method == "PUT" {
+            state.updates += 1;
             let v: Value = serde_json::from_slice(&r.body).unwrap();
             state.body["description"] = v["description"].clone();
             return ResponseTemplate::new(204);
@@ -460,4 +465,311 @@ fn persistent_recovery_keeps_uncertain_intents() {
     s = store.get("submission", &s.draft_id).unwrap().unwrap();
     assert_eq!(s.state, "create_unknown");
     assert!(store.editable(&s.draft_id).is_err());
+}
+
+fn submission_state(
+    store: &Store,
+    server: &MockServer,
+    profile: &Profile,
+) -> crate::commands::AppState {
+    let mut state = crate::commands::AppState::new(store.root.clone()).unwrap();
+    state.api_base = server.uri();
+    *state.profile.lock().unwrap() = profile.clone();
+    *state.token.lock().unwrap() = Some("test-personal-pat".into());
+    *state.user.lock().unwrap() = Some(crate::workspace::UserIdentity {
+        id: "alice".into(),
+        name: "Alice".into(),
+        last_organization: profile.organization_id.clone(),
+    });
+    state
+}
+fn bind_alice(store: &Store, id: &str) {
+    store
+        .put("draft_scope", id, &"alice:test-org:test-project:")
+        .unwrap();
+}
+fn change_identity(state: &crate::commands::AppState, original: &Profile, dimension: &str) {
+    let mut profile = original.clone();
+    let user = if dimension == "account" {
+        "bob"
+    } else {
+        "alice"
+    };
+    if dimension == "organization" {
+        profile.organization_id = "other-org".into();
+    }
+    if dimension == "project" {
+        profile.project_id = "other-project".into();
+    }
+    *state.profile.lock().unwrap() = profile;
+    state.user.lock().unwrap().as_mut().unwrap().id = user.into();
+}
+fn write_counts(remote: &Arc<Mutex<Remote>>) -> (usize, usize, usize) {
+    let r = remote.lock().unwrap();
+    (r.creates, r.uploads, r.updates)
+}
+async fn rejected_recovery_matrix(
+    server: &MockServer,
+    remote: &Arc<Mutex<Remote>>,
+    state: &crate::commands::AppState,
+    id: &str,
+    profile: &Profile,
+) {
+    let before_requests = server.received_requests().await.unwrap().len();
+    let before_counts = write_counts(remote);
+    let before = state.store.get::<Value>("submission", id).unwrap();
+    for dimension in ["account", "organization", "project"] {
+        change_identity(state, profile, dimension);
+        assert!(crate::commands::submit_with_state(id.into(), state)
+            .await
+            .unwrap_err()
+            .contains("其他账号"));
+        for remote_id in [None, Some("real-id".into())] {
+            assert!(
+                crate::commands::reconcile_with_state(id.into(), remote_id, state)
+                    .await
+                    .unwrap_err()
+                    .contains("其他账号")
+            );
+        }
+        assert_eq!(
+            write_counts(remote),
+            before_counts,
+            "write on {dimension} mismatch"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_requests,
+            "network on {dimension} mismatch"
+        );
+        assert_eq!(state.store.get::<Value>("submission", id).unwrap(), before);
+        assert!(state.locks.lock().unwrap().is_empty());
+    }
+    change_identity(state, profile, "original");
+}
+
+#[tokio::test]
+async fn command_new_submission_checks_scope_before_any_network() {
+    let (server, remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    rejected_recovery_matrix(&server, &remote, &state, &id, &api.profile).await;
+    let result = crate::commands::submit_with_state(id, &state)
+        .await
+        .unwrap();
+    assert_eq!(result.state, "submitted");
+    assert_eq!(write_counts(&remote), (1, 2, 1));
+}
+#[tokio::test]
+async fn command_partial_recovery_requires_original_account_and_keeps_evidence() {
+    let (server, remote, api) = mock(Remote {
+        reject_upload: true,
+        ..Default::default()
+    })
+    .await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let partial = crate::commands::submit_with_state(id.clone(), &state)
+        .await
+        .unwrap();
+    assert_eq!(partial.state, "partial");
+    rejected_recovery_matrix(&server, &remote, &state, &id, &api.profile).await;
+    assert_eq!(
+        evidence::hash_file(Path::new(&partial.evidence.zip_path))
+            .unwrap()
+            .1,
+        partial.evidence.sha256
+    );
+    let resumed = crate::commands::submit_with_state(id, &state)
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, "submitted");
+    assert_eq!(resumed.workitem_id, partial.workitem_id);
+    assert_eq!(resumed.evidence.sha256, partial.evidence.sha256);
+    assert_eq!(write_counts(&remote), (1, 3, 1));
+    assert!(Path::new(&resumed.evidence.directory)
+        .with_extension("receipt.json")
+        .exists());
+}
+#[tokio::test]
+async fn command_unknown_creation_checks_account_before_search_or_explicit_id() {
+    let (server, remote, api) = mock(Remote {
+        lose_create: true,
+        ..Default::default()
+    })
+    .await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let unknown = crate::commands::submit_with_state(id.clone(), &state)
+        .await
+        .unwrap();
+    assert_eq!(unknown.state, "create_unknown");
+    rejected_recovery_matrix(&server, &remote, &state, &id, &api.profile).await;
+    let resumed = crate::commands::reconcile_with_state(id, None, &state)
+        .await
+        .unwrap();
+    assert_eq!(resumed.state, "submitted");
+    assert_eq!(resumed.workitem_id.as_deref(), Some("real-id"));
+    assert_eq!(resumed.evidence.sha256, unknown.evidence.sha256);
+    assert_eq!(write_counts(&remote), (1, 2, 1));
+}
+#[tokio::test]
+async fn command_empty_candidates_keeps_unknown_without_recreate() {
+    let (server, remote, api) = mock(Remote {
+        lose_create: true,
+        empty_search: true,
+        ..Default::default()
+    })
+    .await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let unknown = crate::commands::submit_with_state(id.clone(), &state)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let searched = crate::commands::reconcile_with_state(id.clone(), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(searched.state, "create_unknown");
+        assert!(searched.workitem_id.is_none());
+        assert_eq!(searched.evidence.sha256, unknown.evidence.sha256);
+        let request_count = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            crate::commands::submit_with_state(id.clone(), &state)
+                .await
+                .unwrap()
+                .state,
+            "create_unknown"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            request_count
+        );
+        assert_eq!(write_counts(&remote), (1, 0, 0));
+    }
+    let verified = crate::commands::reconcile_with_state(id, Some("real-id".into()), &state)
+        .await
+        .unwrap();
+    assert_eq!(verified.state, "submitted");
+    assert_eq!(write_counts(&remote), (1, 2, 1));
+    assert_eq!(
+        evidence::hash_file(Path::new(&unknown.evidence.zip_path))
+            .unwrap()
+            .1,
+        unknown.evidence.sha256
+    );
+}
+#[tokio::test]
+async fn command_legacy_identity_stays_unknown_without_losing_records() {
+    for mode in ["draft", "partial", "create_unknown"] {
+        let (server, remote, api) = mock(Remote {
+            reject_upload: mode == "partial",
+            lose_create: mode == "create_unknown",
+            ..Default::default()
+        })
+        .await;
+        let (_temp, store, d) = setup();
+        let id = string(&d, "id");
+        if mode != "draft" {
+            Submitter {
+                store: store.clone(),
+            }
+            .submit(&id, &api)
+            .await
+            .unwrap();
+        }
+        let state = submission_state(&store, &server, &api.profile);
+        let before = store.get::<Value>("submission", &id).unwrap();
+        let counts = write_counts(&remote);
+        let requests = server.received_requests().await.unwrap().len();
+        let error = crate::commands::submit_with_state(id.clone(), &state)
+            .await
+            .unwrap_err();
+        assert!(error.contains(if mode == "draft" {
+            "旧草稿缺少账号绑定"
+        } else {
+            "身份未知"
+        }));
+        for remote_id in [None, Some("real-id".into())] {
+            assert!(
+                crate::commands::reconcile_with_state(id.clone(), remote_id, &state)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(store.get::<Value>("submission", &id).unwrap(), before);
+        assert_eq!(store.draft(&id).unwrap(), d);
+        assert!(store.get::<String>("draft_scope", &id).unwrap().is_none());
+        if let Some(row) = before {
+            let s: Submission = serde_json::from_value(row).unwrap();
+            assert_eq!(
+                evidence::hash_file(Path::new(&s.evidence.zip_path))
+                    .unwrap()
+                    .1,
+                s.evidence.sha256
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        assert_eq!(write_counts(&remote), counts);
+        assert!(state.locks.lock().unwrap().is_empty());
+    }
+}
+#[tokio::test]
+async fn command_recovery_rejects_inconsistent_saved_project_binding() {
+    let (server, remote, api) = mock(Remote {
+        reject_upload: true,
+        ..Default::default()
+    })
+    .await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    Submitter {
+        store: store.clone(),
+    }
+    .submit(&id, &api)
+    .await
+    .unwrap();
+    let state = submission_state(&store, &server, &api.profile);
+    change_identity(&state, &api.profile, "project");
+    store
+        .put("draft_scope", &id, &"alice:test-org:other-project:")
+        .unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    let counts = write_counts(&remote);
+    assert!(crate::commands::submit_with_state(id.clone(), &state)
+        .await
+        .unwrap_err()
+        .contains("原提交项目不一致"));
+    assert!(crate::commands::reconcile_with_state(id, None, &state)
+        .await
+        .unwrap_err()
+        .contains("原提交项目不一致"));
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(write_counts(&remote), counts);
+}
+#[tokio::test]
+async fn command_submission_api_snapshot_does_not_mix_switched_credentials() {
+    let (server, remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let original_api = crate::workspace::submission_api(&state, &id).unwrap();
+    change_identity(&state, &api.profile, "account");
+    *state.token.lock().unwrap() = Some("other-personal-pat".into());
+    let done = Submitter { store }
+        .submit(&id, &original_api)
+        .await
+        .unwrap();
+    assert_eq!(done.state, "submitted");
+    assert_eq!(write_counts(&remote), (1, 2, 1));
+    assert!(crate::workspace::submission_api(&state, &id).is_err());
 }
