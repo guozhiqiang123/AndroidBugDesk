@@ -43,6 +43,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Verify candidate manifests with synthetic packages
+        run: node --test tests/build-manifest.node.mjs
       - run: npm run build
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build native desktop packages
@@ -52,13 +54,13 @@ jobs:
       - name: Archive macOS application bundle
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/${{ matrix.target }}/release/bundle/macos/Android Bug Desk.app" "src-tauri/target/${{ matrix.target }}/release/bundle/Android-Bug-Desk-${{ matrix.target }}.app.zip"
+      - name: Stage packages and write verified build manifest
+        id: manifest
+        run: node scripts/build-manifest.mjs --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: AndroidBugDesk-${{ matrix.target }}
+          name: ${{ steps.manifest.outputs.artifact_name }}
           if-no-files-found: error
-          path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.zip
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+          retention-days: 30
+          compression-level: 0
+          path: ${{ steps.manifest.outputs.artifact_path }}/

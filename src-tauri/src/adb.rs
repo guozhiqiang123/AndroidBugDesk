@@ -252,6 +252,174 @@ pub async fn screenshot(path: &Path, serial: &str, dest: &Path) -> Result<()> {
         .await
         .map_err(|e| e.to_string())
 }
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BugreportCapture {
+    pub serial: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub timed_out: bool,
+    pub exit_code: Option<i32>,
+    pub failure: Option<String>,
+    pub attachment: Option<Attachment>,
+    pub directory: PathBuf,
+}
+
+/// Rust-only entry point. The caller supplies the trusted store root, never an IPC output path.
+/// A failed command may leave partial files; they are retained, but never reported as an attachment.
+pub async fn bugreport(
+    path: &Path,
+    serial: &str,
+    root: &Path,
+    timeout_seconds: u64,
+) -> Result<BugreportCapture> {
+    if !(1..=600).contains(&timeout_seconds) {
+        return Err("系统报告超时必须在 1 到 600 秒之间".into());
+    }
+    capture_bugreport(
+        path,
+        serial,
+        root,
+        std::time::Duration::from_secs(timeout_seconds),
+    )
+    .await
+}
+
+async fn capture_bugreport(
+    path: &Path,
+    serial: &str,
+    root: &Path,
+    timeout: std::time::Duration,
+) -> Result<BugreportCapture> {
+    valid_serial(serial)?;
+    // A leading dash is not a device identity, even if it passes the legacy serial validator.
+    if serial.starts_with('-') {
+        return Err("设备序列号不能以选项前缀开头".into());
+    }
+    let directory = crate::evidence::derived_directory(root, "bugreports")?;
+    let stdout = std::fs::File::create(directory.join("stdout.log")).map_err(|e| e.to_string())?;
+    let stderr = std::fs::File::create(directory.join("stderr.log")).map_err(|e| e.to_string())?;
+    let mut result = BugreportCapture {
+        serial: serial.into(),
+        started_at: now(),
+        finished_at: String::new(),
+        timed_out: false,
+        exit_code: None,
+        failure: None,
+        attachment: None,
+        directory,
+    };
+    // argv only; no shell, root, package/PID filter, or fallback to another device.
+    let child = command(path)
+        .args(["-s", serial, "bugreport"])
+        .arg(&result.directory)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn();
+    match child {
+        Err(e) => result.failure = Some(format!("ADB 系统报告启动失败：{e}")),
+        Ok(mut child) => match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => {
+                result.exit_code = status.code();
+                if !status.success() {
+                    result.failure = Some(format!("ADB 系统报告退出失败：{status}"));
+                }
+            }
+            Ok(Err(e)) => result.failure = Some(format!("ADB 系统报告进程状态读取失败：{e}")),
+            Err(_) => {
+                result.timed_out = true;
+                result.failure = Some("ADB 系统报告超时；部分输出不代表采集成功".into());
+                // Reap only the exact child we started. kill_on_drop also protects cancellation.
+                let _ = child.kill().await;
+                if let Ok(status) = child.wait().await {
+                    result.exit_code = status.code();
+                }
+            }
+        },
+    }
+    if result.failure.is_none() {
+        let report = (|| -> Result<Attachment> {
+            let mut candidates = Vec::new();
+            for entry in std::fs::read_dir(&result.directory).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("zip"))
+                {
+                    if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
+                        return Err("系统报告不是本地普通文件".into());
+                    }
+                    candidates.push(entry.path());
+                }
+            }
+            if candidates.len() != 1 {
+                return Err("ADB 未生成唯一 ZIP 系统报告；需人工补充".into());
+            }
+            crate::evidence::inspect(&candidates[0], "report", "ADB 按需系统报告；未脱敏", root)
+        })();
+        match report {
+            Ok(a) => result.attachment = Some(a),
+            Err(e) => result.failure = Some(e),
+        }
+    }
+    result.finished_at = now();
+    let receipt = serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?;
+    std::fs::write(result.directory.join("receipt.json"), receipt).map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProblemWindow {
+    pub marked_at: String,
+    pub due_at: String,
+}
+
+impl ProblemWindow {
+    pub fn new(marked_at: &str) -> Result<Self> {
+        let mark =
+            chrono::DateTime::parse_from_rfc3339(marked_at).map_err(|_| "问题标记时间无效")?;
+        let due = mark
+            .checked_add_signed(chrono::Duration::seconds(30))
+            .ok_or("问题时间超出范围")?;
+        Ok(Self {
+            marked_at: marked_at.into(),
+            due_at: due.to_rfc3339(),
+        })
+    }
+
+    /// Foreground wait only. Persist this window before awaiting and reconcile interrupted jobs on restart.
+    /// Ready means the host deadline elapsed; evidence coverage must still be checked separately.
+    pub async fn wait_ready(&self, mut cancelled: watch::Receiver<bool>) -> Result<WindowWait> {
+        let validated = Self::new(&self.marked_at)?;
+        if chrono::DateTime::parse_from_rfc3339(&validated.due_at).ok()
+            != chrono::DateTime::parse_from_rfc3339(&self.due_at).ok()
+        {
+            return Err("日志固定截止时间必须是标记后 30 秒".into());
+        }
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Ok(WindowWait::Interrupted);
+        }
+        let due = chrono::DateTime::parse_from_rfc3339(&self.due_at).map_err(|_| "截止时间无效")?;
+        let delay = (due.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Ok(WindowWait::Ready),
+            _ = async { loop {
+                if cancelled.changed().await.is_err() || *cancelled.borrow() { break; }
+            }} => Ok(WindowWait::Interrupted),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WindowWait {
+    Ready,
+    Interrupted,
+}
 pub struct Collector {
     pub id: String,
     pub stop: watch::Sender<bool>,
@@ -411,4 +579,206 @@ pub async fn start_logs(
 pub async fn stop_logs(c: Collector) {
     let _ = c.stop.send(true);
     let _ = c.task.await;
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delayed_pin_requires_deadline_and_live_owner() {
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(31)).to_rfc3339();
+        let window = ProblemWindow::new(&past).unwrap();
+        let (tx, rx) = watch::channel(false);
+        assert_eq!(window.wait_ready(rx).await.unwrap(), WindowWait::Ready);
+        let window = ProblemWindow::new(&now()).unwrap();
+        let rx = tx.subscribe();
+        tx.send(true).unwrap();
+        assert_eq!(
+            window.wait_ready(rx).await.unwrap(),
+            WindowWait::Interrupted
+        );
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+        assert_eq!(
+            window.wait_ready(rx).await.unwrap(),
+            WindowWait::Interrupted
+        );
+        let (_, rx) = watch::channel(false);
+        let mut invalid = window;
+        invalid.due_at = past;
+        assert!(invalid.wait_ready(rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delayed_pin_can_be_cancelled_while_waiting() {
+        let window = ProblemWindow::new(&now()).unwrap();
+        let (tx, rx) = watch::channel(false);
+        let signal = async {
+            tokio::task::yield_now().await;
+            tx.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(window.wait_ready(rx), signal);
+        assert_eq!(result.unwrap(), WindowWait::Interrupted);
+    }
+
+    #[cfg(unix)]
+    fn fake_adb(root: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("fake adb");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn quoted(path: &Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn fixture_zip(root: &Path) -> PathBuf {
+        use std::io::Write;
+        let path = root.join("fixture.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("bugreport.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"fixture report: no device was contacted")
+            .unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bugreport_pins_serial_and_safe_directory_with_valid_zip_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("evidence root ; literal");
+        std::fs::create_dir(&root).unwrap();
+        let fixture = fixture_zip(&root);
+        let trace = root.join("arguments.txt");
+        let adb = fake_adb(
+            &root,
+            &format!(
+                "printf '%s\\n' \"$@\" > {}\n/bin/cp {} \"$4/report.zip\"",
+                quoted(&trace),
+                quoted(&fixture)
+            ),
+        );
+        for serial in ["USB-A", "USB-B"] {
+            let result = bugreport(&adb, serial, &root, 5).await.unwrap();
+            assert_eq!(result.serial, serial);
+            assert_eq!(result.exit_code, Some(0));
+            assert!(!result.timed_out);
+            assert!(result.failure.is_none());
+            let a = result.attachment.unwrap();
+            assert_eq!(a.sha256, crate::evidence::hash_file(&fixture).unwrap().1);
+            assert!(!a.confirmed);
+            assert!(Path::new(&a.path).starts_with(root.canonicalize().unwrap()));
+            let args = std::fs::read_to_string(&trace).unwrap();
+            assert_eq!(
+                args.lines().take(3).collect::<Vec<_>>(),
+                ["-s", serial, "bugreport"]
+            );
+            assert_eq!(
+                args.lines().nth(3).unwrap(),
+                result.directory.to_str().unwrap()
+            );
+            assert_eq!(args.lines().count(), 4);
+            let receipt: Value = serde_json::from_slice(
+                &std::fs::read(result.directory.join("receipt.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["attachment"]["sha256"], a.sha256);
+            assert!(
+                receipt["finishedAt"].as_str().unwrap() >= receipt["startedAt"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bugreport_failures_never_accept_partial_or_invalid_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = fixture_zip(temp.path());
+        let bodies = [
+            format!("/bin/cp {} \"$4/report.zip\"\nexit 7", quoted(&fixture)),
+            "exit 0".into(),
+            "printf invalid > \"$4/report.zip\"".into(),
+            format!("/bin/ln -s {} \"$4/report.zip\"", quoted(&fixture)),
+            format!(
+                "/bin/cp {} \"$4/a.zip\"\n/bin/cp {} \"$4/b.zip\"",
+                quoted(&fixture),
+                quoted(&fixture)
+            ),
+        ];
+        for body in bodies {
+            let adb = fake_adb(temp.path(), &body);
+            let result = bugreport(&adb, "USB-A", temp.path(), 5).await.unwrap();
+            assert!(result.failure.is_some());
+            assert!(result.attachment.is_none());
+            assert!(!result.timed_out);
+            assert!(result.directory.join("receipt.json").is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bugreport_timeout_reaps_the_exact_child_and_keeps_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("pid");
+        let adb = fake_adb(temp.path(), &format!("printf '%s' \"$$\" > {}\nprintf 'partial' > \"$4/partial.txt\"\nexec /bin/sleep 10", quoted(&pid_path)));
+        let before = std::time::Instant::now();
+        let result = capture_bugreport(
+            &adb,
+            "USB-A",
+            temp.path(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(before.elapsed() < std::time::Duration::from_secs(5));
+        assert!(result.timed_out);
+        assert!(result.failure.is_some());
+        assert!(result.attachment.is_none());
+        assert!(result.directory.join("partial.txt").is_file());
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        assert!(!std::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[tokio::test]
+    async fn bugreport_rejects_injection_and_invalid_timeout_before_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        for serial in [
+            "",
+            "-d",
+            "USB;touch pwned",
+            "A\nB",
+            "A B",
+            "../../dev",
+            "a:5555",
+        ] {
+            assert!(bugreport(Path::new("missing-adb"), serial, temp.path(), 1)
+                .await
+                .is_err());
+        }
+        for timeout in [0, 601] {
+            assert!(
+                bugreport(Path::new("missing-adb"), "USB-A", temp.path(), timeout)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        let result = bugreport(&temp.path().join("missing-adb"), "USB-A", temp.path(), 1)
+            .await
+            .unwrap();
+        assert!(result.failure.unwrap().contains("启动失败"));
+        assert!(result.exit_code.is_none());
+    }
 }

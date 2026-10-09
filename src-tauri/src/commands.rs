@@ -4,8 +4,8 @@ use crate::{
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    path::{Path, PathBuf},
-    sync::Mutex,
+    path::PathBuf,
+    sync::{atomic::AtomicU64, Mutex},
 };
 use tauri::{Manager, State};
 use zeroize::Zeroize;
@@ -13,16 +13,21 @@ pub struct AppState {
     pub store: Store,
     pub profile: Mutex<Profile>,
     pub token: Mutex<Option<String>>,
+    pub user: Mutex<Option<crate::workspace::UserIdentity>>,
+    pub auth_epoch: AtomicU64,
+    pub workspace_epoch: AtomicU64,
+    pub(crate) api_base: String,
     pub metadata: Mutex<Option<Metadata>>,
     pub adb: Mutex<Option<PathBuf>>,
     pub collector: Mutex<Option<adb::Collector>>,
     pub locks: Mutex<HashSet<String>>,
 }
-const SERVICE: &str = "com.qa.androidbugdesk";
+pub(crate) const SERVICE: &str = "com.qa.androidbugdesk";
 impl AppState {
     pub fn new(root: PathBuf) -> Result<Self> {
         let store = Store::new(&root)?;
         store.recover()?;
+        crate::capture::recover(&store)?;
         for mut session in store.list("session")? {
             if session["stoppedAt"].is_null() {
                 session["stoppedAt"] = json!(now());
@@ -33,21 +38,17 @@ impl AppState {
                 store.put("session", &string(&session, "id"), &session)?;
             }
         }
-        let profile = store.get("settings", "profile")?.unwrap_or(
-            serde_json::from_str(include_str!("../../profiles/photos-recovery.json")).unwrap(),
-        );
-        let remembered: bool = store.get("settings", "remembered")?.unwrap_or(false);
-        let token = if remembered {
-            keyring::Entry::new(SERVICE, "personal-pat")
-                .ok()
-                .and_then(|e| e.get_password().ok())
-        } else {
-            None
-        };
+        // Restore only after validating the token's actual user. Never auto-select the example project.
+        let profile = crate::workspace::empty_profile();
         Ok(Self {
             store,
             profile: Mutex::new(profile),
-            token: Mutex::new(token),
+            // Startup always requires manual entry, even if an older version saved a PAT.
+            token: Mutex::new(None),
+            user: Mutex::new(None),
+            auth_epoch: AtomicU64::new(0),
+            workspace_epoch: AtomicU64::new(0),
+            api_base: "https://openapi-rdc.aliyuncs.com".into(),
             metadata: Mutex::new(None),
             adb: Mutex::new(adb::discover()),
             collector: Mutex::new(None),
@@ -55,22 +56,25 @@ impl AppState {
         })
     }
     pub fn api(&self) -> Result<Api> {
+        if self.user.lock().unwrap().is_none() {
+            return Err("请先验证登录令牌".into());
+        }
         let p = self.profile.lock().unwrap().clone();
         let t = self.token.lock().unwrap();
-        Api::new(p, t.as_deref().ok_or("请填写个人 PAT")?)
+        Api::with_base(p, t.as_deref().ok_or("请填写个人 PAT")?, &self.api_base)
     }
-    fn editable(&self, id: &str) -> Result<()> {
+    pub(crate) fn editable(&self, id: &str) -> Result<()> {
         if self.locks.lock().unwrap().contains(id) {
             return Err("该草稿正在提交，不能修改证据".into());
         }
         self.store.editable(id)
     }
-    fn adb_path(&self) -> Result<PathBuf> {
+    pub(crate) fn adb_path(&self) -> Result<PathBuf> {
         self.adb.lock().unwrap().clone().ok_or_else(|| {
             "未找到 ADB，请安装官方 Android SDK Platform Tools 或选择 adb 路径".into()
         })
     }
-    fn assert_no_token(&self, d: &Value) -> Result<()> {
+    pub(crate) fn assert_no_token(&self, d: &Value) -> Result<()> {
         let token = self.token.lock().unwrap().clone();
         if let Some(mut t) = token {
             if t.len() >= 8 {
@@ -107,44 +111,40 @@ impl AppState {
 }
 #[tauri::command]
 pub fn bootstrap(state: State<AppState>) -> Result<Value> {
+    let user = state.user.lock().unwrap().clone();
+    let authorized = user.is_some();
     Ok(
-        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":state.token.lock().unwrap().is_some(),"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":state.store.list("draft")?,"submissions":state.store.list("submission")?,"sessions":state.store.list("session")?}),
+        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":state.store.list("draft")?,"submissions":state.store.list("submission")?,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
     )
 }
 #[tauri::command]
-pub fn set_auth(mut token: String, remember: bool, state: State<AppState>) -> Result<()> {
-    token = token.trim().to_string();
-    if token.len() < 8 || token.len() > 4096 || token.contains(['\n', '\r']) {
-        token.zeroize();
-        return Err("PAT 格式不正确".into());
-    }
-    if remember {
-        let entry = keyring::Entry::new(SERVICE, "personal-pat")
-            .map_err(|_| "系统安全存储不可用，请使用仅本次授权")?;
-        if entry.set_password(&token).is_err() {
-            token.zeroize();
-            return Err("系统安全存储不可用，未保存 Token；请选择仅本次使用".into());
-        }
-        state.store.put("settings", "remembered", &true)?;
+pub async fn set_auth(token: String, remember: bool, state: State<'_, AppState>) -> Result<()> {
+    let result = crate::workspace::login(&state, token, remember).await?;
+    if result.status == "valid" {
+        Ok(())
     } else {
-        let remembered: bool = state.store.get("settings", "remembered")?.unwrap_or(false);
-        state.store.put("settings", "remembered", &false)?;
-        if remembered {
-            if let Ok(entry) = keyring::Entry::new(SERVICE, "personal-pat") {
-                let _ = entry.delete_credential();
-            }
-        }
+        Err(result.message)
     }
-    let mut old = state.token.lock().unwrap();
-    if let Some(t) = old.as_mut() {
-        t.zeroize();
-    }
-    *old = Some(token);
-    *state.metadata.lock().unwrap() = None;
-    Ok(())
 }
 #[tauri::command]
-pub fn clear_auth(state: State<AppState>) -> Result<()> {
+pub async fn check_auth(state: State<'_, AppState>) -> Result<crate::workspace::AuthResult> {
+    crate::workspace::check_auth(&state).await
+}
+#[tauri::command]
+pub async fn login(
+    token: String,
+    remember: bool,
+    state: State<'_, AppState>,
+) -> Result<crate::workspace::AuthResult> {
+    crate::workspace::login(&state, token, remember).await
+}
+#[tauri::command]
+pub async fn clear_auth(state: State<'_, AppState>) -> Result<()> {
+    if !state.locks.lock().unwrap().is_empty() {
+        return Err("请等待本次提交结束后再退出登录".into());
+    }
+    crate::workspace::invalidate(&state);
+    stop_session(state.clone()).await?;
     state.store.put("settings", "remembered", &false)?;
     let mut t = state.token.lock().unwrap();
     if let Some(s) = t.as_mut() {
@@ -164,10 +164,142 @@ pub fn clear_auth(state: State<AppState>) -> Result<()> {
 }
 #[tauri::command]
 pub async fn load_metadata(type_id: String, state: State<'_, AppState>) -> Result<Metadata> {
+    let scope = crate::workspace::current_scope(&state, "")?;
+    let epoch = state
+        .workspace_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     *state.metadata.lock().unwrap() = None;
-    let m = state.api()?.metadata(&type_id).await?;
+    let remembered = if type_id.is_empty() {
+        state
+            .store
+            .get::<String>("last_type", &scope)?
+            .unwrap_or_default()
+    } else {
+        type_id.clone()
+    };
+    let api = state.api()?;
+    let result = api.metadata(&remembered).await;
+    let m = if type_id.is_empty()
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("所选 Bug 类型不属于当前项目"))
+    {
+        crate::workspace::observed_error(&state, api.metadata("").await)?
+    } else {
+        crate::workspace::observed_error(&state, result)?
+    };
+    if epoch
+        != state
+            .workspace_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+        || crate::workspace::current_scope(&state, "")? != scope
+    {
+        return Err("账号或项目已变化，请重新读取字段".into());
+    }
     *state.metadata.lock().unwrap() = Some(m.clone());
     Ok(m)
+}
+#[tauri::command]
+pub async fn list_organizations(state: State<'_, AppState>) -> Result<Vec<OptionItem>> {
+    crate::workspace::observed_error(&state, state.api()?.organizations().await)
+}
+#[tauri::command]
+pub async fn list_projects(
+    organization_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OptionItem>> {
+    let mut api = state.api()?;
+    if !api
+        .organizations()
+        .await?
+        .iter()
+        .any(|o| o.id == organization_id)
+    {
+        return Err("组织不在当前令牌可访问列表中".into());
+    }
+    api.profile.organization_id = organization_id;
+    api.profile.validate()?;
+    crate::workspace::observed_error(&state, api.projects().await)
+}
+#[tauri::command]
+pub async fn select_project(
+    organization_id: String,
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Profile> {
+    crate::workspace::observed_error(
+        &state,
+        crate::workspace::select_project(&state, organization_id, project_id).await,
+    )
+}
+#[tauri::command]
+pub fn load_selection_memory(type_id: String, state: State<AppState>) -> Result<Value> {
+    let m = state
+        .metadata
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先读取项目字段")?;
+    if m.type_id != type_id {
+        return Err("所选类型与当前字段配置不一致".into());
+    }
+    crate::workspace::check_metadata_scope(&state, &m)?;
+    let key = crate::workspace::current_scope(&state, &type_id)?;
+    let remembered: Value = state.store.get("selection", &key)?.unwrap_or(json!({}));
+    Ok(crate::workspace::sanitize_selections(&remembered, &m))
+}
+#[tauri::command]
+pub fn remember_selections(selection: Value, state: State<AppState>) -> Result<()> {
+    if serde_json::to_vec(&selection)
+        .map_err(|_| "选项格式错误")?
+        .len()
+        > 65536
+    {
+        return Err("选项记忆数据过大".into());
+    }
+    let m = state
+        .metadata
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先读取项目字段")?;
+    if string(&selection, "workitemTypeId") != m.type_id {
+        return Err("选项与当前Bug类型不一致，请刷新字段".into());
+    }
+    crate::workspace::check_metadata_scope(&state, &m)?;
+    let key = crate::workspace::current_scope(&state, &m.type_id)?;
+    let cleaned = crate::workspace::sanitize_selections(&selection, &m);
+    if state
+        .token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| cleaned.to_string().contains(t))
+    {
+        return Err("选择记忆不得包含登录令牌".into());
+    }
+    state.store.put("selection", &key, &cleaned)?;
+    state.store.put(
+        "last_type",
+        &crate::workspace::current_scope(&state, "")?,
+        &m.type_id,
+    )
+}
+#[tauri::command]
+pub async fn list_remote_history(
+    page: usize,
+    state: State<'_, AppState>,
+) -> Result<crate::workspace::HistoryPage> {
+    crate::workspace::current_scope(&state, "")?;
+    let user = state
+        .user
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先验证登录令牌")?;
+    crate::workspace::observed_error(&state, state.api()?.history(&user.id, page).await)
 }
 #[tauri::command]
 pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
@@ -184,23 +316,37 @@ pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
     }
     let p: Profile = serde_json::from_slice(&raw).map_err(|_| "项目配置格式错误")?;
     p.validate()?;
-    state.store.put("settings", "profile", &p)?;
+    let user = state
+        .user
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先验证登录令牌")?;
+    state
+        .store
+        .put("settings", &format!("profile:{}", user.id), &p)?;
+    state
+        .workspace_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *state.profile.lock().unwrap() = p.clone();
     *state.metadata.lock().unwrap() = None;
     Ok(p)
 }
 #[tauri::command]
 pub fn new_draft(state: State<AppState>) -> Result<Value> {
+    let scope = crate::workspace::current_scope(&state, "")?;
     let mut d: Value =
         serde_json::from_str(include_str!("../../schemas/empty-draft.json")).unwrap();
     d["id"] = json!(uuid());
     d["createdAt"] = json!(now());
     d["updatedAt"] = json!(now());
     state.store.put("draft", &string(&d, "id"), &d)?;
+    state.store.put("draft_scope", &string(&d, "id"), &scope)?;
     Ok(d)
 }
 #[tauri::command]
 pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
     validation::check_shape(&draft)?;
     let id = string(&draft, "id");
     state.editable(&id)?;
@@ -277,7 +423,7 @@ pub fn validate_draft(id: String, state: State<AppState>) -> Result<Vec<Issue>> 
         &d,
         &state.profile.lock().unwrap(),
         state.metadata.lock().unwrap().as_ref(),
-        state.token.lock().unwrap().is_some(),
+        state.user.lock().unwrap().is_some(),
         true,
     ))
 }
@@ -307,6 +453,7 @@ pub async fn start_session(
     business: String,
     state: State<'_, AppState>,
 ) -> Result<Value> {
+    crate::workspace::current_scope(&state, "")?;
     adb::valid_serial(&serial)?;
     adb::valid_package(&package_name)?;
     if validation::fixed_build_url(&build_url).is_none() {
@@ -352,12 +499,15 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<()> {
 #[tauri::command]
 pub async fn mark_problem(id: String, state: State<'_, AppState>) -> Result<Value> {
     state.editable(&id)?;
-    let sid = state
+    if crate::capture::pending(&state.store, &id)? {
+        return Err("请等待当前证据采集完成后再记录问题".into());
+    }
+    let (sid, cancelled) = state
         .collector
         .lock()
         .unwrap()
         .as_ref()
-        .map(|c| c.id.clone())
+        .map(|c| (c.id.clone(), c.stop.subscribe()))
         .ok_or("请先开始采集")?;
     let session: Value = state.store.get("session", &sid)?.ok_or("会话不存在")?;
     if !session["stoppedAt"].is_null() {
@@ -371,75 +521,199 @@ pub async fn mark_problem(id: String, state: State<'_, AppState>) -> Result<Valu
         stop_session(state.clone()).await?;
         return Err("安装包身份在采集中发生变化，请建立新会话".into());
     }
+    let before = chrono::Utc::now().timestamp_micros();
+    let clock = adb::output(&path, Some(&serial), &["shell", "date", "+%s"], 5).await;
+    let after = chrono::Utc::now().timestamp_micros();
+    let offset = clock
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .and_then(|v| v.checked_mul(1_000_000))
+        .and_then(|v| v.checked_sub(before + (after - before) / 2));
+    let clock_note = if offset.is_some() {
+        format!(
+            "设备 epoch 秒与电脑请求中点估算；设备秒级精度，往返 {} ms，非精确同步",
+            (after - before) / 1000
+        )
+    } else {
+        "无法读取设备 epoch 时间；时间对应未知，不能宣称完整覆盖".into()
+    };
+    let temp = state.store.root.join(format!("capture-{}.png", uuid()));
+    let screenshot = match adb::screenshot(&path, &serial, &temp).await {
+        Ok(()) => evidence::inspect(&temp, "image", "ADB 问题时截图", &state.store.root),
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_file(temp);
+    let _write = state.store.writes.lock().unwrap();
+    state.editable(&id)?;
+    if crate::capture::pending(&state.store, &id)? {
+        return Err("该问题已有待完成采集".into());
+    }
     let mut d = state.store.draft(&id)?;
+    let scope = crate::workspace::current_scope(&state, "")?;
+    if state.store.get::<String>("draft_scope", &id)?.as_deref() != Some(&scope) {
+        return Err("草稿不属于当前账号或项目".into());
+    }
     d["sessionId"] = json!(sid);
     d["business"] = session["business"].clone();
     d["buildUrl"] = session["buildUrl"].clone();
     d["device"] = snapshot["device"].clone();
-    for (k, v) in snapshot["app"].as_object().unwrap() {
+    for (k, v) in snapshot["app"].as_object().ok_or("采集应用信息无效")? {
         d["app"][k] = v.clone();
     }
     d["sources"] = snapshot["sources"].clone();
     d["collectionErrors"] = snapshot["errors"].clone();
-    d["collectionErrors"]
-        .as_array_mut()
-        .unwrap()
-        .extend(session["gaps"].as_array().unwrap().iter().cloned());
-    d["collectionErrors"].as_array_mut().unwrap().push(json!(
-        "问题后日志请继续记录约 30 秒，然后点击固定会话日志；窗口未达到时需如实填写覆盖时间"
-    ));
-    d["event"] = json!({"occurredAt":marked,"originalAt":marked,"source":"auto","sourceNote":"电脑时钟标记；设备时间保存在会话快照中","lateCapture":false});
+    d["event"] = json!({"occurredAt":marked,"originalAt":marked,"source":"auto","sourceNote":"电脑时钟标记；日志保存设备时钟估算依据","lateCapture":false});
     d["previewConfirmed"] = json!(false);
-    let temp = state.store.root.join(format!("capture-{}.png", uuid()));
-    match adb::screenshot(&path, &serial, &temp).await {
-        Ok(()) => {
-            let a = evidence::inspect(&temp, "image", "ADB 问题时截图", &state.store.root)?;
-            d["attachments"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::to_value(a).unwrap());
-            let _ = std::fs::remove_file(temp);
-        }
+    d["updatedAt"] = json!(now());
+    match screenshot {
+        Ok(a) => d["attachments"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(a).unwrap()),
         Err(e) => d["collectionErrors"].as_array_mut().unwrap().push(json!(e)),
     }
     state.store.put("snapshot", &id, &snapshot)?;
-    state.store.put("draft", &id, &d)?;
+    crate::capture::schedule(
+        &state.store,
+        &d,
+        &sid,
+        &marked,
+        offset,
+        &clock_note,
+        cancelled,
+    )?;
     Ok(d)
 }
 #[tauri::command]
 pub fn pin_logs(id: String, state: State<AppState>) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
     state.editable(&id)?;
-    let mut d = state.store.draft(&id)?;
+    if crate::capture::pending(&state.store, &id)? {
+        return Err("正在等待问题后日志，请等待自动固定或先结束采集".into());
+    }
+    crate::capture::retry_interrupted(&state.store, &id)?;
+    state.store.draft(&id)
+}
+#[tauri::command]
+pub async fn capture_bugreport(id: String, state: State<'_, AppState>) -> Result<Value> {
+    state.editable(&id)?;
+    let d = state.store.draft(&id)?;
     let sid = string(&d, "sessionId");
     let session: Value = state
         .store
         .get("session", &sid)?
-        .ok_or("草稿没有关联采集会话")?;
-    for path in session["logFiles"].as_array().unwrap() {
-        let p = Path::new(path.as_str().unwrap());
-        if std::fs::metadata(p).is_ok_and(|m| m.len() > 0) {
-            let mut a = evidence::inspect(p, "log", "ADB 会话日志固定副本", &state.store.root)?;
-            a.coverage_start = string(&session, "startedAt");
-            a.coverage_end = if session["stoppedAt"].is_null() {
-                now()
+        .ok_or("请先记录问题并绑定设备会话")?;
+    let scope = crate::workspace::current_scope(&state, "")?;
+    if state.store.get::<String>("draft_scope", &id)?.as_deref() != Some(&scope) {
+        return Err("草稿不属于当前账号或项目".into());
+    }
+    let path = state.adb_path()?;
+    let task_id = uuid();
+    {
+        let _write = state.store.writes.lock().unwrap();
+        state.editable(&id)?;
+        if crate::capture::pending_kind(&state.store, &id, "bugreport")? {
+            return Err("系统报告正在采集，请勿重复启动".into());
+        }
+        state.store.put("capture", &task_id, &json!({"id":task_id,"draftId":id,"sessionId":sid,"kind":"bugreport","status":"pending","startedAt":now()}))?;
+    }
+    let result = adb::bugreport(&path, &string(&session, "serial"), &state.store.root, 120).await;
+    let _write = state.store.writes.lock().unwrap();
+    let mut task: Value = state
+        .store
+        .get("capture", &task_id)?
+        .ok_or("采集记录不存在")?;
+    task["finishedAt"] = json!(now());
+    let mut d = state.store.draft(&id)?;
+    match result {
+        Ok(c) => {
+            task["status"] = json!(if c.attachment.is_some() {
+                "complete"
             } else {
-                string(&session, "stoppedAt")
-            };
-            if p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains("existing")
-            {
-                a.coverage_start = String::new();
-                a.coverage_end = String::new();
+                "failed"
+            });
+            task["receipt"] = serde_json::to_value(&c).map_err(|e| e.to_string())?;
+            if let Some(a) = c.attachment {
+                d["attachments"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::to_value(a).unwrap());
+            } else {
+                d["collectionErrors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!(c.failure.unwrap_or("系统报告未完成".into())));
             }
-            d["attachments"]
-                .as_array_mut()
-                .unwrap()
-                .push(serde_json::to_value(a).unwrap());
+        }
+        Err(e) => {
+            task["status"] = json!("failed");
+            task["error"] = json!(e);
+            d["collectionErrors"].as_array_mut().unwrap().push(json!(e));
         }
     }
+    state.editable(&id)?;
     d["previewConfirmed"] = json!(false);
+    d["updatedAt"] = json!(now());
+    state.store.put("draft", &id, &d)?;
+    state.store.put("capture", &task_id, &task)?;
+    Ok(d)
+}
+#[tauri::command]
+pub fn redact_log(
+    id: String,
+    attachment_id: String,
+    literal: String,
+    state: State<AppState>,
+) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
+    state.editable(&id)?;
+    let mut d = state.store.draft(&id)?;
+    let original = attachments(&d)?
+        .into_iter()
+        .find(|a| a.id == attachment_id)
+        .ok_or("日志不存在")?;
+    let redacted = evidence::redact_text(
+        &state.store.root,
+        &original,
+        &[evidence::TextRedactionRule {
+            label: "用户指定文本".into(),
+            literal,
+        }],
+    )?;
+    let receipt = crate::capture::paired_report(
+        &state.store,
+        &redacted.receipt_path,
+        &redacted.attachment.id,
+        "文本替换记录（请核对副本）",
+    )?;
+    let mut inherited = Vec::new();
+    for a in attachments(&d)? {
+        if a.role == "report" && a.derived_from.as_deref() == Some(&original.id) {
+            let mut copy = evidence::inspect(
+                std::path::Path::new(&a.path),
+                "report",
+                &a.source,
+                &state.store.root,
+            )?;
+            copy.derived_from = Some(redacted.attachment.id.clone());
+            inherited.push(serde_json::to_value(copy).unwrap());
+        }
+    }
+    for a in d["attachments"].as_array_mut().unwrap() {
+        if string(a, "id") == original.id
+            || (string(a, "derivedFrom") == original.id && string(a, "role") == "report")
+        {
+            a["confirmed"] = json!(false);
+        }
+    }
+    d["attachments"].as_array_mut().unwrap().extend([
+        serde_json::to_value(redacted.attachment).unwrap(),
+        serde_json::to_value(receipt).unwrap(),
+    ]);
+    d["attachments"].as_array_mut().unwrap().extend(inherited);
+    d["previewConfirmed"] = json!(false);
+    d["updatedAt"] = json!(now());
     state.store.put("draft", &id, &d)?;
     Ok(d)
 }
@@ -455,6 +729,8 @@ pub async fn import_attachment(
         .pick_files()
         .await
         .ok_or("已取消")?;
+    let _write = state.store.writes.lock().unwrap();
+    state.editable(&id)?;
     let mut d = state.store.draft(&id)?;
     for f in files {
         let a = evidence::inspect(
@@ -481,6 +757,7 @@ pub fn confirm_attachment(
     coverage_end: String,
     state: State<AppState>,
 ) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
     state.editable(&id)?;
     let mut d = state.store.draft(&id)?;
     let row = d["attachments"]
@@ -494,6 +771,18 @@ pub fn confirm_attachment(
     row["confirmed"] = json!(confirmed);
     row["coverageStart"] = json!(coverage_start);
     row["coverageEnd"] = json!(coverage_end);
+    let owner = if a.role == "report" {
+        a.derived_from.as_deref().unwrap_or(&attachment_id)
+    } else {
+        &attachment_id
+    };
+    for paired in d["attachments"].as_array_mut().unwrap() {
+        if string(paired, "id") == owner
+            || (string(paired, "role") == "report" && string(paired, "derivedFrom") == owner)
+        {
+            paired["confirmed"] = json!(confirmed);
+        }
+    }
     d["previewConfirmed"] = json!(false);
     validation::check_shape(&d)?;
     state.assert_no_token(&d)?;
@@ -506,12 +795,13 @@ pub fn remove_attachment(
     attachment_id: String,
     state: State<AppState>,
 ) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
     state.editable(&id)?;
     let mut d = state.store.draft(&id)?;
-    d["attachments"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|a| string(a, "id") != attachment_id);
+    d["attachments"].as_array_mut().unwrap().retain(|a| {
+        string(a, "id") != attachment_id
+            && !(string(a, "role") == "report" && string(a, "derivedFrom") == attachment_id)
+    });
     d["previewConfirmed"] = json!(false);
     state.store.put("draft", &id, &d)?;
     Ok(d)
@@ -562,6 +852,9 @@ pub async fn export_evidence(
 }
 #[tauri::command]
 pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submission> {
+    submit_with_state(id, &state).await
+}
+pub(crate) async fn submit_with_state(id: String, state: &AppState) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
         if !locks.insert(id.clone()) {
@@ -569,12 +862,16 @@ pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submis
         }
     }
     let result = async {
+        let api = crate::workspace::submission_api(state, &id)?;
+        if crate::capture::pending(&state.store, &id)? {
+            return Err("证据仍在采集中，请等待采集完成或中断记录落盘后提交".into());
+        }
         let d = state.store.draft(&id)?;
         state.assert_no_token(&d)?;
         Submitter {
             store: state.store.clone(),
         }
-        .submit(&id, &state.api()?)
+        .submit(&id, &api)
         .await
     }
     .await;
@@ -587,6 +884,13 @@ pub async fn reconcile_submission(
     remote_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Submission> {
+    reconcile_with_state(id, remote_id, &state).await
+}
+pub(crate) async fn reconcile_with_state(
+    id: String,
+    remote_id: Option<String>,
+    state: &AppState,
+) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
         if !locks.insert(id.clone()) {
@@ -594,10 +898,11 @@ pub async fn reconcile_submission(
         }
     }
     let result = async {
+        let api = crate::workspace::submission_api(state, &id)?;
         Submitter {
             store: state.store.clone(),
         }
-        .reconcile(&id, &state.api()?, remote_id)
+        .reconcile(&id, &api, remote_id)
         .await
     }
     .await;
