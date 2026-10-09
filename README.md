@@ -37,7 +37,9 @@ Linux 编译需要 WebKitGTK 4.1、GTK 3、DBus、librsvg、patchelf 和 OpenSSL
 
 推送到 `main/master` 或创建 PR 执行检查。手动运行 **Desktop bundles** 或推送 `v*` tag 构建安装包，并保存为 Actions artifacts；不自动创建或发布 GitHub Release。
 
-macOS 构建使用 ad-hoc 签名；企业证书、Apple 公证及 Windows 签名后续接入。Linux x64 输出 `.deb` 与 `.AppImage`，Windows x64 输出 NSIS `.exe`，macOS 两架构分别输出 `.dmg` 与 `.app.zip`。其他架构可继续扩展矩阵。上传 GitHub 和运行 Actions 由用户后续执行，本次没有创建远端仓库。
+macOS 构建使用 ad-hoc 签名；企业证书、Apple 公证及 Windows 签名后续接入。Linux x64 输出 `.deb` 与 `.AppImage`，Windows x64 输出 NSIS `.exe`，macOS 两架构分别输出 `.dmg` 与 `.app.zip`。其他架构可继续扩展矩阵。
+
+远程仓库是 [guozhiqiang123/AndroidBugDesk](https://github.com/guozhiqiang123/AndroidBugDesk)。任务成果、版本候选、主分支合并和 Actions 构建按 [合并与推送约定](docs/git-delivery-policy.md) 推进；首次源码上传先完成公开历史检查。正式发布单独确认。
 
 ## 当前阶段
 
