@@ -28,6 +28,23 @@ import { applySelectionMemory, profileConfigured } from "./session";
 import { initialWorkspace, remoteAuthReaction } from "./session";
 import "./style.css";
 
+interface CaptureStatus {
+  id: string;
+  draftId: string;
+  kind: string;
+  status: string;
+  error?: string;
+  window?: { markedAt: string; dueAt: string };
+  summary?: {
+    rangeCovered: boolean;
+    selectedRecords: number;
+    coverageStart: string | null;
+    coverageEnd: string | null;
+    clockNote: string;
+    limitations: string[];
+    gaps: { reason: string }[];
+  };
+}
 interface Bootstrap {
   profile: Profile;
   authorized: boolean;
@@ -37,6 +54,7 @@ interface Bootstrap {
   drafts: Draft[];
   submissions: Submission[];
   sessions: Session[];
+  captures?: CaptureStatus[];
 }
 const stateLabels: Record<string, string> = {
   ready: "证据已固定",
@@ -248,6 +266,45 @@ function App() {
       }
     });
   }, [tab, boot?.authorized]);
+  useEffect(() => {
+    if (!isTauri() || !boot?.authorized || !draft?.sessionId) return;
+    let active = true;
+    const draftId = draft.id;
+    const timer = window.setInterval(() => {
+      if (busyGate.current) return;
+      void invoke<Bootstrap>("bootstrap")
+        .then((b) => {
+          if (!active) return;
+          setBoot(b);
+          const stored = b.drafts.find((d) => d.id === draftId);
+          if (!stored) return;
+          setDraft((current) => {
+            if (!current || current.id !== draftId) return current;
+            if (
+              JSON.stringify(current.attachments) ===
+                JSON.stringify(stored.attachments) &&
+              JSON.stringify(current.collectionErrors) ===
+                JSON.stringify(stored.collectionErrors)
+            )
+              return current;
+            setPreview(false);
+            return {
+              ...current,
+              attachments: stored.attachments,
+              collectionErrors: stored.collectionErrors,
+              previewConfirmed: false,
+            };
+          });
+        })
+        .catch((e) => {
+          if (active) setError(`读取本地采集进度失败：${String(e)}`);
+        });
+    }, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [boot?.authorized, draft?.id, draft?.sessionId]);
   const update = (path: string, value: unknown) => {
     if (!draft) return;
     const next = structuredClone(draft);
@@ -386,6 +443,9 @@ function App() {
       ? validateDraft(draft, boot.profile, boot.metadata, boot.authorized)
       : [];
   const frozen = !!boot?.submissions.some((s) => s.draftId === draft?.id);
+  const capturePending = (boot?.captures ?? []).some(
+    (t) => t.draftId === draft?.id && t.status === "pending",
+  );
   const currentSubmission = boot?.submissions.find(
     (s) => s.draftId === draft?.id,
   );
@@ -936,7 +996,7 @@ function App() {
                   停止采集
                 </button>
                 <button
-                  disabled={!session || frozen}
+                  disabled={!session || frozen || capturePending || !!busy}
                   onClick={() =>
                     void run("记录问题", async () => {
                       let d = draft;
@@ -961,8 +1021,8 @@ function App() {
                 </div>
               )}
               <p className="muted-text">
-                开始新会话会结束原会话。断线不会自动切换设备。记录问题后建议继续约
-                30 秒，再固定日志证据。
+                开始新会话会结束原会话。断线不会自动切换设备。记录问题后保持采集，
+                30 秒后自动固定日志；提前结束会如实记录缺口。
               </p>
             </details>
           </>
@@ -1253,9 +1313,68 @@ function App() {
                       void run("固定日志", () => mutate("pin_logs"))
                     }
                   >
-                    固定会话日志
+                    恢复中断窗口记录
                   </button>
                 </div>
+                <div className="actions">
+                  <button
+                    disabled={frozen || !draft.sessionId || !!busy}
+                    onClick={() =>
+                      void run("采集系统报告（最长两分钟）", () =>
+                        mutate("capture_bugreport"),
+                      )
+                    }
+                  >
+                    采集系统报告
+                  </button>
+                </div>
+                {(boot.captures ?? [])
+                  .filter((t) => t.draftId === draft.id)
+                  .map((t) => (
+                    <div className="capture-status" role="status" key={t.id}>
+                      <strong>
+                        {t.kind === "log-window" ? "问题日志窗口" : "系统报告"}{" "}
+                        ·{" "}
+                        {{
+                          pending: "采集中",
+                          complete: "采集结束",
+                          interrupted: "采集中断",
+                          failed: "采集失败",
+                        }[t.status] ?? t.status}
+                      </strong>
+                      {t.status === "pending" && t.window && (
+                        <p>
+                          正在保留问题后 30
+                          秒日志，请保持设备连接。完成后预览并选择要上传的副本。
+                        </p>
+                      )}
+                      {t.error && <p>{t.error}</p>}
+                      {t.summary && (
+                        <>
+                          <p>
+                            提取 {t.summary.selectedRecords} 条记录 ·{" "}
+                            {t.summary.rangeCovered
+                              ? "观察到请求窗口的时间边界"
+                              : "覆盖存在缺口或不确定项"}
+                          </p>
+                          <p>
+                            实际日志边界：{t.summary.coverageStart ?? "未知"} ～{" "}
+                            {t.summary.coverageEnd ?? "未知"}
+                          </p>
+                          <details>
+                            <summary>查看时间依据与缺口</summary>
+                            <p>{t.summary.clockNote}</p>
+                            {[
+                              ...t.summary.limitations,
+                              ...t.summary.gaps.map((g) => g.reason),
+                            ].map((v, n) => (
+                              <p key={n}>{v}</p>
+                            ))}
+                          </details>
+                        </>
+                      )}
+                    </div>
+                  ))}
                 <p className="muted-text">
                   文件先保存为本地副本。勾选后才进入证据包和上传；日志请填真实覆盖范围。超过{" "}
                   {boot.profile.attachmentWarningMb} MB
@@ -1274,6 +1393,11 @@ function App() {
                           coverageStart: start,
                           coverageEnd: end,
                         }),
+                      )
+                    }
+                    onRedact={(literal) =>
+                      void run("生成脱敏副本", () =>
+                        mutate("redact_log", { attachmentId: a.id, literal }),
                       )
                     }
                     onRemove={() =>
@@ -1365,6 +1489,7 @@ function App() {
                     disabled={
                       frozen ||
                       !!busy ||
+                      capturePending ||
                       issues.some((i) => i.field !== "previewConfirmed")
                     }
                     onClick={() =>
@@ -1453,7 +1578,9 @@ function App() {
                   </label>
                   <button
                     className="primary"
-                    disabled={!draft.previewConfirmed || !!busy}
+                    disabled={
+                      !draft.previewConfirmed || !!busy || capturePending
+                    }
                     onClick={() =>
                       void run("提交 Bug 并核对附件", async () => {
                         const d = await save();
@@ -1690,15 +1817,18 @@ function AttachmentCard({
   onConfirm,
   onRemove,
   onRead,
+  onRedact,
 }: {
   attachment: Attachment;
   disabled: boolean;
   onConfirm: (c: boolean, s: string, e: string) => void;
   onRemove: () => void;
   onRead: () => void;
+  onRedact: (literal: string) => void;
 }) {
   const [start, setStart] = useState(a.coverageStart),
     [end, setEnd] = useState(a.coverageEnd);
+  const [literal, setLiteral] = useState("");
   return (
     <article className="attachment">
       <div className="attachment-body">
@@ -1717,6 +1847,31 @@ function AttachmentCard({
           {a.role === "log" && (
             <>
               <button onClick={onRead}>预览日志</button>
+              <details className="redaction-control">
+                <summary>生成脱敏副本</summary>
+                <p>
+                  指定需要替换的文字，原文件保留。生成后须重新预览并确认副本；只替换完全匹配的文字。
+                </p>
+                <label className="field">
+                  <span>需要替换的文字</span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    disabled={disabled}
+                    value={literal}
+                    onChange={(e) => setLiteral(e.target.value)}
+                  />
+                </label>
+                <button
+                  disabled={disabled || !literal}
+                  onClick={() => {
+                    onRedact(literal);
+                    setLiteral("");
+                  }}
+                >
+                  生成副本
+                </button>
+              </details>
               <div className="grid">
                 <label className="field">
                   <span>真实覆盖起点（含时区）</span>

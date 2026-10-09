@@ -663,3 +663,27 @@ details.card > summary {
 details.card[open] > summary {
   margin-bottom: 20px;
 }
+
+.capture-status {
+  margin-top: 14px;
+  padding: 16px 18px;
+  background: #f5f8fc;
+  border: 1px solid #dce5ef;
+  border-radius: 12px;
+}
+.capture-status p,
+.redaction-control p {
+  margin: 8px 0;
+  color: #526479;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.capture-status summary,
+.redaction-control summary {
+  cursor: pointer;
+  color: #265cab;
+}
+.redaction-control {
+  margin: 10px 0;
+  max-width: 520px;
+}

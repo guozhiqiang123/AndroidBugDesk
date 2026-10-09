@@ -1,4 +1,5 @@
 pub mod adb;
+pub mod capture;
 pub mod commands;
 pub mod evidence;
 pub mod model;
@@ -42,6 +43,8 @@ pub fn run() {
             commands::stop_session,
             commands::mark_problem,
             commands::pin_logs,
+            commands::capture_bugreport,
+            commands::redact_log,
             commands::import_attachment,
             commands::confirm_attachment,
             commands::remove_attachment,
