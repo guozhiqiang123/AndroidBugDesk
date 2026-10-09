@@ -46,7 +46,11 @@ export function nativeTarget(
 ): string | undefined {
   return (
     profile.fieldMappings[field.id] ??
-    (field.type === "NativeField" &&
+    ((field.type === "NativeField" ||
+      (field.type === "Role" &&
+        ["verifier", "participants", "trackers"].includes(field.id)) ||
+      (field.type === "Application" &&
+        ["sprint", "versions", "labels"].includes(field.id))) &&
     [
       "subject",
       "description",
@@ -65,6 +69,7 @@ export function nativeTarget(
 export const supportedFormats = new Set([
   "list",
   "multiList",
+  "tag",
   "string",
   "text",
   "int",
@@ -310,14 +315,37 @@ export function validateDraft(
       }
       if (required && !present)
         add(`customFields.${field.id}`, `请补充云效必填字段「${field.name}」`);
-      if (!present || target) continue;
+      if (
+        !present ||
+        (target &&
+          [
+            "subject",
+            "description",
+            "assignedTo",
+            "sprint",
+            "versions",
+          ].includes(target))
+      )
+        continue;
       const values = Array.isArray(value) ? value : [value!];
       const options =
         field.format.includes("User") || field.format === "user"
           ? metadata.members
-          : field.options;
+          : field.format === "sprint"
+            ? metadata.sprints
+            : field.format === "version"
+              ? metadata.versions
+              : field.options;
       if (
-        ["list", "multiList", "user", "multiUser"].includes(field.format) &&
+        [
+          "list",
+          "multiList",
+          "tag",
+          "user",
+          "multiUser",
+          "sprint",
+          "version",
+        ].includes(field.format) &&
         values.some((v) => !options.some((o) => o.id === v))
       )
         add(`customFields.${field.id}`, `「${field.name}」选项已失效`);

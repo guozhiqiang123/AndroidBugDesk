@@ -156,6 +156,8 @@ export interface Field {
   format: string;
   type: string;
   required: boolean;
+  showWhenCreate?: boolean;
+  optionError?: string;
   options: Option[];
 }
 export interface Metadata {

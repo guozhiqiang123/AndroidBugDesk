@@ -58,7 +58,11 @@ pub fn check_shape(d: &Value) -> Result<()> {
 }
 pub fn native_target<'a>(f: &'a Field, p: &'a Profile) -> Option<&'a str> {
     p.field_mappings.get(&f.id).map(String::as_str).or_else(|| {
-        if f.field_type == "NativeField"
+        if (f.field_type == "NativeField"
+            || (f.field_type == "Role"
+                && ["verifier", "participants", "trackers"].contains(&f.id.as_str()))
+            || (f.field_type == "Application"
+                && ["sprint", "versions", "labels"].contains(&f.id.as_str())))
             && [
                 "subject",
                 "description",
@@ -343,6 +347,7 @@ pub fn validate(
                     && (![
                         "list",
                         "multiList",
+                        "tag",
                         "string",
                         "text",
                         "int",
@@ -371,7 +376,11 @@ pub fn validate(
                         format!("请补充云效必填字段「{}」", f.name)
                     );
                 }
-                if !present || target.is_some() {
+                if !present
+                    || target.is_some_and(|v| {
+                        ["subject", "description", "assignedTo", "sprint", "versions"].contains(&v)
+                    })
+                {
                     continue;
                 }
                 let options = match f.format.as_str() {
@@ -383,6 +392,7 @@ pub fn validate(
                 if [
                     "list",
                     "multiList",
+                    "tag",
                     "user",
                     "multiUser",
                     "sprint",

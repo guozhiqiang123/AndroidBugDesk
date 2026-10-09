@@ -46,6 +46,23 @@ button:disabled {
   display: flex;
   min-height: 100vh;
 }
+.app.login-page {
+  display: block;
+  min-height: 100vh;
+}
+.login-page main {
+  width: min(100% - 32px, 480px);
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 64px 0;
+}
+.login-page .card {
+  padding: 30px;
+}
+.login-page .primary {
+  min-width: 130px;
+  min-height: 44px;
+}
 aside {
   position: fixed;
   width: 244px;
@@ -525,4 +542,12 @@ details {
   .card {
     padding: 23px;
   }
+}
+
+details.card > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+details.card[open] > summary {
+  margin-bottom: 20px;
 }
