@@ -6,7 +6,7 @@ import {
   profileConfigured,
   remoteAuthReaction,
   tabForAuth,
-  workspaceDriver,
+  initialWorkspace,
 } from "../src/renderer/session";
 import type { Draft, Metadata } from "../src/shared/domain";
 import { nativeTarget } from "../src/shared/validation";
@@ -146,71 +146,18 @@ describe("登录和工作区门禁", () => {
     expect(next.customFields.untouched).toBe("keep");
   });
 
-  it("首次有效登录按组织、项目、metadata、新草稿、记忆顺序驱动主界面", async () => {
-    const calls: string[] = [];
-    const invoke = async (command: string) => {
-      calls.push(command);
-      if (command === "check_auth")
-        return {
-          status: "valid",
-          user: { id: "u", name: "U", lastOrganization: "org" },
-          message: "",
-        };
-      if (command === "bootstrap")
-        return {
-          profile: { organizationId: "org", projectId: "project", name: "P" },
-        };
-      if (command === "list_organizations") return [{ id: "org" }];
-      if (command === "list_projects") return [{ id: "project" }];
-      return {};
-    };
-    const result = await workspaceDriver(invoke);
-    expect(result).toEqual({
-      screen: "new",
-      configured: true,
-      metadataLoaded: true,
-    });
-    expect(calls).toEqual([
-      "check_auth",
-      "bootstrap",
-      "list_organizations",
-      "list_projects",
-      "load_metadata",
-      "new_draft",
-      "load_selection_memory",
-    ]);
+  it("启动只建立未授权登录页，不恢复凭据或项目", () => {
+    const state = initialWorkspace();
+    expect(state.authorized).toBe(false);
+    expect(state.user).toBeNull();
+    expect(state.metadata).toBeNull();
+    expect(profileConfigured(state.profile)).toBe(false);
+    expect(state.drafts).toEqual([]);
   });
 
-  it("撤权不复用旧项目，403留在主界面，401才退出", async () => {
-    expect(
-      profileConfigured({
-        organizationId: "unconfigured",
-        projectId: "unconfigured",
-        name: "unconfigured",
-      } as unknown as import("../src/shared/domain").Profile),
-    ).toBe(false);
+  it("权限不足保留主界面，确认令牌失效才返回登录", () => {
     expect(remoteAuthReaction("403 permission denied")).toBe("stay");
     expect(remoteAuthReaction("network timeout")).toBe("stay");
     expect(remoteAuthReaction("401 unauthorized")).toBe("logout");
-    const calls: string[] = [];
-    const result = await workspaceDriver(async (command) => {
-      calls.push(command);
-      if (command === "check_auth")
-        return { status: "valid", user: null, message: "" };
-      if (command === "bootstrap")
-        return {
-          profile: {
-            organizationId: "old-org",
-            projectId: "old-project",
-            name: "Old",
-          },
-        };
-      if (command === "list_organizations")
-        throw new Error("403 permission denied");
-      return [];
-    });
-    expect(result.screen).toBe("new");
-    expect(result.configured).toBe(false);
-    expect(calls).toEqual(["check_auth", "bootstrap", "list_organizations"]);
   });
 });

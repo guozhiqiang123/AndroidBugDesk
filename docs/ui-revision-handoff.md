@@ -6,11 +6,11 @@
 
 新增 IPC：`check_auth`、`login`、`list_organizations`、`list_projects`、`select_project`、`load_selection_memory`、`remember_selections`、`list_remote_history`。`bootstrap` 增加 user，authorized 表示在线校验通过。旧 set_auth 保留但改为异步校验；clear_auth 异步停止采集。DTO 在 `src/shared/workspace.ts`。Field.showWhenCreate 可选，旧夹具兼容；草稿 Schema 未改。
 
-启动调用官方 GET /oapi/v1/platform/user，401 为失效；403/网络/格式变化不假称令牌有效。登录成功进入主界面，项目读取失败留在主界面重试。组织、项目、创建字段、成员、标签、迭代及版本来自官方 API；未知必填字段或失效选项阻止写入。历史用只读 POST workitems:search，限定当前项目、Bug、当前账号创建者，50 条一页。创建/上传不确定结果保护沿用原实现。
+启动只读本机 bootstrap，显示空令牌输入页；用户点击“确定”后才调用官方 GET /oapi/v1/platform/user，401 为失效；403/网络/格式变化不假称令牌有效。登录成功进入主界面，项目读取失败留在主界面重试。组织、项目、创建字段、成员、标签、迭代及版本来自官方 API；未知必填字段或失效选项阻止写入。历史用只读 POST workitems:search，限定当前项目、Bug、当前账号创建者，50 条一页。创建/上传不确定结果保护沿用原实现。
 
 ## 数据兼容
 
-令牌只在验证成功后接受；默认内存，记住登录使用系统安全存储，无明文回退。项目配置以 profile:<userId> 隔离；选择记忆按用户/组织/项目/类型隔离，只保存当前合法下拉值。旧全局示例项目不自动恢复。
+令牌只在用户手动输入并验证成功后接受，仅进程内使用。启动不访问钥匙串，界面移除记住登录。旧 set_auth/login 的 remember 参数保留兼容，标准界面传 false。项目配置以 profile:<userId> 隔离；选择记忆按用户/组织/项目/类型隔离，只保存当前合法下拉值。旧全局示例项目不自动恢复。
 
 新草稿使用独立 draft_scope 绑定。旧未绑定草稿保留但阻止首次提交，需新建当前项目草稿补入需要的信息。已有提交状态沿用固定原项目恢复。不要删旧 SQLite、证据与回执，不用重复创建解决结果不确定。
 

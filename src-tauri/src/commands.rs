@@ -39,18 +39,11 @@ impl AppState {
         }
         // Restore only after validating the token's actual user. Never auto-select the example project.
         let profile = crate::workspace::empty_profile();
-        let remembered: bool = store.get("settings", "remembered")?.unwrap_or(false);
-        let token = if remembered {
-            keyring::Entry::new(SERVICE, "personal-pat")
-                .ok()
-                .and_then(|e| e.get_password().ok())
-        } else {
-            None
-        };
         Ok(Self {
             store,
             profile: Mutex::new(profile),
-            token: Mutex::new(token),
+            // Startup always requires manual entry, even if an older version saved a PAT.
+            token: Mutex::new(None),
             user: Mutex::new(None),
             auth_epoch: AtomicU64::new(0),
             workspace_epoch: AtomicU64::new(0),

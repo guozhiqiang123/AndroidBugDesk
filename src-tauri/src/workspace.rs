@@ -415,6 +415,19 @@ mod tests {
         token.zeroize();
     }
     #[tokio::test]
+    async fn startup_ignores_legacy_remembered_flag_and_requires_manual_token() {
+        let server = MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let previous = state(&server, root.path());
+        previous.store.put("settings", "remembered", &true).unwrap();
+        drop(previous);
+        let reopened = state(&server, root.path());
+        assert!(reopened.token.lock().unwrap().is_none());
+        assert!(reopened.user.lock().unwrap().is_none());
+        assert_eq!(check_auth(&reopened).await.unwrap().status, "missing");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    #[tokio::test]
     async fn startup_requires_real_validation_and_rejects_expired_cached_token() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

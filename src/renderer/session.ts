@@ -1,4 +1,10 @@
-import type { Draft, Metadata, Profile } from "../shared/domain";
+import type {
+  Draft,
+  Metadata,
+  Profile,
+  Session,
+  Submission,
+} from "../shared/domain";
 import type { AuthResult, SelectionMemory } from "../shared/workspace";
 
 export type AppTab = "auth" | "new" | "history";
@@ -17,40 +23,28 @@ export function remoteAuthReaction(error: unknown): "logout" | "stay" {
     : "stay";
 }
 
-export async function workspaceDriver(
-  invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
-): Promise<{ screen: AppTab; configured: boolean; metadataLoaded: boolean }> {
-  const auth = (await invoke("check_auth")) as AuthResult;
-  if (auth.status !== "valid")
-    return { screen: "auth", configured: false, metadataLoaded: false };
-  const bootstrap = (await invoke("bootstrap")) as { profile: Profile };
-  try {
-    const organizations = (await invoke("list_organizations")) as {
-      id: string;
-    }[];
-    const profile = bootstrap.profile;
-    const orgVisible = organizations.some(
-      (item) => item.id === profile.organizationId,
-    );
-    if (!orgVisible)
-      return { screen: "new", configured: false, metadataLoaded: false };
-    const projects = (await invoke("list_projects", {
-      organizationId: profile.organizationId,
-    })) as { id: string }[];
-    const projectVisible = projects.some(
-      (item) => item.id === profile.projectId,
-    );
-    if (!projectVisible)
-      return { screen: "new", configured: false, metadataLoaded: false };
-    await invoke("load_metadata", { typeId: "" });
-    await invoke("new_draft");
-    await invoke("load_selection_memory", { typeId: "" });
-    return { screen: "new", configured: true, metadataLoaded: true };
-  } catch (error) {
-    if (remoteAuthReaction(error) === "logout")
-      return { screen: "auth", configured: false, metadataLoaded: false };
-    return { screen: "new", configured: false, metadataLoaded: false };
-  }
+export function initialWorkspace() {
+  return {
+    profile: {
+      name: "请选择项目",
+      edition: "central",
+      organizationId: "unconfigured",
+      projectId: "unconfigured",
+      businessProfiles: ["Android 测试"],
+      requiredFieldIds: [],
+      fieldMappings: {},
+      enableVersions: true,
+      enableSprints: true,
+      attachmentWarningMb: 50,
+    } as Profile,
+    authorized: false,
+    user: null,
+    metadata: null as Metadata | null,
+    adbPath: null as string | null,
+    drafts: [] as Draft[],
+    submissions: [] as Submission[],
+    sessions: [] as Session[],
+  };
 }
 
 export function tabForAuth(result: Pick<AuthResult, "status">): AppTab {

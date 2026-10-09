@@ -25,6 +25,7 @@ import {
 } from "../shared/validation";
 import { enqueueSelectionWrite, tabForAuth } from "./session";
 import { applySelectionMemory, profileConfigured } from "./session";
+import { initialWorkspace, remoteAuthReaction } from "./session";
 import "./style.css";
 
 interface Bootstrap {
@@ -48,14 +49,13 @@ const stateLabels: Record<string, string> = {
   submitted: "提交完成",
 };
 function App() {
-  const [boot, setBoot] = useState<Bootstrap | null>(null),
+  const [boot, setBoot] = useState<Bootstrap | null>(initialWorkspace),
     [draft, setDraft] = useState<Draft | null>(null);
-  const [tab, setTab] = useState("new"),
+  const [tab, setTab] = useState("auth"),
     [busy, setBusy] = useState(""),
     [notice, setNotice] = useState(""),
     [error, setError] = useState("");
   const [token, setToken] = useState(""),
-    [remember, setRemember] = useState(false),
     [devices, setDevices] = useState<Device[]>([]),
     [serial, setSerial] = useState("");
   const [packageName, setPackageName] = useState(""),
@@ -124,9 +124,7 @@ function App() {
   const remoteErrorMessage = (error: unknown) =>
     typeof error === "string" ? error : String(error);
   const isAuthExpired = (error: unknown) =>
-    /(^|\D)401(\D|$)|unauthorized|令牌失效|授权失效|token.*(expired|invalid)|过期/i.test(
-      remoteErrorMessage(error),
-    );
+    remoteAuthReaction(error) === "logout";
   const handleRemoteError = async (error: unknown, context: string) => {
     const message = `${context}：${remoteErrorMessage(error)}`;
     if (isAuthExpired(error)) await invalidateAuth(message);
@@ -220,26 +218,16 @@ function App() {
   };
   useEffect(() => {
     if (isTauri())
-      void run("正在检查登录状态", async () => {
-        const checked = await invoke<AuthResult>("check_auth");
-        setAuth(checked);
-        const b = await refresh();
-        const authorized = checked.status === "valid";
-        setBoot({ ...b, authorized, user: checked.user });
+      void run("打开登录页", async () => {
+        const b = await invoke<Bootstrap>("bootstrap");
+        setAuth({
+          status: "missing",
+          user: null,
+          message: "请输入个人访问令牌",
+        });
+        setBoot({ ...b, authorized: false, user: null, metadata: null });
         setDraft(null);
-        setTab(tabForAuth(checked));
-        if (authorized) {
-          try {
-            const validProject = await loadWorkspace(b.profile);
-            if (profileConfigured(b.profile) && validProject) {
-              await loadProjectMetadataAndDraft(b.profile);
-            } else {
-              setDraft(null);
-            }
-          } catch (e) {
-            await handleRemoteError(e, "云效项目读取失败");
-          }
-        }
+        setTab("auth");
       });
   }, []);
   useEffect(() => {
@@ -517,8 +505,8 @@ function App() {
   if (!boot)
     return (
       <main className="browser-message">
-        <h1>正在检查登录状态</h1>
-        <p>{error || "正在检查登录令牌…"}</p>
+        <h1>打开登录页</h1>
+        <p>{error || "正在读取本机数据…"}</p>
       </main>
     );
   return (
@@ -666,14 +654,6 @@ function App() {
                   placeholder="输入你的个人访问令牌"
                 />
               </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={remember}
-                  onChange={(e) => setRemember(e.target.checked)}
-                />
-                记住登录（使用系统安全存储）
-              </label>
               <div className="actions">
                 <button
                   className="primary"
@@ -684,7 +664,7 @@ function App() {
                       try {
                         result = await invoke<AuthResult>("login", {
                           token,
-                          remember,
+                          remember: false,
                         });
                       } catch (e) {
                         setToken("");
@@ -695,6 +675,7 @@ function App() {
                       }
                       setToken("");
                       setAuth(result);
+                      setTab(tabForAuth(result));
                       if (result.status !== "valid") {
                         setError(
                           result.message || "令牌校验失败，请重新输入。",
