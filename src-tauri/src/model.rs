@@ -70,6 +70,9 @@ pub struct OptionItem {
     pub id: String,
     pub name: String,
 }
+fn default_true() -> bool {
+    true
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Field {
     pub id: String,
@@ -78,6 +81,14 @@ pub struct Field {
     #[serde(rename = "type")]
     pub field_type: String,
     pub required: bool,
+    #[serde(rename = "showWhenCreate", default = "default_true")]
+    pub show_when_create: bool,
+    #[serde(
+        rename = "optionError",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub option_error: Option<String>,
     pub options: Vec<OptionItem>,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
 import {
@@ -12,21 +12,50 @@ import {
   type Attachment,
   type Option,
 } from "../shared/domain";
+import type {
+  AuthResult,
+  HistoryPage,
+  SelectionMemory,
+  UserIdentity,
+} from "../shared/workspace";
 import {
   nativeTarget,
   validateDraft,
   supportedFormats,
 } from "../shared/validation";
+import { enqueueSelectionWrite, tabForAuth } from "./session";
+import { applySelectionMemory, profileConfigured } from "./session";
+import { initialWorkspace, remoteAuthReaction } from "./session";
 import "./style.css";
+import { UserProfile } from "./user-profile";
 
+interface CaptureStatus {
+  id: string;
+  draftId: string;
+  kind: string;
+  status: string;
+  error?: string;
+  window?: { markedAt: string; dueAt: string };
+  summary?: {
+    rangeCovered: boolean;
+    selectedRecords: number;
+    coverageStart: string | null;
+    coverageEnd: string | null;
+    clockNote: string;
+    limitations: string[];
+    gaps: { reason: string }[];
+  };
+}
 interface Bootstrap {
   profile: Profile;
   authorized: boolean;
+  user?: UserIdentity | null;
   metadata: Metadata | null;
   adbPath: string | null;
   drafts: Draft[];
   submissions: Submission[];
   sessions: Session[];
+  captures?: CaptureStatus[];
 }
 const stateLabels: Record<string, string> = {
   ready: "证据已固定",
@@ -39,14 +68,13 @@ const stateLabels: Record<string, string> = {
   submitted: "提交完成",
 };
 function App() {
-  const [boot, setBoot] = useState<Bootstrap | null>(null),
+  const [boot, setBoot] = useState<Bootstrap | null>(initialWorkspace),
     [draft, setDraft] = useState<Draft | null>(null);
   const [tab, setTab] = useState("auth"),
     [busy, setBusy] = useState(""),
     [notice, setNotice] = useState(""),
     [error, setError] = useState("");
   const [token, setToken] = useState(""),
-    [remember, setRemember] = useState(false),
     [devices, setDevices] = useState<Device[]>([]),
     [serial, setSerial] = useState("");
   const [packageName, setPackageName] = useState(""),
@@ -57,32 +85,227 @@ function App() {
     [log, setLog] = useState(""),
     [dirty, setDirty] = useState(false);
   const [remoteId, setRemoteId] = useState("");
+  const [auth, setAuth] = useState<AuthResult | null>(null);
+  const [remoteHistory, setRemoteHistory] = useState<HistoryPage | null>(null);
+  const [remoteHistoryPage, setRemoteHistoryPage] = useState(1);
+  const [remoteHistoryError, setRemoteHistoryError] = useState("");
+  const [organizations, setOrganizations] = useState<Option[]>([]);
+  const [projects, setProjects] = useState<Option[]>([]);
+  const [organizationId, setOrganizationId] = useState("");
+  const [projectId, setProjectId] = useState("");
+  const memoryWrite = useRef<Promise<unknown>>(Promise.resolve());
+  const busyGate = useRef(false);
+  const workspaceEpoch = useRef(0);
   const refresh = async () => {
     const b = await invoke<Bootstrap>("bootstrap");
     setBoot(b);
     return b;
   };
   const run = async (name: string, work: () => Promise<unknown>) => {
-    if (busy) return;
+    if (busyGate.current) return;
+    busyGate.current = true;
     setBusy(name);
     setError("");
     setNotice("");
     try {
       await work();
     } catch (e) {
-      setError(typeof e === "string" ? e : String(e));
+      if (isAuthExpired(e))
+        await invalidateAuth(`授权已失效：${remoteErrorMessage(e)}`);
+      else setError(typeof e === "string" ? e : String(e));
     } finally {
+      busyGate.current = false;
       setBusy("");
     }
   };
+  const invalidateAuth = async (message: string) => {
+    workspaceEpoch.current += 1;
+    await invoke("clear_auth").catch(() => undefined);
+    setDraft(null);
+    setDirty(false);
+    setPreview(false);
+    setSession(null);
+    setDevices([]);
+    setSerial("");
+    setPackageName("");
+    setBuildUrl("");
+    setBusiness("");
+    setAuth({ status: "invalid", user: null, message });
+    setOrganizations([]);
+    setProjects([]);
+    setRemoteHistory(null);
+    setRemoteHistoryError(message);
+    setBoot((b) =>
+      b ? { ...b, authorized: false, user: null, metadata: null } : b,
+    );
+    setTab("auth");
+  };
+  const remoteErrorMessage = (error: unknown) =>
+    typeof error === "string" ? error : String(error);
+  const isAuthExpired = (error: unknown) =>
+    remoteAuthReaction(error) === "logout";
+  const handleRemoteError = async (error: unknown, context: string) => {
+    const message = `${context}：${remoteErrorMessage(error)}`;
+    if (isAuthExpired(error)) await invalidateAuth(message);
+    else setError(message);
+  };
+  const loadWorkspace = async (profile: Profile): Promise<boolean> => {
+    const orgs = await invoke<Option[]>("list_organizations");
+    setOrganizations(orgs);
+    const rememberedOrg = orgs.some((o) => o.id === profile.organizationId)
+      ? profile.organizationId
+      : "";
+    setOrganizationId(rememberedOrg);
+    if (!rememberedOrg) {
+      setProjects([]);
+      setProjectId("");
+      return false;
+    }
+    const nextProjects = await invoke<Option[]>("list_projects", {
+      organizationId: rememberedOrg,
+    });
+    setProjects(nextProjects);
+    const validProject = nextProjects.some((p) => p.id === profile.projectId);
+    setProjectId(validProject ? profile.projectId : "");
+    return validProject;
+  };
+  const retryWorkspace = async () => {
+    if (!boot?.authorized) return;
+    try {
+      const validProject = await loadWorkspace(boot.profile);
+      if (validProject && profileConfigured(boot.profile))
+        await loadProjectMetadataAndDraft(boot.profile);
+      else {
+        setDraft(null);
+        setError("当前项目已不可访问，请重新选择组织和项目。");
+      }
+    } catch (error) {
+      await handleRemoteError(error, "云效项目读取失败");
+    }
+  };
+  const loadProjectMetadataAndDraft = async (profile: Profile) => {
+    const epoch = ++workspaceEpoch.current;
+    const metadata = await invoke<Metadata>("load_metadata", { typeId: "" });
+    if (epoch !== workspaceEpoch.current) return;
+    setBoot((current) =>
+      current ? { ...current, profile, metadata, authorized: true } : current,
+    );
+    const fresh = await invoke<Draft>("new_draft");
+    if (epoch !== workspaceEpoch.current) return;
+    fresh.workitemTypeId = metadata.typeId;
+    let initialized = fresh;
+    try {
+      const memory = await invoke<Partial<SelectionMemory>>(
+        "load_selection_memory",
+        {
+          typeId: metadata.typeId,
+        },
+      );
+      if (epoch !== workspaceEpoch.current) return;
+      initialized = applySelectionMemory(fresh, memory, metadata, profile);
+      await invoke<Draft>("save_draft", {
+        draft: draftSchema.parse(initialized),
+      });
+    } catch (error) {
+      setError(`读取选择记忆失败：${remoteErrorMessage(error)}`);
+    }
+    if (epoch === workspaceEpoch.current) {
+      setDraft(initialized);
+      setDirty(false);
+      setPreview(false);
+    }
+  };
+  const selectProject = async (
+    nextOrganizationId: string,
+    nextProjectId: string,
+  ) => {
+    if (!nextOrganizationId || !nextProjectId) return;
+    await memoryWrite.current;
+    if (dirty && draft) await save();
+    const profile = await invoke<Profile>("select_project", {
+      organizationId: nextOrganizationId,
+      projectId: nextProjectId,
+    });
+    const b = await refresh();
+    setBoot({ ...b, profile, authorized: true, metadata: null });
+    setOrganizationId(nextOrganizationId);
+    setProjectId(nextProjectId);
+    await loadProjectMetadataAndDraft(profile);
+    setDirty(false);
+    setPreview(false);
+    setNotice("项目已切换，已建立新的项目草稿；旧草稿保留在本机历史中。");
+  };
   useEffect(() => {
     if (isTauri())
-      void run("加载本地草稿", async () => {
-        const b = await refresh();
-        setDraft(b.drafts[0] ?? null);
-        setTab(b.authorized ? "capture" : "auth");
+      void run("打开登录页", async () => {
+        const b = await invoke<Bootstrap>("bootstrap");
+        setAuth({
+          status: "missing",
+          user: null,
+          message: "请输入个人访问令牌",
+        });
+        setBoot({ ...b, authorized: false, user: null, metadata: null });
+        setDraft(null);
+        setTab("auth");
       });
   }, []);
+  useEffect(() => {
+    if (!isTauri() || tab !== "history" || !boot?.authorized) return;
+    void run("读取云效历史", async () => {
+      setRemoteHistoryError("");
+      try {
+        const page = await invoke<HistoryPage>("list_remote_history", {
+          page: 1,
+        });
+        setRemoteHistory(page);
+        setRemoteHistoryPage(1);
+      } catch (e) {
+        setRemoteHistory(null);
+        const message = `云效历史读取失败：${remoteErrorMessage(e)}`;
+        setRemoteHistoryError(message);
+        await handleRemoteError(e, "云效历史读取失败");
+      }
+    });
+  }, [tab, boot?.authorized]);
+  useEffect(() => {
+    if (!isTauri() || !boot?.authorized || !draft?.sessionId) return;
+    let active = true;
+    const draftId = draft.id;
+    const timer = window.setInterval(() => {
+      if (busyGate.current) return;
+      void invoke<Bootstrap>("bootstrap")
+        .then((b) => {
+          if (!active) return;
+          setBoot(b);
+          const stored = b.drafts.find((d) => d.id === draftId);
+          if (!stored) return;
+          setDraft((current) => {
+            if (!current || current.id !== draftId) return current;
+            if (
+              JSON.stringify(current.attachments) ===
+                JSON.stringify(stored.attachments) &&
+              JSON.stringify(current.collectionErrors) ===
+                JSON.stringify(stored.collectionErrors)
+            )
+              return current;
+            setPreview(false);
+            return {
+              ...current,
+              attachments: stored.attachments,
+              collectionErrors: stored.collectionErrors,
+              previewConfirmed: false,
+            };
+          });
+        })
+        .catch((e) => {
+          if (active) setError(`读取本地采集进度失败：${String(e)}`);
+        });
+    }, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [boot?.authorized, draft?.id, draft?.sessionId]);
   const update = (path: string, value: unknown) => {
     if (!draft) return;
     const next = structuredClone(draft);
@@ -97,6 +320,51 @@ function App() {
     setDraft(next);
     setDirty(true);
     setPreview(false);
+  };
+  const changeType = async (typeId: string) => {
+    if (!draft || !typeId) return;
+    await memoryWrite.current;
+    const saved = dirty ? await save() : draft;
+    const next = structuredClone(saved);
+    next.workitemTypeId = typeId;
+    next.assignedTo = "";
+    next.sprint = "";
+    next.versions = [];
+    next.customFields = {};
+    const metadata = await invoke<Metadata>("load_metadata", { typeId });
+    setBoot((current) => (current ? { ...current, metadata } : current));
+    const memory = await invoke<Partial<SelectionMemory>>(
+      "load_selection_memory",
+      { typeId },
+    );
+    const initialized = applySelectionMemory(
+      next,
+      memory,
+      metadata,
+      boot?.profile,
+    );
+    setDraft(initialized);
+    setDirty(true);
+    setPreview(false);
+    rememberSelections(initialized);
+  };
+  const rememberSelections = (next: Draft) => {
+    const selection: SelectionMemory = {
+      workitemTypeId: next.workitemTypeId,
+      assignedTo: next.assignedTo,
+      sprint: next.sprint,
+      versions: next.versions,
+      kind: next.kind,
+      business: next.business,
+      customFields: next.customFields,
+    };
+    memoryWrite.current = enqueueSelectionWrite(
+      memoryWrite.current,
+      () => invoke("remember_selections", { selection }),
+      (e) => {
+        setError(`选择记忆保存失败：${typeof e === "string" ? e : String(e)}`);
+      },
+    );
   };
   const save = async (d = draft) => {
     if (!d) throw "请先创建草稿";
@@ -118,19 +386,67 @@ function App() {
     await refresh();
   };
   const newDraft = async () => {
+    if (!boot?.authorized || !profileConfigured(boot.profile) || !projectId) {
+      setError("请先在上方选择可访问的组织和项目。");
+      return;
+    }
+    await memoryWrite.current;
     if (dirty && draft) await save();
-    const d = await invoke<Draft>("new_draft");
-    setDraft(d);
-    setDirty(false);
-    setPreview(false);
-    setTab("problem");
+    await loadProjectMetadataAndDraft(boot.profile);
+    setTab("new");
     await refresh();
+  };
+  const confirmLogin = async () => {
+    let result: AuthResult;
+    try {
+      result = await invoke<AuthResult>("login", {
+        token,
+        remember: false,
+      });
+    } catch (e) {
+      setToken("");
+      await invalidateAuth(
+        `云效授权校验失败：${typeof e === "string" ? e : String(e)}`,
+      );
+      return;
+    }
+    setToken("");
+    setAuth(result);
+    if (result.status !== "valid") {
+      setTab(tabForAuth(result));
+      setError(result.message || "令牌校验失败，请重新输入。");
+      setBoot((b) => (b ? { ...b, authorized: false, user: result.user } : b));
+      return;
+    }
+    const next = await refresh();
+    setBoot({ ...next, authorized: true, user: result.user });
+    setTab("new");
+    let validProject = false;
+    try {
+      validProject = await loadWorkspace(next.profile);
+    } catch (e) {
+      await handleRemoteError(e, "云效项目读取失败");
+      return;
+    }
+    if (profileConfigured(next.profile) && validProject) {
+      try {
+        await loadProjectMetadataAndDraft(next.profile);
+      } catch (e) {
+        await handleRemoteError(e, "云效元数据读取失败");
+        return;
+      }
+    }
+    setTab("new");
+    setNotice("登录成功，已进入新建提交。");
   };
   const issues =
     draft && boot
       ? validateDraft(draft, boot.profile, boot.metadata, boot.authorized)
       : [];
   const frozen = !!boot?.submissions.some((s) => s.draftId === draft?.id);
+  const capturePending = (boot?.captures ?? []).some(
+    (t) => t.draftId === draft?.id && t.status === "pending",
+  );
   const currentSubmission = boot?.submissions.find(
     (s) => s.draftId === draft?.id,
   );
@@ -181,32 +497,112 @@ function App() {
     label: string,
     options: Option[],
     multiple = false,
+    optionError?: string,
   ) => (
     <label className="field" id={`field-${path}`} key={path}>
       <span>{label}</span>
       <select
         multiple={multiple}
         value={multiple ? (value(path) as string[]) : String(value(path))}
-        onChange={(e) =>
-          update(
-            path,
-            multiple
-              ? Array.from(e.target.selectedOptions, (o) => o.value)
-              : e.target.value,
-          )
-        }
+        onChange={(e) => {
+          const nextValue = multiple
+            ? Array.from(e.target.selectedOptions, (o) => o.value)
+            : e.target.value;
+          if (path === "workitemTypeId" && !multiple) {
+            void run("读取类型字段", () => changeType(String(nextValue)));
+            return;
+          }
+          update(path, nextValue);
+          if (draft) {
+            const next = structuredClone(draft);
+            const parts = path.split(".");
+            let obj = next as unknown as Record<string, unknown>;
+            for (const p of parts.slice(0, -1))
+              obj = obj[p] as Record<string, unknown>;
+            obj[parts.at(-1)!] = nextValue;
+            rememberSelections(next);
+          }
+        }}
       >
         {!multiple && <option value="">请选择</option>}
         {options.map((o) => (
           <option key={o.id} value={o.id}>
             {o.name}
-            {o.name !== o.id ? ` · ${o.id}` : ""}
+            {(o as Option & { description?: string }).description
+              ? ` · ${(o as Option & { description?: string }).description}`
+              : ""}
           </option>
         ))}
       </select>
-      <small>{issues.find((i) => i.field === path)?.message}</small>
+      <small>
+        {issues.find((i) => i.field === path)?.message ??
+          optionError ??
+          (!options.length ? "API 暂未提供可选值" : "")}
+      </small>
     </label>
   );
+  const dynamicFields = boot?.metadata ? (
+    <section className="card dynamic-fields">
+      <div className="card-title">
+        <h2>云效关键字段</h2>
+        <span className="section-hint">选项来自当前项目</span>
+      </div>
+      <div className="grid">
+        {boot.metadata.fields
+          .filter(
+            (f) =>
+              ![
+                "subject",
+                "description",
+                "assignedTo",
+                "sprint",
+                "versions",
+              ].includes(nativeTarget(f, boot.profile) ?? ""),
+          )
+          .filter((f) => f.showWhenCreate !== false || f.required)
+          .map((f) => {
+            const path = `customFields.${f.id}`;
+            const opts = ["user", "multiUser"].includes(f.format)
+              ? boot.metadata!.members
+              : f.format === "sprint"
+                ? boot.metadata!.sprints
+                : f.format === "version"
+                  ? boot.metadata!.versions
+                  : f.options;
+            if (!supportedFormats.has(f.format))
+              return (
+                <p className="banner error" key={f.id}>
+                  「{f.name}」格式 {f.format} 未支持，请完善映射或实现后再提交。
+                </p>
+              );
+            if (
+              [
+                "list",
+                "multiList",
+                "user",
+                "multiUser",
+                "sprint",
+                "version",
+                "tag",
+              ].includes(f.format)
+            ) {
+              return select(
+                path,
+                `${f.name}${f.required ? "（必填）" : ""}`,
+                opts,
+                ["multiList", "multiUser", "version", "tag"].includes(f.format),
+                f.optionError,
+              );
+            }
+            return field(path, `${f.name}${f.required ? "（必填）" : ""}`, {
+              multi: f.format === "text",
+              type: f.format === "date" ? "date" : "text",
+            });
+          })}
+      </div>
+      {!boot.metadata.fields.length && <p>当前类型没有额外字段。</p>}
+    </section>
+  ) : null;
   if (!isTauri())
     return (
       <main className="browser-message">
@@ -218,112 +614,164 @@ function App() {
   if (!boot)
     return (
       <main className="browser-message">
-        <h1>正在打开工作台</h1>
-        <p>{error || "读取本地草稿…"}</p>
+        <h1>打开登录页</h1>
+        <p>{error || "正在读取本机数据…"}</p>
       </main>
     );
   return (
-    <div className="app">
-      <aside>
-        <div className="brand">
-          <span className="brand-icon">A</span>
-          <div>
-            Android Bug Desk<small>测试证据工作台</small>
+    <div className={`app ${boot.authorized ? "" : "login-page"}`}>
+      {boot.authorized && (
+        <aside>
+          <div className="brand">
+            <span className="brand-icon">A</span>
+            <div>
+              Android Bug Desk<small>测试证据工作台</small>
+            </div>
           </div>
-        </div>
-        <div className="nav-caption">提交一个可追溯的问题</div>
-        <nav>
-          {[
-            ["auth", "01", "授权与项目"],
-            ["capture", "02", "连接与采集"],
-            ["problem", "03", "问题与证据"],
-            ["history", "04", "提交记录"],
-          ].map(([id, num, title]) => (
-            <button
-              className={tab === id ? "active" : ""}
-              onClick={() => setTab(id)}
-              key={id}
-            >
-              <span>{num}</span>
-              {title}
-            </button>
-          ))}
-        </nav>
-        <div className="aside-status">
-          <span className={boot.authorized ? "dot" : "dot muted"} />
-          {boot.authorized ? "个人授权已载入" : "可离线采集与保存"}
-          <small>
-            {boot.profile.name}
-            <br />
-            v0.1.0 · 本地优先
-          </small>
-        </div>
-      </aside>
+          <div className="nav-caption">工作台</div>
+          <nav>
+            {[
+              ["new", "01", "新建提交"],
+              ["history", "02", "历史提交"],
+            ].map(([id, num, title]) => (
+              <button
+                className={tab === id ? "active" : ""}
+                onClick={() => setTab(id)}
+                key={id}
+              >
+                <span>{num}</span>
+                {title}
+              </button>
+            ))}
+          </nav>
+          <div className="aside-status">
+            <UserProfile key={boot.user?.id || "anonymous"} user={boot.user} />
+            <small>
+              {boot.profile.name}
+              <br />
+              v0.1.0 · 本地优先
+            </small>
+          </div>
+        </aside>
+      )}
       <main>
-        <header>
-          <div>
-            <span className="eyebrow">ANDROID QA WORKSPACE</span>
-            <h1>
-              {
-                {
-                  auth: "授权与项目",
-                  capture: "连接与采集",
-                  problem: "问题与证据",
-                  history: "提交记录",
-                }[tab]
-              }
-            </h1>
-            <p>
-              {
-                {
-                  auth: "使用你的个人权限提交，草稿始终保存在本机。",
-                  capture: "明确选择 USB 设备，让日志跟随每一次复现。",
-                  problem: "补齐事实、确认材料，再把完整证据交给开发。",
-                  history: "查看真实提交阶段，恢复尚未完成的证据上传。",
-                }[tab]
-              }
-            </p>
-          </div>
-          <div className="header-actions">
-            <button onClick={() => void run("创建草稿", newDraft)}>
-              ＋ 新建问题
-            </button>
-            {draft && (
-              <span className="pill">
-                {frozen ? "证据已固定" : dirty ? "草稿未保存" : "草稿已保存"}
-              </span>
-            )}
-          </div>
-        </header>
-        {busy && (
+        {boot.authorized && (
+          <header>
+            <div>
+              <span className="eyebrow">Android 缺陷工作台</span>
+              <h1>{tab === "history" ? "历史提交" : "新建提交"}</h1>
+              <p>
+                {tab === "history"
+                  ? "查看本机持久记录和云效已创建的历史 Bug。"
+                  : "连接设备，补齐 Bug 关键信息并提交可追溯证据。"}
+              </p>
+            </div>
+            <div className="header-actions">
+              <button
+                disabled={
+                  !profileConfigured(boot.profile) || !projectId || !!busy
+                }
+                title={!projectId ? "请先选择组织和项目" : undefined}
+                onClick={() => void run("创建草稿", newDraft)}
+              >
+                ＋ 新建问题
+              </button>
+              {draft && (
+                <span className="pill">
+                  {frozen ? "证据已固定" : dirty ? "草稿未保存" : "草稿已保存"}
+                </span>
+              )}
+              <button
+                onClick={() =>
+                  void run("退出登录", async () => {
+                    if (dirty && draft) await save();
+                    await memoryWrite.current;
+                    workspaceEpoch.current += 1;
+                    await invoke("clear_auth");
+                    memoryWrite.current = Promise.resolve();
+                    setSession(null);
+                    setSerial("");
+                    setDevices([]);
+                    setPackageName("");
+                    setBuildUrl("");
+                    setBusiness("");
+                    setDraft(null);
+                    setDirty(false);
+                    setAuth({
+                      status: "missing",
+                      user: null,
+                      message: "未登录",
+                    });
+                    setOrganizations([]);
+                    setProjects([]);
+                    setRemoteHistory(null);
+                    setBoot((b) =>
+                      b
+                        ? {
+                            ...b,
+                            authorized: false,
+                            user: null,
+                            metadata: null,
+                          }
+                        : b,
+                    );
+                    setTab("auth");
+                  })
+                }
+              >
+                退出登录
+              </button>
+            </div>
+          </header>
+        )}
+        {boot.authorized && busy && (
           <div className="banner loading" role="status">
             {busy}…
           </div>
         )}
-        {error && (
+        {boot.authorized && error && (
           <div className="banner error" role="alert">
             {error}
           </div>
         )}
-        {notice && (
+        {boot.authorized && notice && (
           <div className="banner success" role="status">
             {notice}
           </div>
         )}
         {tab === "auth" && (
-          <>
-            <section className="card">
-              <div className="card-title">
-                <h2>个人云效授权</h2>
-                <span className="pill">
-                  {boot.metadata ? "项目读取已验证" : "未完成项目读取验证"}
-                </span>
+          <section className="card login-card" aria-labelledby="login-title">
+            <div className="login-brand">
+              <span className="login-mark" aria-hidden="true">
+                A
+              </span>
+              <span>Android Bug Desk</span>
+            </div>
+            <h2 id="login-title">登录云效</h2>
+            <p className="login-intro">输入个人访问令牌，进入缺陷工作台。</p>
+            {(error ||
+              (auth &&
+                auth.status !== "missing" &&
+                auth.status !== "valid" &&
+                auth.message)) && (
+              <div className="banner error" role="alert">
+                {error || auth?.message}
               </div>
-              <p className="muted-text">
-                请输入个人访问令牌。只读验证不会创建缺陷，也不代表附件写入权限已验收。
-              </p>
+            )}
+            {busy && (
+              <div className="banner loading" role="status">
+                {busy}…
+              </div>
+            )}
+            <form
+              className="login-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void run("验证授权", confirmLogin);
+              }}
+            >
               <label className="field">
-                <span>个人 PAT</span>
+                <span>个人访问令牌</span>
                 <input
                   autoComplete="off"
                   type="password"
@@ -332,97 +780,20 @@ function App() {
                   placeholder="输入你的个人访问令牌"
                 />
               </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={remember}
-                  onChange={(e) => setRemember(e.target.checked)}
-                />
-                在系统安全存储中保存（钥匙串 / Windows 凭据 / Linux Secret
-                Service）
-              </label>
-              <div className="actions">
-                <button
-                  className="primary"
-                  disabled={!token || !!busy}
-                  onClick={() =>
-                    void run("验证授权", async () => {
-                      await invoke("set_auth", { token, remember });
-                      setToken("");
-                      await refresh();
-                      const m = await invoke<Metadata>("load_metadata", {
-                        typeId: "",
-                      });
-                      setBoot((b) => (b ? { ...b, metadata: m } : b));
-                      setNotice(
-                        "项目读取已验证；真实创建和媒体上传仍需单独验收。",
-                      );
-                    })
-                  }
-                >
-                  授权并读取项目
-                </button>
-                <button
-                  onClick={() =>
-                    void run("清除授权", async () => {
-                      await invoke("clear_auth");
-                      setToken("");
-                      await refresh();
-                    })
-                  }
-                >
-                  清除授权
-                </button>
-              </div>
-            </section>
-            <section className="card">
-              <h2>项目配置</h2>
-              <div className="facts">
-                <div>
-                  <small>项目</small>
-                  <strong>{boot.profile.name}</strong>
-                </div>
-                <div>
-                  <small>组织 ID</small>
-                  <code>{boot.profile.organizationId}</code>
-                </div>
-                <div>
-                  <small>项目 ID</small>
-                  <code>{boot.profile.projectId}</code>
-                </div>
-              </div>
-              <p>{boot.profile.businessProfiles.join(" / ")}</p>
-              <div className="actions">
-                <button
-                  onClick={() =>
-                    void run("导入配置", async () => {
-                      await invoke("import_profile");
-                      await refresh();
-                    })
-                  }
-                >
-                  导入项目 JSON
-                </button>
-                <button
-                  disabled={!boot.authorized}
-                  onClick={() =>
-                    void run("读取项目配置", async () => {
-                      await invoke("load_metadata", {
-                        typeId: draft?.workitemTypeId ?? "",
-                      });
-                      await refresh();
-                    })
-                  }
-                >
-                  重新读取配置
-                </button>
-              </div>
-            </section>
-          </>
+              <button
+                type="submit"
+                className="primary"
+                disabled={!token || !!busy}
+              >
+                确定
+              </button>
+            </form>
+            <p className="login-note">令牌仅在本次会话中使用</p>
+          </section>
         )}
-        {tab === "capture" && (
+        {tab === "new" && (
           <>
-            <section className="card">
+            <section className="card connection-card">
               <div className="card-title">
                 <h2>USB 设备</h2>
                 <button
@@ -474,7 +845,91 @@ function App() {
                 </small>
               </label>
             </section>
-            <section className="card">
+            {tab === "new" && boot.authorized && (
+              <section className="card project-selector">
+                <div className="card-title">
+                  <h2>云效项目</h2>
+                  <div className="actions">
+                    <span className="pill">当前账号可访问范围</span>
+                    <button
+                      disabled={!!busy}
+                      onClick={() => void run("重试读取项目", retryWorkspace)}
+                    >
+                      刷新项目列表
+                    </button>
+                  </div>
+                </div>
+                <div className="grid">
+                  <label className="field">
+                    <span>组织</span>
+                    <select
+                      value={organizationId}
+                      disabled={!!busy}
+                      onChange={(e) =>
+                        void run("读取项目", async () => {
+                          const id = e.target.value;
+                          setOrganizationId(id);
+                          setProjectId("");
+                          try {
+                            setProjects(
+                              id
+                                ? await invoke<Option[]>("list_projects", {
+                                    organizationId: id,
+                                  })
+                                : [],
+                            );
+                          } catch (error) {
+                            await handleRemoteError(error, "云效项目读取失败");
+                          }
+                        })
+                      }
+                    >
+                      <option value="">请选择组织</option>
+                      {organizations.map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {o.name}
+                        </option>
+                      ))}
+                    </select>
+                    {!organizations.length && (
+                      <small>API 暂未返回可用组织。</small>
+                    )}
+                  </label>
+                  <label className="field">
+                    <span>项目</span>
+                    <select
+                      value={projectId}
+                      disabled={!organizationId || !!busy}
+                      onChange={(e) =>
+                        void run("切换项目", async () => {
+                          try {
+                            await selectProject(organizationId, e.target.value);
+                          } catch (error) {
+                            await handleRemoteError(error, "云效项目切换失败");
+                          }
+                        })
+                      }
+                    >
+                      <option value="">请选择项目</option>
+                      {projects.map((o) => (
+                        <option key={o.id} value={o.id}>
+                          {o.name}
+                        </option>
+                      ))}
+                    </select>
+                    {organizationId && !projects.length && (
+                      <small>API 暂未返回该组织的可用项目。</small>
+                    )}
+                  </label>
+                </div>
+                <p className="muted-text">
+                  当前项目：{boot.profile.name}
+                  。切换项目会建立新的当前草稿，旧草稿和提交记录保留。
+                </p>
+              </section>
+            )}
+            <details className="card" open={!!session}>
+              <summary>设备采集与固定构建</summary>
               <h2>测试会话</h2>
               <div className="grid">
                 <label className="field">
@@ -541,7 +996,7 @@ function App() {
                   停止采集
                 </button>
                 <button
-                  disabled={!session || frozen}
+                  disabled={!session || frozen || capturePending || !!busy}
                   onClick={() =>
                     void run("记录问题", async () => {
                       let d = draft;
@@ -551,7 +1006,7 @@ function App() {
                         await invoke<Draft>("mark_problem", { id: d.id }),
                       );
                       setDirty(false);
-                      setTab("problem");
+                      setTab("new");
                       await refresh();
                     })
                   }
@@ -563,21 +1018,20 @@ function App() {
                 <div className="session-live">
                   <span className="dot" />
                   正在采集 · {session.serial} · {session.packageName}
-                  <small>会话 {session.id}</small>
                 </div>
               )}
               <p className="muted-text">
-                开始新会话会结束原会话。断线不会自动切换设备。记录问题后建议继续约
-                30 秒，再固定日志证据。
+                开始新会话会结束原会话。断线不会自动切换设备。记录问题后保持采集，
+                30 秒后自动固定日志；提前结束会如实记录缺口。
               </p>
-            </section>
+            </details>
           </>
         )}
-        {tab === "problem" &&
+        {tab === "new" &&
           (!draft ? (
             <section className="card empty">
               <h2>记录第一个问题</h2>
-              <p>可以先连接设备自动采集，也可以创建离线草稿并导入已有证据。</p>
+              <p>请选择云效项目，创建草稿后连接设备采集或导入已有证据。</p>
               <button
                 className="primary"
                 onClick={() => void run("创建草稿", newDraft)}
@@ -604,11 +1058,15 @@ function App() {
                 >
                   {boot.drafts.map((d) => (
                     <option value={d.id} key={d.id}>
-                      {d.title || "未命名问题"} · {d.id.slice(0, 8)}
+                      {d.title || "未命名草稿"} ·{" "}
+                      {new Date(d.createdAt).toLocaleString()}
                     </option>
                   ))}
                 </select>
-                <code>{draft.id}</code>
+                <small>
+                  {draft.title || "未命名草稿"} ·{" "}
+                  {new Date(draft.createdAt).toLocaleString()}
+                </small>
               </div>
               {frozen && (
                 <div className="banner">
@@ -623,6 +1081,7 @@ function App() {
                     {field("title", "具体问题标题", {
                       hint: "写清在什么操作下发生什么行为",
                     })}
+                    {field("actual", "问题描述 / 实际结果", { multi: true })}
                     {select(
                       "kind",
                       "问题类型",
@@ -702,6 +1161,7 @@ function App() {
                     精确产物与 mapping 匹配仍需构建清单和安装指纹验证。
                   </p>
                 </section>
+                {dynamicFields}
                 <section className="card">
                   <h2>应用与设备</h2>
                   <div className="grid">
@@ -742,7 +1202,6 @@ function App() {
                     })}
                     {field("steps", "复现步骤（每行一步）", { multi: true })}
                     {field("expected", "预期结果", { multi: true })}
-                    {field("actual", "实际结果", { multi: true })}
                   </div>
                   <label className="check">
                     <input
@@ -820,66 +1279,6 @@ function App() {
                         </div>
                       )}
                 </section>
-                {boot.metadata && (
-                  <section className="card">
-                    <h2>云效项目字段</h2>
-                    {boot.metadata.fields
-                      .filter(
-                        (f) =>
-                          ![
-                            "subject",
-                            "description",
-                            "assignedTo",
-                            "sprint",
-                            "versions",
-                          ].includes(nativeTarget(f, boot.profile) ?? ""),
-                      )
-                      .map((f) => {
-                        const path = `customFields.${f.id}`;
-                        const opts = ["user", "multiUser"].includes(f.format)
-                          ? boot.metadata!.members
-                          : f.format === "sprint"
-                            ? boot.metadata!.sprints
-                            : f.format === "version"
-                              ? boot.metadata!.versions
-                              : f.options;
-                        return !supportedFormats.has(f.format) ? (
-                          <p className="banner error" key={f.id}>
-                            「{f.name}」格式 {f.format}{" "}
-                            未支持，请完善映射或实现后再提交。
-                          </p>
-                        ) : [
-                            "list",
-                            "multiList",
-                            "user",
-                            "multiUser",
-                            "sprint",
-                            "version",
-                          ].includes(f.format) ? (
-                          select(
-                            path,
-                            `${f.name}${f.required ? "（必填）" : ""}`,
-                            opts,
-                            ["multiList", "multiUser", "version"].includes(
-                              f.format,
-                            ),
-                          )
-                        ) : (
-                          field(
-                            path,
-                            `${f.name}${f.required ? "（必填）" : ""}`,
-                            {
-                              multi: f.format === "text",
-                              type: f.format === "date" ? "date" : "text",
-                            },
-                          )
-                        );
-                      })}
-                    {!boot.metadata.fields.length && (
-                      <p>当前类型没有额外字段。</p>
-                    )}
-                  </section>
-                )}
               </fieldset>
               <section className="card">
                 <div className="card-title">
@@ -914,10 +1313,70 @@ function App() {
                       void run("固定日志", () => mutate("pin_logs"))
                     }
                   >
-                    固定会话日志
+                    恢复中断窗口记录
                   </button>
                 </div>
+                <div className="actions">
+                  <button
+                    disabled={frozen || !draft.sessionId || !!busy}
+                    onClick={() =>
+                      void run("采集系统报告（最长两分钟）", () =>
+                        mutate("capture_bugreport"),
+                      )
+                    }
+                  >
+                    采集系统报告
+                  </button>
+                </div>
+                {(boot.captures ?? [])
+                  .filter((t) => t.draftId === draft.id)
+                  .map((t) => (
+                    <div className="capture-status" role="status" key={t.id}>
+                      <strong>
+                        {t.kind === "log-window" ? "问题日志窗口" : "系统报告"}{" "}
+                        ·{" "}
+                        {{
+                          pending: "采集中",
+                          complete: "采集结束",
+                          interrupted: "采集中断",
+                          failed: "采集失败",
+                        }[t.status] ?? t.status}
+                      </strong>
+                      {t.status === "pending" && t.window && (
+                        <p>
+                          正在保留问题后 30
+                          秒日志，请保持设备连接。完成后预览并选择要上传的副本。
+                        </p>
+                      )}
+                      {t.error && <p>{t.error}</p>}
+                      {t.summary && (
+                        <>
+                          <p>
+                            提取 {t.summary.selectedRecords} 条记录 ·{" "}
+                            {t.summary.rangeCovered
+                              ? "观察到请求窗口的时间边界"
+                              : "覆盖存在缺口或不确定项"}
+                          </p>
+                          <p>
+                            实际日志边界：{t.summary.coverageStart ?? "未知"} ～{" "}
+                            {t.summary.coverageEnd ?? "未知"}
+                          </p>
+                          <details>
+                            <summary>查看时间依据与缺口</summary>
+                            <p>{t.summary.clockNote}</p>
+                            {[
+                              ...t.summary.limitations,
+                              ...t.summary.gaps.map((g) => g.reason),
+                            ].map((v, n) => (
+                              <p key={n}>{v}</p>
+                            ))}
+                          </details>
+                        </>
+                      )}
+                    </div>
+                  ))}
                 <p className="muted-text">
+                  派生副本与来源回执一起选择；移除副本会同时移除关联回执，回执不能单独移除。
                   文件先保存为本地副本。勾选后才进入证据包和上传；日志请填真实覆盖范围。超过{" "}
                   {boot.profile.attachmentWarningMb} MB
                   为本地提醒，不代表云效限制。
@@ -935,6 +1394,11 @@ function App() {
                           coverageStart: start,
                           coverageEnd: end,
                         }),
+                      )
+                    }
+                    onRedact={(literal) =>
+                      void run("生成脱敏副本", () =>
+                        mutate("redact_log", { attachmentId: a.id, literal }),
                       )
                     }
                     onRemove={() =>
@@ -1026,6 +1490,7 @@ function App() {
                     disabled={
                       frozen ||
                       !!busy ||
+                      capturePending ||
                       issues.some((i) => i.field !== "previewConfirmed")
                     }
                     onClick={() =>
@@ -1049,17 +1514,12 @@ function App() {
                   <h2>提交预览</h2>
                   <dl>
                     <dt>云效项目</dt>
-                    <dd>
-                      {boot.profile.name} · {boot.profile.projectId}
-                    </dd>
+                    <dd>{boot.profile.name}</dd>
                     <dt>负责人</dt>
                     <dd>
-                      {
-                        boot.metadata?.members.find(
-                          (m) => m.id === draft.assignedTo,
-                        )?.name
-                      }{" "}
-                      · {draft.assignedTo}
+                      {boot.metadata?.members.find(
+                        (m) => m.id === draft.assignedTo,
+                      )?.name ?? "未选择"}
                     </dd>
                     <dt>业务与范围</dt>
                     <dd>
@@ -1119,7 +1579,9 @@ function App() {
                   </label>
                   <button
                     className="primary"
-                    disabled={!draft.previewConfirmed || !!busy}
+                    disabled={
+                      !draft.previewConfirmed || !!busy || capturePending
+                    }
                     onClick={() =>
                       void run("提交 Bug 并核对附件", async () => {
                         const d = await save();
@@ -1139,113 +1601,198 @@ function App() {
             </>
           ))}
         {tab === "history" && (
-          <section className="card">
-            <div className="card-title">
-              <h2>持久提交记录</h2>
-              <button onClick={() => void run("刷新记录", refresh)}>
-                刷新
-              </button>
-            </div>
-            {!boot.submissions.length ? (
-              <div className="empty">
-                <p>还没有提交记录。离线草稿保留在“问题与证据”。</p>
+          <>
+            <section className="card">
+              <div className="card-title">
+                <h2>本机提交记录</h2>
+                <button onClick={() => void run("刷新记录", refresh)}>
+                  刷新
+                </button>
               </div>
-            ) : (
-              boot.submissions.map((s) => (
-                <article className="submission" key={s.draftId}>
-                  <div className="card-title">
-                    <h3>
-                      {boot.drafts.find((d) => d.id === s.draftId)?.title}
-                    </h3>
-                    <span className="pill">
-                      {stateLabels[s.state] ?? s.state}
-                    </span>
-                  </div>
-                  <p>
-                    工作项 {s.identifier || s.workitemId || "尚未获得确定 ID"} ·{" "}
-                    {s.uploads.filter((a) => a.state === "confirmed").length}/
-                    {s.uploads.length} 份附件已核对
-                  </p>
-                  <code>evidenceId: {s.evidence.id}</code>
-                  {s.error && <p className="error-text">{s.error}</p>}
-                  <div className="actions">
-                    {s.url && (
-                      <>
-                        <button
-                          onClick={() =>
-                            void run("打开云效", () =>
-                              invoke("open_receipt", { id: s.draftId }),
-                            )
-                          }
-                        >
-                          打开云效
-                        </button>
-                        <button
-                          onClick={() =>
-                            void run("复制链接", () =>
-                              invoke("copy_receipt", {
-                                id: s.draftId,
-                                repair: false,
-                              }),
-                            )
-                          }
-                        >
-                          复制链接
-                        </button>
-                      </>
-                    )}
-                    <button
-                      onClick={() =>
-                        void run("复制修复输入", () =>
-                          invoke("copy_receipt", {
-                            id: s.draftId,
-                            repair: true,
-                          }),
-                        )
-                      }
-                    >
-                      复制修复任务输入
-                    </button>
-                    {s.state === "partial" && (
+              {!boot.submissions.length ? (
+                <div className="empty">
+                  <p>还没有本机提交记录。</p>
+                </div>
+              ) : (
+                boot.submissions.map((s) => (
+                  <article className="submission" key={s.draftId}>
+                    <div className="card-title">
+                      <h3>
+                        {boot.drafts.find((d) => d.id === s.draftId)?.title}
+                      </h3>
+                      <span className="pill">
+                        {stateLabels[s.state] ?? s.state}
+                      </span>
+                    </div>
+                    <p>
+                      工作项 {s.identifier || s.workitemId || "尚未获得确定 ID"}{" "}
+                      ·{" "}
+                      {s.uploads.filter((a) => a.state === "confirmed").length}/
+                      {s.uploads.length} 份附件已核对
+                    </p>
+                    <code>evidenceId: {s.evidence.id}</code>
+                    {s.error && <p className="error-text">{s.error}</p>}
+                    <div className="actions">
+                      {s.url && (
+                        <>
+                          <button
+                            onClick={() =>
+                              void run("打开云效", () =>
+                                invoke("open_receipt", { id: s.draftId }),
+                              )
+                            }
+                          >
+                            打开云效
+                          </button>
+                          <button
+                            onClick={() =>
+                              void run("复制链接", () =>
+                                invoke("copy_receipt", {
+                                  id: s.draftId,
+                                  repair: false,
+                                }),
+                              )
+                            }
+                          >
+                            复制链接
+                          </button>
+                        </>
+                      )}
                       <button
-                        className="primary"
                         onClick={() =>
-                          void run("核对并补传证据", async () => {
-                            await invoke("submit_bug", { id: s.draftId });
-                            await refresh();
-                          })
+                          void run("复制修复输入", () =>
+                            invoke("copy_receipt", {
+                              id: s.draftId,
+                              repair: true,
+                            }),
+                          )
                         }
                       >
-                        核对并恢复
+                        复制修复任务输入
                       </button>
-                    )}
-                    {s.state === "create_unknown" && (
-                      <>
-                        <input
-                          placeholder="可选：人工确认的工作项 ID"
-                          value={remoteId}
-                          onChange={(e) => setRemoteId(e.target.value)}
-                        />
+                      {s.state === "partial" && (
                         <button
+                          className="primary"
                           onClick={() =>
-                            void run("核对创建结果", async () => {
-                              await invoke("reconcile_submission", {
-                                id: s.draftId,
-                                remoteId: remoteId || null,
-                              });
+                            void run("核对并补传证据", async () => {
+                              await invoke("submit_bug", { id: s.draftId });
                               await refresh();
                             })
                           }
                         >
-                          核对已有缺陷
+                          核对并恢复
                         </button>
-                      </>
-                    )}
+                      )}
+                      {s.state === "create_unknown" && (
+                        <>
+                          <input
+                            placeholder="可选：人工确认的工作项 ID"
+                            value={remoteId}
+                            onChange={(e) => setRemoteId(e.target.value)}
+                          />
+                          <button
+                            onClick={() =>
+                              void run("核对创建结果", async () => {
+                                await invoke("reconcile_submission", {
+                                  id: s.draftId,
+                                  remoteId: remoteId || null,
+                                });
+                                await refresh();
+                              })
+                            }
+                          >
+                            核对已有缺陷
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </article>
+                ))
+              )}
+            </section>
+            <section className="card">
+              <div className="card-title">
+                <h2>云效历史 Bug</h2>
+                <button
+                  disabled={!!busy}
+                  onClick={() => {
+                    setRemoteHistoryError("");
+                    void run("读取云效历史", async () => {
+                      setRemoteHistory(
+                        await invoke<HistoryPage>("list_remote_history", {
+                          page: 1,
+                        }),
+                      );
+                    });
+                  }}
+                >
+                  刷新
+                </button>
+              </div>
+              {remoteHistoryError ? (
+                <p className="banner error">
+                  云效历史读取失败：{remoteHistoryError}
+                </p>
+              ) : remoteHistory ? (
+                remoteHistory.items.length ? (
+                  remoteHistory.items.map((item) => (
+                    <article className="submission" key={item.id}>
+                      <div className="card-title">
+                        <h3>{item.title}</h3>
+                        <span className="pill">{item.status}</span>
+                      </div>
+                      <p>
+                        工作项 {item.identifier || item.id} · 创建于{" "}
+                        {item.createdAt}
+                      </p>
+                    </article>
+                  ))
+                ) : (
+                  <div className="empty">
+                    <p>云效没有返回当前用户在此项目中的历史 Bug。</p>
                   </div>
-                </article>
-              ))
-            )}
-          </section>
+                )
+              ) : (
+                <p className="muted-text">
+                  正在读取云效历史；读取失败会明确提示，不会伪装为空记录。
+                </p>
+              )}
+              {remoteHistory?.hasMore && (
+                <button
+                  disabled={!!busy}
+                  onClick={() =>
+                    void run("加载更多历史", async () => {
+                      const nextPage = remoteHistoryPage + 1;
+                      const page = await invoke<HistoryPage>(
+                        "list_remote_history",
+                        { page: nextPage },
+                      );
+                      setRemoteHistory((current) =>
+                        current
+                          ? {
+                              ...page,
+                              items: [
+                                ...current.items,
+                                ...page.items.filter(
+                                  (item) =>
+                                    !current.items.some(
+                                      (old) => old.id === item.id,
+                                    ),
+                                ),
+                              ],
+                              page: nextPage,
+                            }
+                          : page,
+                      );
+                      setRemoteHistoryPage(nextPage);
+                    })
+                  }
+                >
+                  加载更多
+                </button>
+              )}
+            </section>
+          </>
         )}
         {log && (
           <div className="modal">
@@ -1271,15 +1818,18 @@ function AttachmentCard({
   onConfirm,
   onRemove,
   onRead,
+  onRedact,
 }: {
   attachment: Attachment;
   disabled: boolean;
   onConfirm: (c: boolean, s: string, e: string) => void;
   onRemove: () => void;
   onRead: () => void;
+  onRedact: (literal: string) => void;
 }) {
   const [start, setStart] = useState(a.coverageStart),
     [end, setEnd] = useState(a.coverageEnd);
+  const [literal, setLiteral] = useState("");
   return (
     <article className="attachment">
       <div className="attachment-body">
@@ -1298,6 +1848,31 @@ function AttachmentCard({
           {a.role === "log" && (
             <>
               <button onClick={onRead}>预览日志</button>
+              <details className="redaction-control">
+                <summary>生成脱敏副本</summary>
+                <p>
+                  指定需要替换的文字，原文件保留。生成后须重新预览并确认副本；只替换完全匹配的文字。
+                </p>
+                <label className="field">
+                  <span>需要替换的文字</span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    disabled={disabled}
+                    value={literal}
+                    onChange={(e) => setLiteral(e.target.value)}
+                  />
+                </label>
+                <button
+                  disabled={disabled || !literal}
+                  onClick={() => {
+                    onRedact(literal);
+                    setLiteral("");
+                  }}
+                >
+                  生成副本
+                </button>
+              </details>
               <div className="grid">
                 <label className="field">
                   <span>真实覆盖起点（含时区）</span>

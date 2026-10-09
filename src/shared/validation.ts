@@ -46,7 +46,11 @@ export function nativeTarget(
 ): string | undefined {
   return (
     profile.fieldMappings[field.id] ??
-    (field.type === "NativeField" &&
+    ((field.type === "NativeField" ||
+      (field.type === "Role" &&
+        ["verifier", "participants", "trackers"].includes(field.id)) ||
+      (field.type === "Application" &&
+        ["sprint", "versions", "labels"].includes(field.id))) &&
     [
       "subject",
       "description",
@@ -65,6 +69,7 @@ export function nativeTarget(
 export const supportedFormats = new Set([
   "list",
   "multiList",
+  "tag",
   "string",
   "text",
   "int",
@@ -220,6 +225,39 @@ export function validateDraft(
     )
       add("frequency", "发生次数应为 1 至尝试次数之间的整数");
   }
+  for (const a of d.attachments.filter((a) => a.confirmed)) {
+    const paired = d.attachments.filter(
+      (r) => r.role === "report" && r.derivedFrom === a.id,
+    );
+    const window = a.source.startsWith("ADB 问题日志窗口派生副本");
+    const redacted = a.source.startsWith("文本派生副本");
+    const rangeRequired =
+      window ||
+      (redacted &&
+        d.attachments.some(
+          (parent) =>
+            parent.id === a.derivedFrom &&
+            parent.source.startsWith("ADB 问题日志窗口派生副本"),
+        ));
+    if (
+      a.role === "log" &&
+      (window || redacted || paired.length) &&
+      (paired.some((r) => !r.confirmed) ||
+        (rangeRequired &&
+          !paired.some((r) => r.source === "日志窗口范围与缺口记录")) ||
+        (redacted &&
+          !paired.some((r) => r.source === "文本替换记录（请核对副本）")))
+    )
+      add("attachments", "派生副本必须携带并确认全部来源回执");
+    if (
+      a.role === "report" &&
+      a.derivedFrom &&
+      !d.attachments.some(
+        (parent) => parent.id === a.derivedFrom && parent.confirmed,
+      )
+    )
+      add("attachments", "来源回执必须与关联副本一起确认");
+  }
   if (
     !d.attachments.some(
       (a) =>
@@ -310,14 +348,37 @@ export function validateDraft(
       }
       if (required && !present)
         add(`customFields.${field.id}`, `请补充云效必填字段「${field.name}」`);
-      if (!present || target) continue;
+      if (
+        !present ||
+        (target &&
+          [
+            "subject",
+            "description",
+            "assignedTo",
+            "sprint",
+            "versions",
+          ].includes(target))
+      )
+        continue;
       const values = Array.isArray(value) ? value : [value!];
       const options =
         field.format.includes("User") || field.format === "user"
           ? metadata.members
-          : field.options;
+          : field.format === "sprint"
+            ? metadata.sprints
+            : field.format === "version"
+              ? metadata.versions
+              : field.options;
       if (
-        ["list", "multiList", "user", "multiUser"].includes(field.format) &&
+        [
+          "list",
+          "multiList",
+          "tag",
+          "user",
+          "multiUser",
+          "sprint",
+          "version",
+        ].includes(field.format) &&
         values.some((v) => !options.some((o) => o.id === v))
       )
         add(`customFields.${field.id}`, `「${field.name}」选项已失效`);

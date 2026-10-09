@@ -5,11 +5,15 @@ use std::path::{Path, PathBuf};
 #[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
+    pub writes: std::sync::Arc<std::sync::Mutex<()>>,
 }
 impl Store {
     pub fn new(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
-        let store = Self { root: root.into() };
+        let store = Self {
+            root: root.into(),
+            writes: Default::default(),
+        };
         store.connect()?.execute_batch("CREATE TABLE IF NOT EXISTS objects(kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id)); PRAGMA user_version=1;").map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
@@ -31,6 +35,14 @@ impl Store {
         let mut c = self.connect()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO objects(kind,id,data) VALUES(?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data", params![kind,id,serde_json::to_string(data).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    pub fn put_many(&self, objects: &[(&str, &str, &Value)]) -> Result<()> {
+        let mut c = self.connect()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        for (kind, id, value) in objects {
+            tx.execute("INSERT INTO objects(kind,id,data) VALUES(?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data", params![kind,id,serde_json::to_string(value).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn get<T: serde::de::DeserializeOwned>(&self, kind: &str, id: &str) -> Result<Option<T>> {
