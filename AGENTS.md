@@ -3,6 +3,7 @@
 - Use Rust + Tauri 2, with React/TypeScript for the renderer. The user's Tauri decision overrides the Electron recommendation in the preserved original plan.
 - Target macOS arm64/x64, Windows x64, and Linux x64. Packaging runs natively through GitHub Actions.
 - Read `docs/tasks.md` and `docs/acceptance.md` before continuing. Report implemented, mock-verified and real-world-verified capabilities separately.
+- Read `docs/multica-collaboration.md` for the native Squad workflow. The coordinator plans, routes and reviews; backend, UI, build/integration and independent validation members own execution. Preserve existing worktree deliveries, use one trigger per task, and keep templates parked.
 - Cloud verification remains subject to the current task's authorization. Never read another app's or coordinator's PAT. Do not perform real Yunxiao writes without a user-designated acceptance scope.
 - Read `docs/git-delivery-policy.md` before GitHub operations. The public remote is `guozhiqiang123/AndroidBugDesk`; normal task pushes, candidate builds and accepted PR merges follow its gates. A pending public-history review blocks source pushes. Publishing releases, force pushes and destructive operations are outside this policy.
 - Keep credentials, network, ADB and file access in Rust. Do not add generic shell commands, unrestricted file-path IPC or renderer HTTP permissions.
