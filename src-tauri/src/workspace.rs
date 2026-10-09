@@ -4,11 +4,15 @@ use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use zeroize::Zeroize;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UserIdentity {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub nick_name: String,
+    #[serde(default)]
+    pub avatar_png: Option<Vec<u8>>,
     pub last_organization: String,
 }
 #[derive(Serialize, Debug)]
@@ -554,6 +558,7 @@ mod tests {
             id: "user-a".into(),
             name: "".into(),
             last_organization: "".into(),
+            ..Default::default()
         };
         let b = UserIdentity {
             id: "user-b".into(),

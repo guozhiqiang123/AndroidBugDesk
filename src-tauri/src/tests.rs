@@ -480,6 +480,7 @@ fn submission_state(
         id: "alice".into(),
         name: "Alice".into(),
         last_organization: profile.organization_id.clone(),
+        ..Default::default()
     });
     state
 }

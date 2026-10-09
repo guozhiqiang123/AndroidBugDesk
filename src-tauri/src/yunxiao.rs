@@ -135,9 +135,21 @@ impl Api {
             })?;
         let id = string(&value, "id");
         encode_id(&id).map_err(|_| "用户校验响应缺少有效用户 ID")?;
+        // GetUserByToken documents nickName but does not promise an avatar.
+        // Use an avatar only if this verified user's response actually includes it.
+        let avatar_url = ["avatarUrl", "avatar"]
+            .iter()
+            .map(|key| string(&value, key))
+            .find(|url| !url.trim().is_empty());
+        let avatar_png = match avatar_url.and_then(|url| trusted_avatar_url(&url)) {
+            Some(url) => fetch_avatar_png(url).await,
+            None => None,
+        };
         Ok(crate::workspace::UserIdentity {
             id,
             name: string(&value, "name"),
+            nick_name: string(&value, "nickName"),
+            avatar_png,
             last_organization: string(&value, "lastOrganization"),
         })
     }
@@ -531,4 +543,148 @@ pub fn create_payload(d: &Value, m: &Metadata, description: String) -> Result<Va
     }
     body["customFieldValues"] = Value::Object(custom);
     Ok(body)
+}
+
+// The renderer receives normalized image bytes; it never loads remote URLs or PATs.
+fn trusted_avatar_url(value: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(value.trim()).ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some("tcs-devops.aliyuncs.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path().starts_with("/thumbnail/"))
+    .then_some(url)
+}
+
+async fn fetch_avatar_png(url: reqwest::Url) -> Option<Vec<u8>> {
+    // A distinct client ensures the personal token cannot reach an image host.
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let mut response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() || response.content_length().unwrap_or(0) > 512_000 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > 512_000 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    normalize_avatar(&bytes)
+}
+
+fn normalize_avatar(bytes: &[u8]) -> Option<Vec<u8>> {
+    let format = image::guess_format(bytes).ok()?;
+    if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
+        return None;
+    }
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(2048);
+    limits.max_image_height = Some(2048);
+    limits.max_alloc = Some(16_777_216);
+    reader.limits(limits);
+    let avatar = reader.decode().ok()?.thumbnail(128, 128);
+    let mut output = std::io::Cursor::new(Vec::new());
+    avatar.write_to(&mut output, image::ImageFormat::Png).ok()?;
+    Some(output.into_inner())
+}
+
+#[cfg(test)]
+mod user_profile_tests {
+    use super::*;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    #[test]
+    fn avatar_urls_reject_non_cdn_urls_credentials_and_ports() {
+        assert!(
+            trusted_avatar_url("https://tcs-devops.aliyuncs.com/thumbnail/test/w/100/h/100")
+                .is_some()
+        );
+        for url in [
+            "http://tcs-devops.aliyuncs.com/thumbnail/a",
+            "https://127.0.0.1/thumbnail/a",
+            "https://tcs-devops.aliyuncs.com.evil.test/thumbnail/a",
+            "https://user:secret@tcs-devops.aliyuncs.com/thumbnail/a",
+            "https://tcs-devops.aliyuncs.com:9443/thumbnail/a",
+            "file:///tmp/avatar.png",
+            "https://tcs-devops.aliyuncs.com/other/a",
+        ] {
+            assert!(trusted_avatar_url(url).is_none(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn avatar_download_has_no_token_and_rejects_redirects_and_invalid_images() {
+        let server = MockServer::start().await;
+        let image = image::DynamicImage::new_rgba8(256, 256);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/avatar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png.into_inner()))
+            .mount(&server)
+            .await;
+        let bytes = fetch_avatar_png(format!("{}/avatar", server.uri()).parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 128);
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests[0].headers.contains_key("x-yunxiao-token"));
+        assert!(!requests[0].headers.contains_key("authorization"));
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/avatar", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        assert!(
+            fetch_avatar_png(format!("{}/redirect", server.uri()).parse().unwrap())
+                .await
+                .is_none()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert!(normalize_avatar(b"<svg><script>bad</script></svg>").is_none());
+        assert!(normalize_avatar(b"not an image").is_none());
+        Mock::given(method("GET"))
+            .and(path("/large"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 512_001]))
+            .mount(&server)
+            .await;
+        assert!(
+            fetch_avatar_png(format!("{}/large", server.uri()).parse().unwrap())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn documented_nickname_is_retained_and_missing_avatar_needs_no_second_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/oapi/v1/platform/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"user-a", "name":"企业姓名", "nickName":"测试昵称", "lastOrganization":"org-a"})))
+            .expect(1).mount(&server).await;
+        let api = Api::with_base(
+            crate::workspace::empty_profile(),
+            "mock-token",
+            &server.uri(),
+        )
+        .unwrap();
+        let user = api.verify_user().await.unwrap();
+        assert_eq!(user.id, "user-a");
+        assert_eq!(user.nick_name, "测试昵称");
+        assert_eq!(user.name, "企业姓名");
+        assert!(user.avatar_png.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }
