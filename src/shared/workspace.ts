@@ -3,6 +3,8 @@ import type { Draft, Option, Profile } from "./domain";
 export interface UserIdentity {
   id: string;
   name: string;
+  nickName?: string;
+  avatarPng?: number[] | null;
   lastOrganization: string;
 }
 export interface AuthResult {

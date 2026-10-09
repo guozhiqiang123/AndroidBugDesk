@@ -27,6 +27,7 @@ import { enqueueSelectionWrite, tabForAuth } from "./session";
 import { applySelectionMemory, profileConfigured } from "./session";
 import { initialWorkspace, remoteAuthReaction } from "./session";
 import "./style.css";
+import { UserProfile } from "./user-profile";
 
 interface CaptureStatus {
   id: string;
@@ -644,8 +645,7 @@ function App() {
             ))}
           </nav>
           <div className="aside-status">
-            <span className={boot.authorized ? "dot" : "dot muted"} />
-            {boot.authorized ? "个人授权已载入" : "可离线采集与保存"}
+            <UserProfile key={boot.user?.id || "anonymous"} user={boot.user} />
             <small>
               {boot.profile.name}
               <br />
