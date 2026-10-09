@@ -45,9 +45,17 @@ impl Api {
         path: &str,
         body: Option<Value>,
     ) -> Result<(Value, HeaderMap)> {
-        let readonly = method == Method::GET;
+        self.request_url(method, self.url(path), body).await
+    }
+    async fn request_url(
+        &self,
+        method: Method,
+        url: String,
+        body: Option<Value>,
+    ) -> Result<(Value, HeaderMap)> {
+        let readonly = method == Method::GET || url.ends_with(":search");
         for attempt in 0..3 {
-            let mut req = self.client.request(method.clone(), self.url(path));
+            let mut req = self.client.request(method.clone(), &url);
             if let Some(b) = &body {
                 req = req.json(b);
             }
@@ -81,7 +89,7 @@ impl Api {
     }
     fn status_error(status: u16) -> String {
         match status {
-            401 => "云效授权失效，请重新输入个人 PAT".into(),
+            401 => "[授权失效] 云效授权失效，请重新输入个人 PAT".into(),
             403 => "云效权限不足，请检查项目访问及 PAT 对应资源权限".into(),
             429 => "云效限流，请稍后重试；写入需先核对结果".into(),
             _ => format!("云效接口返回 HTTP {status}，请保留草稿并检查字段、附件及权限"),
@@ -102,33 +110,124 @@ impl Api {
             let (data, headers) = self.request(Method::GET, &url, None).await?;
             let rows = data.as_array().ok_or("列表接口格式变化，请核对契约")?;
             all.extend(rows.iter().cloned());
-            let next = headers
-                .get("x-next-page")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("");
-            if let Ok(n) = next.parse::<usize>() {
-                if n <= page {
-                    return Err("接口分页循环，停止读取".into());
-                }
-                page = n;
-                continue;
-            }
-            let total = headers
-                .get("x-total-pages")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.parse::<usize>().ok());
-            if total.is_some_and(|n| page < n) {
-                page += 1;
-                continue;
-            }
-            // When a paged endpoint omits headers, read until a short page. Never assume a full first page is complete.
-            if paged && total.is_none() && rows.len() == 100 {
+            if paged && has_more(&headers, page, rows.len(), 100)? {
                 page += 1;
                 continue;
             }
             return Ok(all);
         }
         Err("分页数量超过限制，未完成读取".into())
+    }
+    pub async fn verify_user(&self) -> Result<crate::workspace::UserIdentity> {
+        let (value, _) = self
+            .request_url(
+                Method::GET,
+                format!("{}/oapi/v1/platform/user", self.base),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                if e.contains("权限不足") {
+                    "令牌缺少组织管理「用户」只读权限，无法校验登录；请调整个人令牌权限".into()
+                } else {
+                    e
+                }
+            })?;
+        let id = string(&value, "id");
+        encode_id(&id).map_err(|_| "用户校验响应缺少有效用户 ID")?;
+        Ok(crate::workspace::UserIdentity {
+            id,
+            name: string(&value, "name"),
+            last_organization: string(&value, "lastOrganization"),
+        })
+    }
+    pub async fn organizations(&self) -> Result<Vec<OptionItem>> {
+        let (value, _) = self
+            .request_url(
+                Method::GET,
+                format!("{}/oapi/v1/platform/organizations", self.base),
+                None,
+            )
+            .await?;
+        options(
+            value.as_array().ok_or("组织列表格式变化")?.clone(),
+            "id",
+            "name",
+        )
+    }
+    pub async fn projects(&self) -> Result<Vec<OptionItem>> {
+        let mut projects = Vec::new();
+        for page in 1..=1000 {
+            let (value, headers) = self
+                .request(
+                    Method::POST,
+                    "/projects:search",
+                    Some(json!({
+                        "page":page,"perPage":100,"orderBy":"gmtCreate","sort":"desc"
+                    })),
+                )
+                .await?;
+            let rows = value.as_array().ok_or("项目列表格式变化")?;
+            projects.extend(rows.iter().cloned());
+            if !has_more(&headers, page, rows.len(), 100)? {
+                return options(projects, "id", "name");
+            }
+        }
+        Err("项目列表读取超出分页限制，未完整读取".into())
+    }
+    pub async fn history(
+        &self,
+        user_id: &str,
+        page: usize,
+    ) -> Result<crate::workspace::HistoryPage> {
+        encode_id(user_id)?;
+        if !(1..=1000).contains(&page) {
+            return Err("历史记录页码不正确".into());
+        }
+        let (value, headers) = self
+            .request(
+                Method::POST,
+                "/workitems:search",
+                Some(json!({
+                    "category":"Bug","spaceId":self.profile.project_id,"spaceType":"Project",
+                    "page":page,"perPage":50,"orderBy":"gmtCreate","sort":"desc",
+                    "conditions":serde_json::to_string(&json!({"conditionGroups":[[{
+                        "fieldIdentifier":"creator","operator":"CONTAINS","value":[user_id],
+                        "toValue":null,"className":"user","format":"list"
+                    }]]})).unwrap()
+                })),
+            )
+            .await?;
+        let rows = value.as_array().ok_or("历史记录列表格式变化")?;
+        let mut items = Vec::new();
+        for row in rows {
+            let id = string(row, "id");
+            encode_id(&id).map_err(|_| "历史记录缺少有效工作项 ID")?;
+            // A malformed/overbroad response must not leak another project's/user's records.
+            if string(row, "space.id") != self.profile.project_id
+                || string(row, "creator.id") != user_id
+                || string(row, "categoryId") != "Bug"
+            {
+                return Err("云效历史结果与当前用户/项目/Bug范围不一致，停止展示".into());
+            }
+            items.push(crate::workspace::HistoryItem {
+                id,
+                identifier: string(row, "serialNumber"),
+                title: string(row, "subject"),
+                status: if string(row, "status.displayName").is_empty() {
+                    string(row, "status.name")
+                } else {
+                    string(row, "status.displayName")
+                },
+                created_at: string(row, "gmtCreate"),
+                updated_at: string(row, "gmtModified"),
+            });
+        }
+        Ok(crate::workspace::HistoryPage {
+            items,
+            page,
+            has_more: has_more(&headers, page, rows.len(), 50)?,
+        })
     }
     pub async fn metadata(&self, type_id: &str) -> Result<Metadata> {
         let path = format!("/projects/{}", self.profile.project_id);
@@ -149,7 +248,7 @@ impl Api {
         let raw = self
             .list(&format!("{path}/workitemTypes/{selected}/fields"), false)
             .await?;
-        let fields = raw
+        let mut fields = raw
             .into_iter()
             .map(|v| {
                 Ok(Field {
@@ -158,6 +257,8 @@ impl Api {
                     format: string(&v, "format"),
                     field_type: string(&v, "type"),
                     required: bool_at(&v, "required"),
+                    show_when_create: v["showWhenCreate"].as_bool().unwrap_or(true),
+                    option_error: None,
                     options: options(
                         v["options"].as_array().cloned().unwrap_or_default(),
                         "id",
@@ -166,8 +267,25 @@ impl Api {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        for field in &mut fields {
+            if (field.format == "tag"
+                || crate::validation::native_target(field, &self.profile) == Some("labels"))
+                && field.options.is_empty()
+            {
+                match self.list(&format!("{path}/labels"), true).await {
+                    Ok(labels) => field.options = options(labels, "id", "name")?,
+                    Err(error) if error.contains("[授权失效]") => return Err(error),
+                    Err(_) => {
+                        field.option_error = Some(
+                            "标签列表未能读取，请检查标签只读权限或稍后刷新字段；其他字段仍可填写"
+                                .into(),
+                        )
+                    }
+                }
+            }
+        }
         let members = options(
-            self.list(&format!("{path}/members"), false).await?,
+            self.list(&format!("{path}/members"), true).await?,
             "userId",
             "userName",
         )?;
@@ -315,6 +433,34 @@ impl Api {
         }
         Err("搜索不完整，保持创建结果不确定".into())
     }
+}
+fn has_more(headers: &HeaderMap, page: usize, count: usize, per_page: usize) -> Result<bool> {
+    // The real service emits x-next-page even at/after the last page.
+    if let Some(total) = headers.get("x-total-pages").and_then(|v| v.to_str().ok()) {
+        let total = total.parse::<usize>().map_err(|_| "接口总页数不正确")?;
+        if page >= total {
+            return Ok(false);
+        }
+    }
+    if let Some(next) = headers
+        .get("x-next-page")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        let n = next.parse::<usize>().map_err(|_| "接口分页参数不正确")?;
+        if n <= page {
+            return Err("接口分页循环，停止读取".into());
+        }
+        if n != page + 1 {
+            return Err("接口分页不连续，停止读取".into());
+        }
+        return Ok(true);
+    }
+    if let Some(total) = headers.get("x-total-pages").and_then(|v| v.to_str().ok()) {
+        return Ok(page < total.parse::<usize>().map_err(|_| "接口总页数不正确")?);
+    }
+    // No documented completion header: offer another page for a full response.
+    Ok(count == per_page)
 }
 fn encode_id(id: &str) -> Result<&str> {
     if regex::Regex::new(r"^[A-Za-z0-9_-]{1,128}$")

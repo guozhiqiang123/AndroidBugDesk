@@ -7,6 +7,7 @@ pub mod submission;
 #[cfg(test)]
 mod tests;
 pub mod validation;
+pub mod workspace;
 pub mod yunxiao;
 pub fn run() {
     tauri::Builder::default()
@@ -20,6 +21,14 @@ pub fn run() {
         .setup(commands::setup)
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::check_auth,
+            commands::login,
+            commands::list_organizations,
+            commands::list_projects,
+            commands::select_project,
+            commands::load_selection_memory,
+            commands::remember_selections,
+            commands::list_remote_history,
             commands::set_auth,
             commands::clear_auth,
             commands::load_metadata,

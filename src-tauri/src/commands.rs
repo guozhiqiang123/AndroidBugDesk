@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{atomic::AtomicU64, Mutex},
 };
 use tauri::{Manager, State};
 use zeroize::Zeroize;
@@ -13,12 +13,16 @@ pub struct AppState {
     pub store: Store,
     pub profile: Mutex<Profile>,
     pub token: Mutex<Option<String>>,
+    pub user: Mutex<Option<crate::workspace::UserIdentity>>,
+    pub auth_epoch: AtomicU64,
+    pub workspace_epoch: AtomicU64,
+    pub(crate) api_base: String,
     pub metadata: Mutex<Option<Metadata>>,
     pub adb: Mutex<Option<PathBuf>>,
     pub collector: Mutex<Option<adb::Collector>>,
     pub locks: Mutex<HashSet<String>>,
 }
-const SERVICE: &str = "com.qa.androidbugdesk";
+pub(crate) const SERVICE: &str = "com.qa.androidbugdesk";
 impl AppState {
     pub fn new(root: PathBuf) -> Result<Self> {
         let store = Store::new(&root)?;
@@ -33,21 +37,17 @@ impl AppState {
                 store.put("session", &string(&session, "id"), &session)?;
             }
         }
-        let profile = store.get("settings", "profile")?.unwrap_or(
-            serde_json::from_str(include_str!("../../profiles/photos-recovery.json")).unwrap(),
-        );
-        let remembered: bool = store.get("settings", "remembered")?.unwrap_or(false);
-        let token = if remembered {
-            keyring::Entry::new(SERVICE, "personal-pat")
-                .ok()
-                .and_then(|e| e.get_password().ok())
-        } else {
-            None
-        };
+        // Restore only after validating the token's actual user. Never auto-select the example project.
+        let profile = crate::workspace::empty_profile();
         Ok(Self {
             store,
             profile: Mutex::new(profile),
-            token: Mutex::new(token),
+            // Startup always requires manual entry, even if an older version saved a PAT.
+            token: Mutex::new(None),
+            user: Mutex::new(None),
+            auth_epoch: AtomicU64::new(0),
+            workspace_epoch: AtomicU64::new(0),
+            api_base: "https://openapi-rdc.aliyuncs.com".into(),
             metadata: Mutex::new(None),
             adb: Mutex::new(adb::discover()),
             collector: Mutex::new(None),
@@ -55,9 +55,12 @@ impl AppState {
         })
     }
     pub fn api(&self) -> Result<Api> {
+        if self.user.lock().unwrap().is_none() {
+            return Err("请先验证登录令牌".into());
+        }
         let p = self.profile.lock().unwrap().clone();
         let t = self.token.lock().unwrap();
-        Api::new(p, t.as_deref().ok_or("请填写个人 PAT")?)
+        Api::with_base(p, t.as_deref().ok_or("请填写个人 PAT")?, &self.api_base)
     }
     fn editable(&self, id: &str) -> Result<()> {
         if self.locks.lock().unwrap().contains(id) {
@@ -107,44 +110,40 @@ impl AppState {
 }
 #[tauri::command]
 pub fn bootstrap(state: State<AppState>) -> Result<Value> {
+    let user = state.user.lock().unwrap().clone();
+    let authorized = user.is_some();
     Ok(
-        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":state.token.lock().unwrap().is_some(),"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":state.store.list("draft")?,"submissions":state.store.list("submission")?,"sessions":state.store.list("session")?}),
+        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":state.store.list("draft")?,"submissions":state.store.list("submission")?,"sessions":state.store.list("session")?}),
     )
 }
 #[tauri::command]
-pub fn set_auth(mut token: String, remember: bool, state: State<AppState>) -> Result<()> {
-    token = token.trim().to_string();
-    if token.len() < 8 || token.len() > 4096 || token.contains(['\n', '\r']) {
-        token.zeroize();
-        return Err("PAT 格式不正确".into());
-    }
-    if remember {
-        let entry = keyring::Entry::new(SERVICE, "personal-pat")
-            .map_err(|_| "系统安全存储不可用，请使用仅本次授权")?;
-        if entry.set_password(&token).is_err() {
-            token.zeroize();
-            return Err("系统安全存储不可用，未保存 Token；请选择仅本次使用".into());
-        }
-        state.store.put("settings", "remembered", &true)?;
+pub async fn set_auth(token: String, remember: bool, state: State<'_, AppState>) -> Result<()> {
+    let result = crate::workspace::login(&state, token, remember).await?;
+    if result.status == "valid" {
+        Ok(())
     } else {
-        let remembered: bool = state.store.get("settings", "remembered")?.unwrap_or(false);
-        state.store.put("settings", "remembered", &false)?;
-        if remembered {
-            if let Ok(entry) = keyring::Entry::new(SERVICE, "personal-pat") {
-                let _ = entry.delete_credential();
-            }
-        }
+        Err(result.message)
     }
-    let mut old = state.token.lock().unwrap();
-    if let Some(t) = old.as_mut() {
-        t.zeroize();
-    }
-    *old = Some(token);
-    *state.metadata.lock().unwrap() = None;
-    Ok(())
 }
 #[tauri::command]
-pub fn clear_auth(state: State<AppState>) -> Result<()> {
+pub async fn check_auth(state: State<'_, AppState>) -> Result<crate::workspace::AuthResult> {
+    crate::workspace::check_auth(&state).await
+}
+#[tauri::command]
+pub async fn login(
+    token: String,
+    remember: bool,
+    state: State<'_, AppState>,
+) -> Result<crate::workspace::AuthResult> {
+    crate::workspace::login(&state, token, remember).await
+}
+#[tauri::command]
+pub async fn clear_auth(state: State<'_, AppState>) -> Result<()> {
+    if !state.locks.lock().unwrap().is_empty() {
+        return Err("请等待本次提交结束后再退出登录".into());
+    }
+    crate::workspace::invalidate(&state);
+    stop_session(state.clone()).await?;
     state.store.put("settings", "remembered", &false)?;
     let mut t = state.token.lock().unwrap();
     if let Some(s) = t.as_mut() {
@@ -164,10 +163,142 @@ pub fn clear_auth(state: State<AppState>) -> Result<()> {
 }
 #[tauri::command]
 pub async fn load_metadata(type_id: String, state: State<'_, AppState>) -> Result<Metadata> {
+    let scope = crate::workspace::current_scope(&state, "")?;
+    let epoch = state
+        .workspace_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     *state.metadata.lock().unwrap() = None;
-    let m = state.api()?.metadata(&type_id).await?;
+    let remembered = if type_id.is_empty() {
+        state
+            .store
+            .get::<String>("last_type", &scope)?
+            .unwrap_or_default()
+    } else {
+        type_id.clone()
+    };
+    let api = state.api()?;
+    let result = api.metadata(&remembered).await;
+    let m = if type_id.is_empty()
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("所选 Bug 类型不属于当前项目"))
+    {
+        crate::workspace::observed_error(&state, api.metadata("").await)?
+    } else {
+        crate::workspace::observed_error(&state, result)?
+    };
+    if epoch
+        != state
+            .workspace_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+        || crate::workspace::current_scope(&state, "")? != scope
+    {
+        return Err("账号或项目已变化，请重新读取字段".into());
+    }
     *state.metadata.lock().unwrap() = Some(m.clone());
     Ok(m)
+}
+#[tauri::command]
+pub async fn list_organizations(state: State<'_, AppState>) -> Result<Vec<OptionItem>> {
+    crate::workspace::observed_error(&state, state.api()?.organizations().await)
+}
+#[tauri::command]
+pub async fn list_projects(
+    organization_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OptionItem>> {
+    let mut api = state.api()?;
+    if !api
+        .organizations()
+        .await?
+        .iter()
+        .any(|o| o.id == organization_id)
+    {
+        return Err("组织不在当前令牌可访问列表中".into());
+    }
+    api.profile.organization_id = organization_id;
+    api.profile.validate()?;
+    crate::workspace::observed_error(&state, api.projects().await)
+}
+#[tauri::command]
+pub async fn select_project(
+    organization_id: String,
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Profile> {
+    crate::workspace::observed_error(
+        &state,
+        crate::workspace::select_project(&state, organization_id, project_id).await,
+    )
+}
+#[tauri::command]
+pub fn load_selection_memory(type_id: String, state: State<AppState>) -> Result<Value> {
+    let m = state
+        .metadata
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先读取项目字段")?;
+    if m.type_id != type_id {
+        return Err("所选类型与当前字段配置不一致".into());
+    }
+    crate::workspace::check_metadata_scope(&state, &m)?;
+    let key = crate::workspace::current_scope(&state, &type_id)?;
+    let remembered: Value = state.store.get("selection", &key)?.unwrap_or(json!({}));
+    Ok(crate::workspace::sanitize_selections(&remembered, &m))
+}
+#[tauri::command]
+pub fn remember_selections(selection: Value, state: State<AppState>) -> Result<()> {
+    if serde_json::to_vec(&selection)
+        .map_err(|_| "选项格式错误")?
+        .len()
+        > 65536
+    {
+        return Err("选项记忆数据过大".into());
+    }
+    let m = state
+        .metadata
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先读取项目字段")?;
+    if string(&selection, "workitemTypeId") != m.type_id {
+        return Err("选项与当前Bug类型不一致，请刷新字段".into());
+    }
+    crate::workspace::check_metadata_scope(&state, &m)?;
+    let key = crate::workspace::current_scope(&state, &m.type_id)?;
+    let cleaned = crate::workspace::sanitize_selections(&selection, &m);
+    if state
+        .token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| cleaned.to_string().contains(t))
+    {
+        return Err("选择记忆不得包含登录令牌".into());
+    }
+    state.store.put("selection", &key, &cleaned)?;
+    state.store.put(
+        "last_type",
+        &crate::workspace::current_scope(&state, "")?,
+        &m.type_id,
+    )
+}
+#[tauri::command]
+pub async fn list_remote_history(
+    page: usize,
+    state: State<'_, AppState>,
+) -> Result<crate::workspace::HistoryPage> {
+    crate::workspace::current_scope(&state, "")?;
+    let user = state
+        .user
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先验证登录令牌")?;
+    crate::workspace::observed_error(&state, state.api()?.history(&user.id, page).await)
 }
 #[tauri::command]
 pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
@@ -184,19 +315,32 @@ pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
     }
     let p: Profile = serde_json::from_slice(&raw).map_err(|_| "项目配置格式错误")?;
     p.validate()?;
-    state.store.put("settings", "profile", &p)?;
+    let user = state
+        .user
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先验证登录令牌")?;
+    state
+        .store
+        .put("settings", &format!("profile:{}", user.id), &p)?;
+    state
+        .workspace_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     *state.profile.lock().unwrap() = p.clone();
     *state.metadata.lock().unwrap() = None;
     Ok(p)
 }
 #[tauri::command]
 pub fn new_draft(state: State<AppState>) -> Result<Value> {
+    let scope = crate::workspace::current_scope(&state, "")?;
     let mut d: Value =
         serde_json::from_str(include_str!("../../schemas/empty-draft.json")).unwrap();
     d["id"] = json!(uuid());
     d["createdAt"] = json!(now());
     d["updatedAt"] = json!(now());
     state.store.put("draft", &string(&d, "id"), &d)?;
+    state.store.put("draft_scope", &string(&d, "id"), &scope)?;
     Ok(d)
 }
 #[tauri::command]
@@ -277,7 +421,7 @@ pub fn validate_draft(id: String, state: State<AppState>) -> Result<Vec<Issue>> 
         &d,
         &state.profile.lock().unwrap(),
         state.metadata.lock().unwrap().as_ref(),
-        state.token.lock().unwrap().is_some(),
+        state.user.lock().unwrap().is_some(),
         true,
     ))
 }
@@ -307,6 +451,7 @@ pub async fn start_session(
     business: String,
     state: State<'_, AppState>,
 ) -> Result<Value> {
+    crate::workspace::current_scope(&state, "")?;
     adb::valid_serial(&serial)?;
     adb::valid_package(&package_name)?;
     if validation::fixed_build_url(&build_url).is_none() {
@@ -562,6 +707,9 @@ pub async fn export_evidence(
 }
 #[tauri::command]
 pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submission> {
+    submit_with_state(id, &state).await
+}
+pub(crate) async fn submit_with_state(id: String, state: &AppState) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
         if !locks.insert(id.clone()) {
@@ -569,12 +717,13 @@ pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submis
         }
     }
     let result = async {
+        let api = crate::workspace::submission_api(state, &id)?;
         let d = state.store.draft(&id)?;
         state.assert_no_token(&d)?;
         Submitter {
             store: state.store.clone(),
         }
-        .submit(&id, &state.api()?)
+        .submit(&id, &api)
         .await
     }
     .await;
@@ -587,6 +736,13 @@ pub async fn reconcile_submission(
     remote_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Submission> {
+    reconcile_with_state(id, remote_id, &state).await
+}
+pub(crate) async fn reconcile_with_state(
+    id: String,
+    remote_id: Option<String>,
+    state: &AppState,
+) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
         if !locks.insert(id.clone()) {
@@ -594,10 +750,11 @@ pub async fn reconcile_submission(
         }
     }
     let result = async {
+        let api = crate::workspace::submission_api(state, &id)?;
         Submitter {
             store: state.store.clone(),
         }
-        .reconcile(&id, &state.api()?, remote_id)
+        .reconcile(&id, &api, remote_id)
         .await
     }
     .await;
