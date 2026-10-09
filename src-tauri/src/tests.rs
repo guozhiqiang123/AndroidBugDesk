@@ -1192,9 +1192,15 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
     final_d["previewConfirmed"] = json!(true);
     validation::check_shape(&final_d).unwrap();
     store.put("draft", &id, &final_d).unwrap();
-    let submitted = crate::commands::submit_bug(id.clone(), app.state())
-        .await
-        .unwrap();
+    let (first, second) = tokio::join!(
+        crate::commands::submit_bug(id.clone(), app.state()),
+        crate::commands::submit_bug(id.clone(), app.state())
+    );
+    let (submitted, duplicate) = match (first, second) {
+        (Ok(submitted), Err(error)) | (Err(error), Ok(submitted)) => (submitted, error),
+        other => panic!("concurrent submit must admit exactly one call: {other:?}"),
+    };
+    assert!(duplicate.contains("请勿重复点击"));
     assert_eq!(submitted.state, "submitted");
     assert_eq!(submitted.uploads.len(), 9, "bundle + original selected log + redacted window + two receipts + PNG/JPEG/MP4 + system report");
     assert_eq!(remote.lock().unwrap().creates, 1);
