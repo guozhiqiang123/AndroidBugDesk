@@ -338,6 +338,49 @@ function App() {
     setTab("new");
     await refresh();
   };
+  const confirmLogin = async () => {
+    let result: AuthResult;
+    try {
+      result = await invoke<AuthResult>("login", {
+        token,
+        remember: false,
+      });
+    } catch (e) {
+      setToken("");
+      await invalidateAuth(
+        `云效授权校验失败：${typeof e === "string" ? e : String(e)}`,
+      );
+      return;
+    }
+    setToken("");
+    setAuth(result);
+    if (result.status !== "valid") {
+      setTab(tabForAuth(result));
+      setError(result.message || "令牌校验失败，请重新输入。");
+      setBoot((b) => (b ? { ...b, authorized: false, user: result.user } : b));
+      return;
+    }
+    const next = await refresh();
+    setBoot({ ...next, authorized: true, user: result.user });
+    setTab("new");
+    let validProject = false;
+    try {
+      validProject = await loadWorkspace(next.profile);
+    } catch (e) {
+      await handleRemoteError(e, "云效项目读取失败");
+      return;
+    }
+    if (profileConfigured(next.profile) && validProject) {
+      try {
+        await loadProjectMetadataAndDraft(next.profile);
+      } catch (e) {
+        await handleRemoteError(e, "云效元数据读取失败");
+        return;
+      }
+    }
+    setTab("new");
+    setNotice("登录成功，已进入新建提交。");
+  };
   const issues =
     draft && boot
       ? validateDraft(draft, boot.profile, boot.metadata, boot.authorized)
@@ -438,59 +481,64 @@ function App() {
     </label>
   );
   const dynamicFields = boot?.metadata ? (
-    <section className="card">
-      <h2>云效关键字段</h2>
-      {boot.metadata.fields
-        .filter(
-          (f) =>
-            ![
-              "subject",
-              "description",
-              "assignedTo",
-              "sprint",
-              "versions",
-            ].includes(nativeTarget(f, boot.profile) ?? ""),
-        )
-        .filter((f) => f.showWhenCreate !== false || f.required)
-        .map((f) => {
-          const path = `customFields.${f.id}`;
-          const opts = ["user", "multiUser"].includes(f.format)
-            ? boot.metadata!.members
-            : f.format === "sprint"
-              ? boot.metadata!.sprints
-              : f.format === "version"
-                ? boot.metadata!.versions
-                : f.options;
-          if (!supportedFormats.has(f.format))
-            return (
-              <p className="banner error" key={f.id}>
-                「{f.name}」格式 {f.format} 未支持，请完善映射或实现后再提交。
-              </p>
-            );
-          if (
-            [
-              "list",
-              "multiList",
-              "user",
-              "multiUser",
-              "sprint",
-              "version",
-              "tag",
-            ].includes(f.format)
-          ) {
-            return select(
-              path,
-              `${f.name}${f.required ? "（必填）" : ""}`,
-              opts,
-              ["multiList", "multiUser", "version", "tag"].includes(f.format),
-              f.optionError,
-            );
-          }
-          return field(path, `${f.name}${f.required ? "（必填）" : ""}`, {
-            multi: f.format === "text",
-            type: f.format === "date" ? "date" : "text",
-          });
-        })}
+    <section className="card dynamic-fields">
+      <div className="card-title">
+        <h2>云效关键字段</h2>
+        <span className="section-hint">选项来自当前项目</span>
+      </div>
+      <div className="grid">
+        {boot.metadata.fields
+          .filter(
+            (f) =>
+              ![
+                "subject",
+                "description",
+                "assignedTo",
+                "sprint",
+                "versions",
+              ].includes(nativeTarget(f, boot.profile) ?? ""),
+          )
+          .filter((f) => f.showWhenCreate !== false || f.required)
+          .map((f) => {
+            const path = `customFields.${f.id}`;
+            const opts = ["user", "multiUser"].includes(f.format)
+              ? boot.metadata!.members
+              : f.format === "sprint"
+                ? boot.metadata!.sprints
+                : f.format === "version"
+                  ? boot.metadata!.versions
+                  : f.options;
+            if (!supportedFormats.has(f.format))
+              return (
+                <p className="banner error" key={f.id}>
+                  「{f.name}」格式 {f.format} 未支持，请完善映射或实现后再提交。
+                </p>
+              );
+            if (
+              [
+                "list",
+                "multiList",
+                "user",
+                "multiUser",
+                "sprint",
+                "version",
+                "tag",
+              ].includes(f.format)
+            ) {
+              return select(
+                path,
+                `${f.name}${f.required ? "（必填）" : ""}`,
+                opts,
+                ["multiList", "multiUser", "version", "tag"].includes(f.format),
+                f.optionError,
+              );
+            }
+            return field(path, `${f.name}${f.required ? "（必填）" : ""}`, {
+              multi: f.format === "text",
+              type: f.format === "date" ? "date" : "text",
+            });
+          })}
+      </div>
       {!boot.metadata.fields.length && <p>当前类型没有额外字段。</p>}
     </section>
   ) : null;
@@ -519,7 +567,7 @@ function App() {
               Android Bug Desk<small>测试证据工作台</small>
             </div>
           </div>
-          <div className="nav-caption">提交一个可追溯的问题</div>
+          <div className="nav-caption">工作台</div>
           <nav>
             {[
               ["new", "01", "新建提交"],
@@ -550,7 +598,7 @@ function App() {
         {boot.authorized && (
           <header>
             <div>
-              <span className="eyebrow">ANDROID QA WORKSPACE</span>
+              <span className="eyebrow">Android 缺陷工作台</span>
               <h1>{tab === "history" ? "历史提交" : "新建提交"}</h1>
               <p>
                 {tab === "history"
@@ -616,34 +664,52 @@ function App() {
             </div>
           </header>
         )}
-        {busy && (
+        {boot.authorized && busy && (
           <div className="banner loading" role="status">
             {busy}…
           </div>
         )}
-        {error && (
+        {boot.authorized && error && (
           <div className="banner error" role="alert">
             {error}
           </div>
         )}
-        {notice && (
+        {boot.authorized && notice && (
           <div className="banner success" role="status">
             {notice}
           </div>
         )}
         {tab === "auth" && (
-          <>
-            <section className="card">
-              <div className="card-title">
-                <h2>登录云效</h2>
-                <span className="pill">个人令牌登录</span>
+          <section className="card login-card" aria-labelledby="login-title">
+            <div className="login-brand">
+              <span className="login-mark" aria-hidden="true">
+                A
+              </span>
+              <span>Android Bug Desk</span>
+            </div>
+            <h2 id="login-title">登录云效</h2>
+            <p className="login-intro">输入个人访问令牌，进入缺陷工作台。</p>
+            {(error ||
+              (auth &&
+                auth.status !== "missing" &&
+                auth.status !== "valid" &&
+                auth.message)) && (
+              <div className="banner error" role="alert">
+                {error || auth?.message}
               </div>
-              <p className="muted-text">
-                填写你的云效个人访问令牌，验证成功后进入工作台。
-              </p>
-              {auth && auth.status !== "missing" && auth.message && (
-                <p className="banner error">{auth.message}</p>
-              )}
+            )}
+            {busy && (
+              <div className="banner loading" role="status">
+                {busy}…
+              </div>
+            )}
+            <form
+              className="login-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void run("验证授权", confirmLogin);
+              }}
+            >
               <label className="field">
                 <span>个人访问令牌</span>
                 <input
@@ -654,89 +720,20 @@ function App() {
                   placeholder="输入你的个人访问令牌"
                 />
               </label>
-              <div className="actions">
-                <button
-                  className="primary"
-                  disabled={!token || !!busy}
-                  onClick={() =>
-                    void run("验证授权", async () => {
-                      let result: AuthResult;
-                      try {
-                        result = await invoke<AuthResult>("login", {
-                          token,
-                          remember: false,
-                        });
-                      } catch (e) {
-                        setToken("");
-                        await invalidateAuth(
-                          `云效授权校验失败：${typeof e === "string" ? e : String(e)}`,
-                        );
-                        return;
-                      }
-                      setToken("");
-                      setAuth(result);
-                      setTab(tabForAuth(result));
-                      if (result.status !== "valid") {
-                        setError(
-                          result.message || "令牌校验失败，请重新输入。",
-                        );
-                        setBoot((b) =>
-                          b
-                            ? { ...b, authorized: false, user: result.user }
-                            : b,
-                        );
-                        return;
-                      }
-                      const next = await refresh();
-                      setBoot({ ...next, authorized: true, user: result.user });
-                      setTab("new");
-                      let validProject = false;
-                      try {
-                        validProject = await loadWorkspace(next.profile);
-                      } catch (e) {
-                        await handleRemoteError(e, "云效项目读取失败");
-                        return;
-                      }
-                      if (profileConfigured(next.profile) && validProject) {
-                        try {
-                          await loadProjectMetadataAndDraft(next.profile);
-                        } catch (e) {
-                          await handleRemoteError(e, "云效元数据读取失败");
-                          return;
-                        }
-                      }
-                      setTab("new");
-                      setNotice("登录成功，已进入新建提交。");
-                    })
-                  }
-                >
-                  确定
-                </button>
-                <button
-                  onClick={() =>
-                    void run("清除授权", async () => {
-                      await invoke("clear_auth");
-                      setToken("");
-                      setAuth({
-                        status: "missing",
-                        user: null,
-                        message: "未登录",
-                      });
-                      setTab("auth");
-                      const next = await refresh();
-                      setBoot({ ...next, authorized: false, user: null });
-                    })
-                  }
-                >
-                  清除授权
-                </button>
-              </div>
-            </section>
-          </>
+              <button
+                type="submit"
+                className="primary"
+                disabled={!token || !!busy}
+              >
+                确定
+              </button>
+            </form>
+            <p className="login-note">令牌仅在本次会话中使用</p>
+          </section>
         )}
         {tab === "new" && (
           <>
-            <section className="card">
+            <section className="card connection-card">
               <div className="card-title">
                 <h2>USB 设备</h2>
                 <button

@@ -32,3 +32,11 @@ GZQ-46/47 交付为 in_review。GZQ-49 需正常合入本提交与 GZQ-45/48，�
 - [工作项搜索](https://help.aliyun.com/zh/yunxiao/developer-reference/searchworkitems)
 
 真实只读检查已通过用户、组织、完整项目、成员、字段、迭代和当前账号历史读取。角色字段 verifier/participants/trackers 使用 Role 类型，sprint/versions/labels 使用 Application 类型，按官方 ID 映射；Field 增加可选 optionError。标签接口空响应保留为未确认，不假称无标签。分页以已知总页数为先，避免无效末页 x-next-page 导致无限读取。常规测试跳过真实联调测试；只有本次明确授权后，使用 ANDROIDBUGDESK_RUN_AUTHORIZED_READONLY=1 显式运行 ignored 测试，通过 1 项。
+
+## 最新视觉修订交接
+
+用户进一步要求登录卡片在窗口中心、删除“清除授权”并整理整个 UI。本次基于 `414f44f6114a7e32682ac66bd40c21df94848122`，只修改 main.tsx/style.css 及对应文档。手动登录政策与 IPC 契约保持；错误提示置于卡片内，表单支持回车，登录成功刷新 bootstrap 后再进入工作台。主界面统一间距和卡片样式，设备选择紧凑排列，云效关键字段双列显示。
+
+49 前端、25 Rust、TypeScript/Vite、fmt/严格 Clippy 及 11 个浏览器模拟场景通过；三种窗口尺寸验证登录居中，失败状态仍居中。新的 macOS arm64 评审包从此次提交构建，交付记录提供提交号和 SHA256。没有真实云效调用、钥匙串读取或写入。
+
+仍不得据此接受 GZQ-46 账号恢复返修。本分支未合入 GZQ-45/48 或独立图标资源；GZQ-49 整合与人工验收仍需各自证据。
