@@ -25,6 +25,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Verify candidate manifests with synthetic packages
+        run: node --test tests/build-manifest.node.mjs
       - name: Verify shared schemas and fixtures
         run: npx tsx scripts/schemas.ts && npx tsx scripts/fixtures.ts && git diff --exit-code -- schemas tests/fixtures
       - run: npm run build
