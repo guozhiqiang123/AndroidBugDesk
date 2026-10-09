@@ -655,8 +655,9 @@ pub async fn capture_bugreport(id: String, state: State<'_, AppState>) -> Result
     state.editable(&id)?;
     d["previewConfirmed"] = json!(false);
     d["updatedAt"] = json!(now());
-    state.store.put("draft", &id, &d)?;
-    state.store.put("capture", &task_id, &task)?;
+    state
+        .store
+        .put_many(&[("draft", &id, &d), ("capture", &task_id, &task)])?;
     Ok(d)
 }
 #[tauri::command]
@@ -798,6 +799,19 @@ pub fn remove_attachment(
     let _write = state.store.writes.lock().unwrap();
     state.editable(&id)?;
     let mut d = state.store.draft(&id)?;
+    let files = attachments(&d)?;
+    let target = files
+        .iter()
+        .find(|a| a.id == attachment_id)
+        .ok_or("附件不存在")?;
+    if target.role == "report"
+        && target
+            .derived_from
+            .as_ref()
+            .is_some_and(|owner| files.iter().any(|a| &a.id == owner))
+    {
+        return Err("来源回执须与关联副本一起保留；请移除关联副本以成组移除".into());
+    }
     d["attachments"].as_array_mut().unwrap().retain(|a| {
         string(a, "id") != attachment_id
             && !(string(a, "role") == "report" && string(a, "derivedFrom") == attachment_id)

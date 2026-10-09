@@ -607,6 +607,9 @@ pub fn merge_managed(
     ))
 }
 pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Result<Evidence> {
+    if let Some(error) = crate::validation::receipt_error(&attachments(d)?) {
+        return Err(error);
+    }
     let id = uuid();
     let dir = store.root.join("evidence").join(&id);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

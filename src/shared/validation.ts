@@ -225,6 +225,39 @@ export function validateDraft(
     )
       add("frequency", "发生次数应为 1 至尝试次数之间的整数");
   }
+  for (const a of d.attachments.filter((a) => a.confirmed)) {
+    const paired = d.attachments.filter(
+      (r) => r.role === "report" && r.derivedFrom === a.id,
+    );
+    const window = a.source.startsWith("ADB 问题日志窗口派生副本");
+    const redacted = a.source.startsWith("文本派生副本");
+    const rangeRequired =
+      window ||
+      (redacted &&
+        d.attachments.some(
+          (parent) =>
+            parent.id === a.derivedFrom &&
+            parent.source.startsWith("ADB 问题日志窗口派生副本"),
+        ));
+    if (
+      a.role === "log" &&
+      (window || redacted || paired.length) &&
+      (paired.some((r) => !r.confirmed) ||
+        (rangeRequired &&
+          !paired.some((r) => r.source === "日志窗口范围与缺口记录")) ||
+        (redacted &&
+          !paired.some((r) => r.source === "文本替换记录（请核对副本）")))
+    )
+      add("attachments", "派生副本必须携带并确认全部来源回执");
+    if (
+      a.role === "report" &&
+      a.derivedFrom &&
+      !d.attachments.some(
+        (parent) => parent.id === a.derivedFrom && parent.confirmed,
+      )
+    )
+      add("attachments", "来源回执必须与关联副本一起确认");
+  }
   if (
     !d.attachments.some(
       (a) =>

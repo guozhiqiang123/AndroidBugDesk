@@ -133,3 +133,51 @@ describe("提交门槛", () => {
     expect(draftSchema.safeParse(v).success).toBe(false);
   });
 });
+
+describe("派生回执完整性", () => {
+  it("窗口、脱敏和来源回执成组确认；缺回执阻止提交", () => {
+    const v = d();
+    const original = v.attachments[0];
+    const window = {
+      ...original,
+      id: "00000000-0000-4000-8000-000000000003",
+      source: "ADB 问题日志窗口派生副本；未脱敏",
+      derivedFrom: original.id,
+    };
+    const receipt = {
+      ...original,
+      id: "00000000-0000-4000-8000-000000000004",
+      role: "report" as const,
+      source: "日志窗口范围与缺口记录",
+      derivedFrom: window.id,
+    };
+    v.attachments.push(window, receipt);
+    expect(check(v)).toEqual([]);
+    receipt.confirmed = false;
+    expect(check(v).some((e) => e.message.includes("来源回执"))).toBe(true);
+    receipt.confirmed = true;
+    const redacted = {
+      ...window,
+      id: "00000000-0000-4000-8000-000000000005",
+      source: "文本派生副本：仅按提供的精确文本替换；未保证完整脱敏",
+      derivedFrom: window.id,
+    };
+    const textReceipt = {
+      ...receipt,
+      id: "00000000-0000-4000-8000-000000000006",
+      source: "文本替换记录（请核对副本）",
+      derivedFrom: redacted.id,
+    };
+    v.attachments.push(redacted, textReceipt);
+    expect(check(v).some((e) => e.message.includes("来源回执"))).toBe(true);
+    const inherited = {
+      ...receipt,
+      id: "00000000-0000-4000-8000-000000000007",
+      derivedFrom: redacted.id,
+    };
+    v.attachments.push(inherited);
+    expect(check(v)).toEqual([]);
+    v.attachments = v.attachments.filter((a) => a.id !== redacted.id);
+    expect(check(v).some((e) => e.message.includes("关联副本"))).toBe(true);
+  });
+});

@@ -82,6 +82,46 @@ pub fn native_target<'a>(f: &'a Field, p: &'a Profile) -> Option<&'a str> {
         }
     })
 }
+/// Selected derivatives and their source receipts form one indivisible evidence set.
+pub fn receipt_error(files: &[Attachment]) -> Option<String> {
+    for a in files.iter().filter(|a| a.confirmed) {
+        let paired: Vec<_> = files
+            .iter()
+            .filter(|r| r.role == "report" && r.derived_from.as_deref() == Some(&a.id))
+            .collect();
+        let window = a.source.starts_with("ADB 问题日志窗口派生副本");
+        let redacted = a.source.starts_with("文本派生副本");
+        if a.role == "log" && (window || redacted || !paired.is_empty()) {
+            let range_required = window
+                || (redacted
+                    && a.derived_from.as_ref().is_some_and(|id| {
+                        files.iter().any(|parent| {
+                            &parent.id == id
+                                && parent.source.starts_with("ADB 问题日志窗口派生副本")
+                        })
+                    }));
+            if paired.iter().any(|r| !r.confirmed)
+                || (range_required && !paired.iter().any(|r| r.source == "日志窗口范围与缺口记录"))
+                || (redacted
+                    && !paired
+                        .iter()
+                        .any(|r| r.source == "文本替换记录（请核对副本）"))
+            {
+                return Some("派生副本必须携带并确认全部来源回执".into());
+            }
+        }
+        if a.role == "report"
+            && a.derived_from.as_ref().is_some_and(|owner| {
+                !files
+                    .iter()
+                    .any(|parent| &parent.id == owner && parent.confirmed)
+            })
+        {
+            return Some("来源回执必须与关联副本一起确认".into());
+        }
+    }
+    None
+}
 pub fn validate(
     d: &Value,
     p: &Profile,
@@ -235,6 +275,9 @@ pub fn validate(
         }
     }
     let files = attachments(d).unwrap_or_default();
+    if let Some(error) = receipt_error(&files) {
+        add!("attachments", error);
+    }
     if !files.iter().any(|a| {
         a.role == "log"
             && a.confirmed

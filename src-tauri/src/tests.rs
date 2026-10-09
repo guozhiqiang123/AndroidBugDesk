@@ -929,6 +929,7 @@ async fn review_account_switch_must_not_resume_another_users_partial_submission(
         id: "bob".into(),
         name: "Bob".into(),
         last_organization: "test-org".into(),
+        ..Default::default()
     });
     let app = tauri::test::mock_builder()
         .manage(state)
@@ -968,6 +969,8 @@ if args[:1]==['logcat']:
  sys.exit(0)
 if args[:1]==['exec-out']: sys.stdout.buffer.write(Path(PNG).read_bytes());sys.exit(0)
 if args[:1]==['bugreport']:
+ if Path(__file__).with_suffix('.fail').exists():
+  Path(args[1],'partial.txt').write_text('partial mock report');sys.exit(7)
  with zipfile.ZipFile(Path(args[1])/'bugreport.zip','w') as z: z.writestr('report.txt','mock system report')
  sys.exit(0)
 if args[:2]==['shell','date']:
@@ -1102,6 +1105,67 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
         "redaction and inherited window receipts travel with selected derivative"
     );
     assert!(!rows.iter().find(|a| a.id == wid).unwrap().confirmed);
+    for receipt in rows
+        .iter()
+        .filter(|a| a.role == "report" && a.derived_from.as_deref() == Some(&derived.id))
+    {
+        assert!(
+            crate::commands::remove_attachment(id.clone(), receipt.id.clone(), app.state())
+                .unwrap_err()
+                .contains("关联副本")
+        );
+        assert_eq!(
+            store.draft(&id).unwrap()["attachments"],
+            confirmed["attachments"]
+        );
+    }
+    for remove in [false, true] {
+        let mut broken = confirmed.clone();
+        let receipt_id = &rows
+            .iter()
+            .find(|a| a.role == "report" && a.derived_from.as_deref() == Some(&derived.id))
+            .unwrap()
+            .id;
+        if remove {
+            broken["attachments"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|a| string(a, "id") != *receipt_id);
+        } else {
+            for a in broken["attachments"].as_array_mut().unwrap() {
+                if string(a, "id") == *receipt_id {
+                    a["confirmed"] = json!(false);
+                }
+            }
+        }
+        assert!(evidence::build(&store, &broken, &api.profile, false).is_err());
+        store.put("draft", &id, &broken).unwrap();
+        assert!(crate::commands::submit_bug(id.clone(), app.state())
+            .await
+            .is_err());
+        assert_eq!(write_counts(&remote), (0, 0, 0));
+    }
+    store.put("draft", &id, &confirmed).unwrap();
+    let exported = evidence::build(&store, &confirmed, &api.profile, true).unwrap();
+    assert_eq!(
+        exported
+            .files
+            .iter()
+            .filter(|a| a.role == "report" && a.derived_from.as_deref() == Some(&derived.id))
+            .count(),
+        2
+    );
+    let removed =
+        crate::commands::remove_attachment(id.clone(), derived.id.clone(), app.state()).unwrap();
+    assert!(!attachments(&removed)
+        .unwrap()
+        .iter()
+        .any(|a| a.id == derived.id || a.derived_from.as_deref() == Some(&derived.id)));
+    assert_eq!(
+        evidence::hash_file(Path::new(&original.path)).unwrap(),
+        before
+    );
+    store.put("draft", &id, &confirmed).unwrap();
     let mut final_d = confirmed;
     for (name, role) in [
         ("evidence.png", "image"),
@@ -1222,5 +1286,51 @@ async fn integrated_early_stop_interrupts_window_and_never_pads_time() {
         chrono::DateTime::parse_from_rfc3339(&string(&task, "summary.observedUntil")).unwrap();
     let end = chrono::DateTime::parse_from_rfc3339(&string(&task, "summary.requestedEnd")).unwrap();
     assert!(observed < end);
+    assert_eq!(write_counts(&remote), (0, 0, 0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn integrated_bugreport_failure_records_gap_and_preserves_device_binding() {
+    use tauri::Manager;
+    let (server, remote, api) = mock(Remote::default()).await;
+    let (_temp, store, mut d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let sid = uuid();
+    d["sessionId"] = json!(sid);
+    store.put("draft", &id, &d).unwrap();
+    store
+        .put(
+            "session",
+            &sid,
+            &json!({"id":sid,"serial":"integration-device","stoppedAt":now(),"gaps":[]}),
+        )
+        .unwrap();
+    let state = submission_state(&store, &server, &api.profile);
+    let fake = integration_fake_adb(&store.root);
+    std::fs::write(fake.with_extension("fail"), "simulate disconnect").unwrap();
+    *state.adb.lock().unwrap() = Some(fake.clone());
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let failed = crate::commands::capture_bugreport(id.clone(), app.state())
+        .await
+        .unwrap();
+    assert_eq!(failed["attachments"], d["attachments"]);
+    assert!(!failed["collectionErrors"].as_array().unwrap().is_empty());
+    assert!(!crate::capture::pending(&store, &id).unwrap());
+    assert_eq!(store.list("capture").unwrap()[0]["status"], "failed");
+    let trace = std::fs::read_to_string(fake.with_extension("argv")).unwrap();
+    assert!(trace.contains("'-s', 'integration-device', 'bugreport'"));
+    change_identity(&app.state(), &api.profile, "account");
+    assert!(crate::commands::capture_bugreport(id, app.state())
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read_to_string(fake.with_extension("argv")).unwrap(),
+        trace
+    );
     assert_eq!(write_counts(&remote), (0, 0, 0));
 }

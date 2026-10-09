@@ -1376,6 +1376,7 @@ function App() {
                     </div>
                   ))}
                 <p className="muted-text">
+                  派生副本与来源回执一起选择；移除副本会同时移除关联回执，回执不能单独移除。
                   文件先保存为本地副本。勾选后才进入证据包和上传；日志请填真实覆盖范围。超过{" "}
                   {boot.profile.attachmentWarningMb} MB
                   为本地提醒，不代表云效限制。
