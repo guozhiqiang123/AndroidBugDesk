@@ -45,6 +45,8 @@ jobs:
       - run: npm test
       - name: Verify candidate manifests with synthetic packages
         run: node --test tests/build-manifest.node.mjs
+      - name: Verify local packaging and browser workflow helpers
+        run: npm run test:workflow
       - run: npm run build
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
       - name: Build native desktop packages

@@ -14,6 +14,8 @@
     "test": "vitest run",
     "check": "npm run typecheck && npm test && npm run build && cargo test --manifest-path src-tauri/Cargo.toml",
     "bundle": "tauri build",
+    "bundle:local": "node scripts/bundle-local.mjs",
+    "test:workflow": "node --test tests/local-bundle.node.mjs tests/browser-check.node.mjs",
     "schemas": "tsx scripts/schemas.ts",
     "format": "prettier --write src scripts tests docs profiles schemas .github package.json tsconfig.json vite.config.ts index.html README.md && cargo fmt --manifest-path src-tauri/Cargo.toml"
   },

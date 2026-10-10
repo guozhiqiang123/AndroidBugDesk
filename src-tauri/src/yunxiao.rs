@@ -10,6 +10,7 @@ pub struct Api {
     client: Client,
     pub profile: Profile,
     base: String,
+    oauth: Option<std::sync::Arc<crate::oauth::OAuthSession>>,
 }
 impl Api {
     pub fn new(profile: Profile, token: &str) -> Result<Self> {
@@ -31,7 +32,15 @@ impl Api {
             client,
             profile,
             base: base.into(),
+            oauth: None,
         })
+    }
+    pub(crate) fn with_oauth(
+        mut self,
+        session: Option<std::sync::Arc<crate::oauth::OAuthSession>>,
+    ) -> Self {
+        self.oauth = session;
+        self
     }
     fn url(&self, path: &str) -> String {
         format!(
@@ -56,6 +65,19 @@ impl Api {
         let readonly = method == Method::GET || url.ends_with(":search");
         for attempt in 0..3 {
             let mut req = self.client.request(method.clone(), &url);
+            if let Some(session) = &self.oauth {
+                let mut token = session.access_token().await?;
+                let mut value =
+                    HeaderValue::from_str(&token).map_err(|_| "云效授权令牌格式错误")?;
+                value.set_sensitive(true);
+                req = req.header("x-yunxiao-token", value);
+                let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| "云效授权令牌格式错误")?;
+                bearer.set_sensitive(true);
+                req = req.header("Authorization", bearer);
+                use zeroize::Zeroize;
+                token.zeroize();
+            }
             if let Some(b) = &body {
                 req = req.json(b);
             }
@@ -192,54 +214,86 @@ impl Api {
         user_id: &str,
         page: usize,
     ) -> Result<crate::workspace::HistoryPage> {
+        self.history_filtered(
+            user_id,
+            page,
+            &crate::history::HistoryFilters::default(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+    }
+    pub async fn history_filtered(
+        &self,
+        user_id: &str,
+        start_page: usize,
+        filters: &crate::history::HistoryFilters,
+        metadata: Option<&Metadata>,
+        known_kinds: &std::collections::HashMap<String, String>,
+    ) -> Result<crate::workspace::HistoryPage> {
         encode_id(user_id)?;
-        if !(1..=1000).contains(&page) {
+        filters.validate()?;
+        if !(1..=1000).contains(&start_page) {
             return Err("历史记录页码不正确".into());
         }
-        let (value, headers) = self
+        // Stop on a matching page or after three empty pages. Never crawl the
+        // entire project automatically; page is the consumed server cursor.
+        for page in start_page..=(start_page + 2).min(1000) {
+            let (value, headers) = self
             .request(
                 Method::POST,
                 "/workitems:search",
                 Some(json!({
                     "category":"Bug","spaceId":self.profile.project_id,"spaceType":"Project",
                     "page":page,"perPage":50,"orderBy":"gmtCreate","sort":"desc",
-                    "conditions":serde_json::to_string(&json!({"conditionGroups":[[{
-                        "fieldIdentifier":"creator","operator":"CONTAINS","value":[user_id],
-                        "toValue":null,"className":"user","format":"list"
-                    }]]})).unwrap()
+                    "conditions":serde_json::to_string(&filters.conditions(user_id)).map_err(|_| "历史筛选条件格式错误")?
                 })),
             )
             .await?;
-        let rows = value.as_array().ok_or("历史记录列表格式变化")?;
-        let mut items = Vec::new();
-        for row in rows {
-            let id = string(row, "id");
-            encode_id(&id).map_err(|_| "历史记录缺少有效工作项 ID")?;
-            // A malformed/overbroad response must not leak another project's/user's records.
-            if string(row, "space.id") != self.profile.project_id
-                || string(row, "creator.id") != user_id
-                || string(row, "categoryId") != "Bug"
-            {
-                return Err("云效历史结果与当前用户/项目/Bug范围不一致，停止展示".into());
+            let rows = value.as_array().ok_or("历史记录列表格式变化")?;
+            if rows.len() > 50 {
+                return Err("云效历史返回超出请求页大小，停止展示".into());
             }
-            items.push(crate::workspace::HistoryItem {
-                id,
-                identifier: string(row, "serialNumber"),
-                title: string(row, "subject"),
-                status: if string(row, "status.displayName").is_empty() {
-                    string(row, "status.name")
-                } else {
-                    string(row, "status.displayName")
-                },
-                created_at: string(row, "gmtCreate"),
-                updated_at: string(row, "gmtModified"),
-            });
+            let mut items = Vec::new();
+            for row in rows {
+                let id = string(row, "id");
+                encode_id(&id).map_err(|_| "历史记录缺少有效工作项 ID")?;
+                // A malformed/overbroad response must not leak another project's/user's records.
+                if string(row, "space.id") != self.profile.project_id
+                    || string(row, "creator.id") != user_id
+                    || string(row, "categoryId") != "Bug"
+                {
+                    return Err("云效历史结果与当前用户/项目/Bug范围不一致，停止展示".into());
+                }
+                if !filters.matches(row, metadata, known_kinds) {
+                    continue;
+                }
+                items.push(crate::workspace::HistoryItem {
+                    id,
+                    identifier: string(row, "serialNumber"),
+                    title: string(row, "subject"),
+                    status: if string(row, "status.displayName").is_empty() {
+                        string(row, "status.name")
+                    } else {
+                        string(row, "status.displayName")
+                    },
+                    created_at: string(row, "gmtCreate"),
+                    updated_at: string(row, "gmtModified"),
+                });
+            }
+            let has_more = has_more(&headers, page, rows.len(), 50)?;
+            if page == 1000 && has_more {
+                return Err("历史读取已达到分页上限，请缩小筛选范围".into());
+            }
+            if !items.is_empty() || !has_more || page == start_page + 2 {
+                return Ok(crate::workspace::HistoryPage {
+                    items,
+                    page,
+                    has_more,
+                });
+            }
         }
-        Ok(crate::workspace::HistoryPage {
-            items,
-            page,
-            has_more: has_more(&headers, page, rows.len(), 50)?,
-        })
+        Err("历史记录分页未完成".into())
     }
     pub async fn metadata(&self, type_id: &str) -> Result<Metadata> {
         let path = format!("/projects/{}", self.profile.project_id);
@@ -280,8 +334,10 @@ impl Api {
             })
             .collect::<Result<Vec<_>>>()?;
         for field in &mut fields {
-            if (field.format == "tag"
-                || crate::validation::native_target(field, &self.profile) == Some("labels"))
+            if !crate::submission_fields::excluded_field(field, &self.profile)
+                && !crate::submission_fields::hidden_optional_field(field, &self.profile)
+                && (field.format == "tag"
+                    || crate::validation::native_target(field, &self.profile) == Some("labels"))
                 && field.options.is_empty()
             {
                 match self.list(&format!("{path}/labels"), true).await {
@@ -474,7 +530,7 @@ fn has_more(headers: &HeaderMap, page: usize, count: usize, per_page: usize) -> 
     // No documented completion header: offer another page for a full response.
     Ok(count == per_page)
 }
-fn encode_id(id: &str) -> Result<&str> {
+pub(crate) fn encode_id(id: &str) -> Result<&str> {
     if regex::Regex::new(r"^[A-Za-z0-9_-]{1,128}$")
         .unwrap()
         .is_match(id)
@@ -514,6 +570,18 @@ pub fn create_payload(d: &Value, m: &Metadata, description: String) -> Result<Va
     }
     let mut custom = serde_json::Map::new();
     for f in &m.fields {
+        if crate::submission_fields::excluded_field(f, &m.profile) {
+            if f.required || m.profile.required_field_ids.contains(&f.id) {
+                return Err(format!(
+                    "云效项目将已移除字段「{}」设为必填，请调整项目配置后提交",
+                    f.name
+                ));
+            }
+            continue;
+        }
+        if crate::submission_fields::hidden_optional_field(f, &m.profile) {
+            continue;
+        }
         let v = d["customFields"][&f.id].clone();
         if v.is_null() || v == "" || v.as_array().is_some_and(|a| a.is_empty()) {
             continue;

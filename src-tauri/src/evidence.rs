@@ -381,6 +381,52 @@ pub fn redact_text(
         receipt_path,
     })
 }
+pub fn inspect_import(path: &Path, root: &Path) -> Result<Attachment> {
+    let mut header = [0u8; 4096];
+    let len = File::open(path)
+        .map_err(|_| "文件不存在或无法读取")?
+        .read(&mut header)
+        .map_err(|_| "文件读取失败")?;
+    let h = &header[..len];
+    let extension = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let role = if h.starts_with(b"\x89PNG\r\n\x1a\n") || h.starts_with(b"\xff\xd8\xff") {
+        "image"
+    } else if len >= 12
+        && &h[4..8] == b"ftyp"
+        && h[8..len]
+            .windows(3)
+            .any(|w| w == b"mp4" || w == b"iso" || w == b"avc")
+    {
+        "video"
+    } else if h.starts_with(b"PK\x03\x04")
+        && ![
+            "docx", "xlsx", "pptx", "odt", "ods", "odp", "apk", "aab", "jar",
+        ]
+        .contains(&extension.as_str())
+    {
+        "report"
+    } else if !h.contains(&0)
+        && utf8_prefix(h)
+        && !["json", "csv", "tsv", "xml", "yaml", "yml"].contains(&extension.as_str())
+    {
+        "log"
+    } else {
+        "sample"
+    };
+    inspect(path, role, "导入文件，类型自动识别", root)
+}
+
+fn utf8_prefix(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(error) => bytes.len() == 4096 && error.error_len().is_none() && error.valid_up_to() > 0,
+    }
+}
+
 pub fn inspect(path: &Path, role: &str, source: &str, root: &Path) -> Result<Attachment> {
     if !["log", "image", "video", "report", "sample"].contains(&role) {
         return Err("附件角色不支持".into());
@@ -406,7 +452,7 @@ pub fn inspect(path: &Path, role: &str, source: &str, root: &Path) -> Result<Att
         "image" if jpeg => "image/jpeg",
         "video" if mp4 => "video/mp4",
         "report" if zip => "application/zip",
-        "log" if !h.contains(&0) && std::str::from_utf8(h).is_ok() => "text/plain",
+        "log" if !h.contains(&0) && utf8_prefix(h) => "text/plain",
         "sample" => "application/octet-stream",
         _ => {
             return Err(
@@ -461,6 +507,47 @@ pub fn inspect(path: &Path, role: &str, source: &str, root: &Path) -> Result<Att
         confirmed: false,
         derived_from: None,
     })
+}
+
+/// Remove one app-managed attachment directory after its durable draft reference
+/// has been replaced. The UUID and canonical parent checks keep this operation
+/// confined to `root/attachments/<attachment-id>`.
+pub(crate) fn remove_managed_attachment(root: &Path, attachment: &Attachment) -> Result<()> {
+    let parsed =
+        uuid::Uuid::parse_str(&attachment.id).map_err(|_| "采集附件 ID 格式不正确".to_string())?;
+    if parsed.to_string() != attachment.id {
+        return Err("采集附件 ID 格式不正确".into());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|_| "本地证据根目录不存在".to_string())?;
+    let attachments = root.join("attachments");
+    if !attachments.exists() {
+        return Ok(());
+    }
+    let attachments = attachments
+        .canonicalize()
+        .map_err(|_| "本地附件目录无法读取".to_string())?;
+    if !attachments.starts_with(&root) {
+        return Err("本地附件目录不能离开证据根目录".into());
+    }
+    let directory = attachments.join(&attachment.id);
+    let Ok(metadata) = fs::symlink_metadata(&directory) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("采集附件目录格式异常".into());
+    }
+    let directory = directory
+        .canonicalize()
+        .map_err(|_| "采集附件目录无法读取".to_string())?;
+    let file = Path::new(&attachment.path)
+        .canonicalize()
+        .map_err(|_| "采集附件文件无法读取".to_string())?;
+    if directory.parent() != Some(attachments.as_path()) || file.parent() != Some(&directory) {
+        return Err("采集附件路径不能离开其管理目录".into());
+    }
+    fs::remove_dir_all(directory).map_err(|e| e.to_string())
 }
 fn validate_mp4(path: &Path) -> Result<()> {
     let mut file = File::open(path).map_err(|_| "视频无法读取")?;
@@ -529,17 +616,17 @@ fn md(s: &str) -> String {
 pub fn report(d: &Value, p: &Profile) -> String {
     let rows = [
         ("问题概述", "title"),
-        ("前置条件", "preconditions"),
-        ("预期结果", "expected"),
-        ("实际结果", "actual"),
+        ("问题类型", "kind"),
+        ("Bug所在页面", "bugPage"),
+        ("复现条件", "preconditions"),
+        ("期望表现", "expected"),
+        ("问题表现", "actual"),
     ];
-    let mut out = format!(
-        "# {}\n\n项目：{}\n方向：{}\n\n",
-        md(&string(d, "title")),
-        md(&p.name),
-        md(&string(d, "business"))
-    );
+    let mut out = format!("# {}\n\n项目：{}\n\n", md(&string(d, "title")), md(&p.name));
     for (title, key) in rows {
+        if key == "bugPage" && string(d, key).trim().is_empty() {
+            continue;
+        }
         out.push_str(&format!("## {title}\n\n{}\n\n", md(&string(d, key))));
     }
     out.push_str("## 复现步骤\n\n");
@@ -550,7 +637,7 @@ pub fn report(d: &Value, p: &Profile) -> String {
     {
         out.push_str(&format!("{}. {}\n", i + 1, md(s)));
     }
-    out.push_str(&format!("\n## 复现频率\n\n{}\n\n## 问题时间\n\n事件：{}\n原始标记：{}\n来源：{}\n事后补采：{}\n依据：{}\n\n## 应用与设备\n\n应用：{}\n\n设备：{}\n\n人工补充来源：{}\n\n## Jenkins 固定构建\n\n{}\n身份状态：{}\n\n## 有效云控\n\n{}\n\n## 采集缺口\n\n{}\n",if bool_at(d,"frequency.firstDiscovery"){ "首次发现、尚未重复".into() }else{format!("{} 次尝试，{} 次发生",string(d,"frequency.attempts"),string(d,"frequency.occurrences"))},md(&string(d,"event.occurredAt")),md(&string(d,"event.originalAt")),md(&string(d,"event.source")),bool_at(d,"event.lateCapture"),md(&string(d,"event.sourceNote")),md(&d["app"].to_string()),md(&d["device"].to_string()),md(&string(d,"manualNote")),md(&string(d,"buildUrl")),md(&string(d,"buildStatus")),md(&d["cloud"].to_string()),md(&d["collectionErrors"].to_string())));
+    out.push_str(&format!("\n## 复现频率\n\n{}\n\n## 问题时间\n\n事件：{}\n原始标记：{}\n来源：{}\n依据：{}\n\n## 应用与设备\n\n应用：{}\n\n设备：{}\n\n## 采集缺口\n\n{}\n",if bool_at(d,"frequency.firstDiscovery"){ "首次发现、尚未重复".into() }else{format!("{} 次尝试，{} 次发生",string(d,"frequency.attempts"),string(d,"frequency.occurrences"))},md(&string(d,"event.occurredAt")),md(&string(d,"event.originalAt")),md(&string(d,"event.source")),md(&string(d,"event.sourceNote")),md(&d["app"].to_string()),md(&d["device"].to_string()),md(&d["collectionErrors"].to_string())));
     out
 }
 pub fn marker(id: &str) -> String {
@@ -614,7 +701,7 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
     let dir = store.root.join("evidence").join(&id);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut files = Vec::new();
-    for mut a in attachments(d)?.into_iter().filter(|a| a.confirmed) {
+    for mut a in attachments(d)? {
         verify_attachment(&a)?;
         let sub = if ["image", "video"].contains(&a.role.as_str()) {
             "media"
@@ -633,7 +720,7 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
         "scope":{"organizationId":p.organization_id,"projectId":p.project_id,"businessProfile":d["business"],"versions":d["versions"],"sprint":d["sprint"],"multicaParentTaskId":null},
         "build":{"url":d["buildUrl"],"parsed":crate::validation::fixed_build_url(&string(d,"buildUrl")),"identityStatus":d["buildStatus"],"manifest":d["buildManifest"],"mappingStatus":"not_collected","parameters":null},
         "installedArtifact":{"identity":d["app"],"fingerprints":null,"status":"not_collected"},"ciArtifacts":{"items":null,"status":"not_collected"},
-        "problem":{"kind":d["kind"],"title":d["title"],"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"cloudConfig":d["cloud"],"collection":d["sources"],"gaps":d["collectionErrors"],
+        "problem":{"kind":d["kind"],"title":d["title"],"bugPage":string(d,"bugPage"),"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"collection":d["sources"],"gaps":d["collectionErrors"],
         "files":files.iter().map(|a|json!({"id":a.id,"relativePath":Path::new(&a.path).strip_prefix(&dir).unwrap().to_string_lossy(),"mime":a.mime,"size":a.size,"sha256":a.sha256,"role":a.role,"source":a.source,"derivedFrom":a.derived_from,"includedInZip":include_media || !["image","video"].contains(&a.role.as_str()),"coverage":{"start":a.coverage_start,"end":a.coverage_end}})).collect::<Vec<_>>()});
     for (name, value) in [
         ("manifest.json", manifest),
@@ -642,7 +729,6 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
             json!({"effective":d["device"],"snapshot":snapshot}),
         ),
         ("app.json", d["app"].clone()),
-        ("cloud-config.json", d["cloud"].clone()),
         ("collection-errors.json", d["collectionErrors"].clone()),
     ] {
         fs::write(dir.join(name), serde_json::to_vec_pretty(&value).unwrap())
@@ -658,7 +744,6 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
         "manifest.json",
         "device.json",
         "app.json",
-        "cloud-config.json",
         "collection-errors.json",
         "report.md",
     ] {

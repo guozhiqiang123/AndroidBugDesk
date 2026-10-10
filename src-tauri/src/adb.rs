@@ -138,7 +138,216 @@ pub fn parse_app(s: &str) -> Value {
     };
     json!({"versionName":field(r"(?m)^\s*versionName=(\S+)"),"versionCode":field(r"\bversionCode=(\d+)"),"firstInstallTime":field(r"firstInstallTime=(.+)"),"lastUpdateTime":field(r"lastUpdateTime=(.+)")})
 }
+
+fn parse_package_app_id(output: &str, package: &str) -> Option<u32> {
+    let mut target_section = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(header) = trimmed.strip_prefix("Package [") {
+            let (name, _) = header.split_once(']')?;
+            target_section = name == package;
+            continue;
+        }
+        if target_section {
+            if let Some(value) = trimmed.strip_prefix("userId=") {
+                return value.split_whitespace().next()?.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the Android UID for the configured package in the current Android user.
+/// Log collection uses this value rather than a transient PID so secondary processes
+/// and process restarts remain in scope without including other applications.
+pub async fn package_uid(path: &Path, serial: &str, package: &str) -> Result<u32> {
+    valid_serial(serial)?;
+    valid_package(package)?;
+    let package_dump = text(path, serial, &["shell", "dumpsys", "package", package]).await?;
+    let app_id = parse_package_app_id(&package_dump, package)
+        .ok_or("无法读取目标应用 UID，已停止日志采集以避免保存整机日志")?;
+    let android_user: u32 = text(path, serial, &["shell", "am", "get-current-user"])
+        .await?
+        .parse()
+        .map_err(|_| "无法读取 Android 当前用户，已停止日志采集以避免保存整机日志")?;
+    if app_id >= 100_000 {
+        return Ok(app_id);
+    }
+    android_user
+        .checked_mul(100_000)
+        .and_then(|base| base.checked_add(app_id))
+        .ok_or_else(|| "目标应用 UID 超出支持范围".into())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForegroundComponent {
+    pub package: String,
+    pub activity: String,
+    pub source: &'static str,
+}
+
+fn valid_component_package(package: &str) -> bool {
+    valid_package(package).is_ok()
+}
+
+/// Extract only components from the well-known resumed/focused markers.  In
+/// particular, process lists and arbitrary dumpsys lines are intentionally
+/// ignored so a package name cannot be injected through unrelated output.
+pub fn parse_foreground_components(s: &str, source: &'static str) -> Vec<ForegroundComponent> {
+    let marker = regex::Regex::new(
+        r"(?x)(?P<pkg>[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/(?P<act>[A-Za-z0-9_.$]+)",
+    )
+    .unwrap();
+    s.lines()
+        .filter(|line| {
+            let lower = line.trim_start().to_ascii_lowercase();
+            (lower.starts_with("mresumedactivity")
+                || lower.starts_with("resumedactivity")
+                || lower.starts_with("mcurrentfocus")
+                || lower.starts_with("mfocusedapp"))
+                && !lower.contains("no activity")
+        })
+        .filter_map(|line| {
+            let c = marker.captures(line)?;
+            let package = c.name("pkg")?.as_str().to_string();
+            if !valid_component_package(&package) {
+                return None;
+            }
+            Some(ForegroundComponent {
+                package,
+                activity: c.name("act")?.as_str().to_string(),
+                source,
+            })
+        })
+        .collect()
+}
+
+pub async fn foreground(path: &Path, serial: &str) -> Result<ForegroundComponent> {
+    valid_serial(serial)?;
+    let resumed = text(
+        path,
+        serial,
+        &["shell", "dumpsys", "activity", "activities"],
+    )
+    .await
+    .map(|v| parse_foreground_components(&v, "dumpsys activity activities"))
+    .unwrap_or_default();
+    let focused = text(path, serial, &["shell", "dumpsys", "window", "windows"])
+        .await
+        .map(|v| parse_foreground_components(&v, "dumpsys window windows"))
+        .unwrap_or_default();
+    let resumed = resumed
+        .into_iter()
+        .filter(|c| !system_overlay(&c.package))
+        .collect::<Vec<_>>();
+    let focused = focused
+        .into_iter()
+        .filter(|c| !system_overlay(&c.package))
+        .collect::<Vec<_>>();
+    let distinct = |items: &[ForegroundComponent]| {
+        items
+            .iter()
+            .map(|c| c.package.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    if distinct(&resumed) > 1 || distinct(&focused) > 1 {
+        return Err("检测到多个不同前台应用，无法安全确定当前界面".into());
+    }
+    if let (Some(r), Some(f)) = (resumed.first(), focused.first()) {
+        if r.package != f.package {
+            return Err("activity 与 focused window 指向不同应用，无法安全确定当前界面".into());
+        }
+    }
+    focused
+        .into_iter()
+        .next()
+        .or_else(|| resumed.into_iter().next())
+        .ok_or_else(|| "无法确定当前前台应用；请保持应用在前台后重试".into())
+}
+
+fn system_overlay(package: &str) -> bool {
+    matches!(
+        package,
+        "android" | "com.android.systemui" | "com.android.keyguard"
+    )
+}
+
+pub async fn inspect_snapshot(path: &Path, serial: &str, target_package: &str) -> Result<Value> {
+    // App identity always comes from the saved project mapping. Foreground is
+    // observed separately and is used only for the optional Bug page.
+    let mut snapshot = snapshot_impl(path, serial, target_package, true).await?;
+    snapshot["details"]["serial"] = json!(serial);
+    match foreground(path, serial).await {
+        Ok(component) => {
+            snapshot["details"]["foregroundPackage"] = json!(component.package);
+            snapshot["details"]["foregroundActivity"] = json!(component.activity);
+            snapshot["details"]["foregroundSource"] = json!(component.source);
+            match foreground(path, serial).await {
+                Ok(final_component) if final_component.package != component.package => {
+                    snapshot["details"]["foregroundPackage"] = json!("");
+                    snapshot["details"]["foregroundActivity"] = json!("");
+                    snapshot["details"]["foregroundSource"] = json!("");
+                    snapshot["errors"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("采集期间前台应用发生切换，未记录 Bug 所在页面"));
+                }
+                Err(error) => {
+                    snapshot["details"]["foregroundPackage"] = json!("");
+                    snapshot["details"]["foregroundActivity"] = json!("");
+                    snapshot["details"]["foregroundSource"] = json!("");
+                    snapshot["errors"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!(format!("采集结束时无法复核前台页面: {error}")));
+                }
+                Ok(final_component) => {
+                    snapshot["details"]["foregroundActivity"] = json!(final_component.activity);
+                    snapshot["details"]["foregroundSource"] = json!(final_component.source);
+                }
+            }
+        }
+        Err(error) => {
+            snapshot["errors"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(error));
+            snapshot["details"]["foregroundPackage"] = json!("");
+            snapshot["details"]["foregroundActivity"] = json!("");
+            snapshot["details"]["foregroundSource"] = json!("");
+        }
+    }
+    let activity = string(&snapshot, "details.foregroundActivity");
+    let package = string(&snapshot, "details.foregroundPackage");
+    let bug_page = if activity.starts_with('.') && !package.is_empty() {
+        format!("{package}{activity}")
+    } else {
+        activity
+    };
+    let collected = !bug_page.is_empty();
+    snapshot["bugPage"] = json!(bug_page);
+    snapshot["sources"]["bugPage"] = json!({
+        "status": if collected { "collected" } else { "failed" },
+        "at": snapshot["capturedAt"],
+        "detail": if collected {
+            format!("ADB 前台页面：{}", string(&snapshot, "details.foregroundSource"))
+        } else {
+            "未能自动读取前台页面；此项选填".into()
+        }
+    });
+    Ok(snapshot)
+}
+
 pub async fn snapshot(path: &Path, serial: &str, package: &str) -> Result<Value> {
+    snapshot_impl(path, serial, package, false).await
+}
+async fn snapshot_impl(
+    path: &Path,
+    serial: &str,
+    package: &str,
+    allow_partial_app: bool,
+) -> Result<Value> {
     valid_serial(serial)?;
     valid_package(package)?;
     let at = now();
@@ -146,7 +355,7 @@ pub async fn snapshot(path: &Path, serial: &str, package: &str) -> Result<Value>
     let mut app = json!({"packageName":package,"versionName":"","versionCode":""});
     let mut sources = json!({});
     let mut errors = Vec::new();
-    let mut details = json!({"deviceAlias":format!("device-{}",&hex::encode(Sha256::digest(serial.as_bytes()))[..12])});
+    let mut details = json!({"deviceAlias":format!("device-{}",&hex::encode(Sha256::digest(serial.as_bytes()))[..12]),"serial":serial});
     for (key, args) in [
         ("model", vec!["shell", "getprop", "ro.product.model"]),
         (
@@ -181,14 +390,20 @@ pub async fn snapshot(path: &Path, serial: &str, package: &str) -> Result<Value>
         .filter(|v| v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty());
     if let Some(user) = user {
         details["androidUser"] = json!(user);
-        let installed = text(
+        match text(
             path,
             serial,
             &["shell", "pm", "list", "packages", "--user", &user, package],
         )
-        .await?;
-        if !installed.lines().any(|v| v == format!("package:{package}")) {
-            return Err("目标包未安装在当前 Android 用户中".into());
+        .await
+        {
+            Ok(installed) if installed.lines().any(|v| v == format!("package:{package}")) => {}
+            Ok(_) if allow_partial_app => {
+                errors.push("目标包未安装在当前 Android 用户中；前台包可能已切换".into())
+            }
+            Err(e) if allow_partial_app => errors.push(format!("应用安装状态: {e}")),
+            Ok(_) => return Err("目标包未安装在当前 Android 用户中".into()),
+            Err(e) => return Err(format!("应用安装状态: {e}")),
         }
         match text(path, serial, &["shell", "dumpsys", "package", package]).await {
             Ok(v) => {
@@ -476,14 +691,29 @@ pub async fn start_logs(
     mut session: Value,
 ) -> Result<Collector> {
     let id = string(&session, "id");
+    let package_name = string(&session, "packageName");
+    let uid = package_uid(&path, &serial, &package_name).await?;
+    let uid_filter = format!("--uid={uid}");
     let dir = store.root.join("sessions").join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Preserve existing buffers before starting; never clear logs and never filter raw evidence to one PID.
+    // Preserve existing buffers before starting and bind both the initial dump and
+    // live stream to the package UID. UID scope survives app process restarts and
+    // includes the package's secondary processes without collecting other apps.
     let initial = output(
         &path,
         Some(&serial),
         &[
-            "logcat", "-d", "-v", "epoch", "-b", "main", "-b", "system", "-b", "crash",
+            "logcat",
+            "-d",
+            "-v",
+            "epoch",
+            &uid_filter,
+            "-b",
+            "main",
+            "-b",
+            "system",
+            "-b",
+            "crash",
         ],
         20,
     )
@@ -491,12 +721,25 @@ pub async fn start_logs(
     let initial_path = dir.join("0000-existing.log");
     std::fs::write(&initial_path, &initial).map_err(|e| e.to_string())?;
     session["logFiles"] = json!([initial_path]);
+    session["logFilter"] = json!({"mode":"androidUid","uid":uid,"packageName":package_name});
     session["gaps"] = json!(["初始缓冲区覆盖时间尚未逐行解析；持续采集起点以会话开始时间为准"]);
     store.put("session", &id, &session)?;
     let mut child = command(&path)
         .args([
-            "-s", &serial, "logcat", "-v", "epoch", "-b", "main", "-b", "system", "-b", "crash",
-            "-T", "1",
+            "-s",
+            &serial,
+            "logcat",
+            "-v",
+            "epoch",
+            &uid_filter,
+            "-b",
+            "main",
+            "-b",
+            "system",
+            "-b",
+            "crash",
+            "-T",
+            "1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -585,6 +828,14 @@ pub async fn stop_logs(c: Collector) {
 mod gap_tests {
     use super::*;
 
+    #[test]
+    fn package_app_id_requires_the_exact_package_section() {
+        let dump = "Packages:\n  Package [com.example.app] (2047da8):\n    userId=10123\n  Package [com.other] (abcdef):\n    userId=10999\n";
+        assert_eq!(parse_package_app_id(dump, "com.example.app"), Some(10123));
+        assert_eq!(parse_package_app_id(dump, "com.missing"), None);
+        assert_eq!(parse_package_app_id(dump, "com.example"), None);
+    }
+
     #[tokio::test]
     async fn delayed_pin_requires_deadline_and_live_owner() {
         let past = (chrono::Utc::now() - chrono::Duration::seconds(31)).to_rfc3339();
@@ -634,6 +885,61 @@ mod gap_tests {
     #[cfg(unix)]
     fn quoted(path: &Path) -> String {
         format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+    }
+
+    #[test]
+    fn foreground_parser_accepts_resumed_and_focused_formats_only() {
+        let resumed = parse_foreground_components(
+            "mResumedActivity: ActivityRecord{abc u0 com.example.app/.MainActivity t12}",
+            "resumed",
+        );
+        assert_eq!(resumed[0].package, "com.example.app");
+        assert_eq!(resumed[0].activity, ".MainActivity");
+        let focused = parse_foreground_components(
+            "mCurrentFocus=Window{abc u0 com.vendor.app/com.vendor.app.Home}",
+            "focused",
+        );
+        assert_eq!(focused[0].package, "com.vendor.app");
+        assert!(parse_foreground_components(
+            "uid=1000 com.bad.process\nrandom com.evil.app/.Injected\nmFocusedApp: null",
+            "focused"
+        )
+        .is_empty());
+        assert!(parse_foreground_components(
+            "debug resumedactivity com.evil.app/.Injected",
+            "resumed"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn foreground_rejects_conflicting_and_system_overlay_candidates() {
+        let resumed = parse_foreground_components(
+            "mResumedActivity: ActivityRecord{u0 com.one.app/.A}",
+            "resumed",
+        );
+        let focused =
+            parse_foreground_components("mCurrentFocus=Window{u0 com.two.app/.B}", "focused");
+        assert_ne!(resumed[0].package, focused[0].package);
+        assert!(system_overlay("com.android.systemui"));
+        assert!(!system_overlay("com.example.app"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inspect_snapshot_fake_adb_reads_the_selected_device_foreground() {
+        let temp = tempfile::tempdir().unwrap();
+        let adb = fake_adb(
+            temp.path(),
+            "if [ \"$4\" = dumpsys ] && [ \"$5\" = activity ]; then printf '%s\\n' 'mResumedActivity: ActivityRecord{abc u0 com.example.app/.MainActivity t1}'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$5\" = window ]; then printf '%s\\n' 'mCurrentFocus=Window{abc u0 com.example.app/.MainActivity}'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.product.model ]; then printf 'Pixel Fake\\n'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.build.version.release ]; then printf '14\\n'; exit 0; fi\nif [ \"$4\" = cat ]; then printf 'MemTotal: 1234 kB\\nMemAvailable: 456 kB\\n'; exit 0; fi\nif [ \"$4\" = wm ]; then printf 'Physical size: 1080x2400\\n'; exit 0; fi\nif [ \"$4\" = am ]; then printf '0\\n'; exit 0; fi\nif [ \"$4\" = pm ]; then printf 'package:com.example.app\\n'; exit 0; fi\nif [ \"$4\" = date ]; then printf '2026-10-09T12:00:00+0800\\n'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$6\" = com.example.app ]; then printf 'versionName=1.2.3\\nversionCode=42\\n'; exit 0; fi\nexit 0",
+        );
+        let value = inspect_snapshot(&adb, "USB-A", "com.example.app")
+            .await
+            .unwrap();
+        assert_eq!(value["app"]["packageName"], "com.example.app");
+        assert_eq!(value["device"]["model"], "Pixel Fake");
+        assert_eq!(value["bugPage"], "com.example.app.MainActivity");
+        assert_eq!(value["sources"]["bugPage"]["status"], "collected");
     }
 
     #[cfg(unix)]

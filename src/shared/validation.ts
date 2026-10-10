@@ -5,6 +5,11 @@ import type {
   ValidationIssue,
   Field,
 } from "./domain";
+import {
+  excludedField,
+  excludedFieldId,
+  hiddenOptionalField,
+} from "./submission-fields";
 export const useful = (v: unknown): boolean =>
   typeof v === "string" &&
   !!v.trim() &&
@@ -103,104 +108,9 @@ export function validateDraft(
       metadata.typeId !== d.workitemTypeId)
   )
     add("project", "请重新读取当前项目和缺陷类型配置");
-  if (!profile.businessProfiles.includes(d.business))
-    add("business", "请选择配置中的业务方向");
-  req("title", d.title, "具体问题标题");
-  if (d.title.trim().length < 5)
-    add("title", "标题至少 5 个字符，并说明具体行为");
-  if (!parseBuildUrl(d.buildUrl))
-    add("buildUrl", "请填写 Jenkins 固定构建号 URL");
-  if (d.buildStatus === "conflict")
-    add("buildStatus", "构建身份存在冲突，需重新选择实际构建");
-  if (d.buildStatus === "unconfirmed")
-    add("buildStatus", "请确认固定构建与当前安装包的关系");
-  if (
-    d.buildManifest &&
-    (["packageName", "versionName", "versionCode"] as const).some(
-      (k) => d.buildManifest![k] !== d.app[k],
-    )
-  )
-    add("buildStatus", "构建清单与设备应用身份不一致");
-  for (const k of [
-    "packageName",
-    "versionName",
-    "channel",
-    "environment",
-    "obfuscation",
-    "hardening",
-  ] as const)
-    req(
-      `app.${k}`,
-      d.app[k],
-      {
-        packageName: "包名",
-        versionName: "应用版本",
-        channel: "渠道",
-        environment: "测试环境",
-        obfuscation: "混淆状态",
-        hardening: "加固状态",
-      }[k],
-    );
-  if (!/^[A-Za-z][\w]*(\.[A-Za-z][\w]*)+$/.test(d.app.packageName))
-    add("app.packageName", "包名格式不正确");
-  if (
-    !/^\d+$/.test(d.app.versionCode) ||
-    !Number.isSafeInteger(Number(d.app.versionCode))
-  )
-    add("app.versionCode", "versionCode 必须是非负整数（允许 0）");
-  for (const k of [
-    "model",
-    "androidVersion",
-    "totalMemKb",
-    "availableMemKb",
-    "resolution",
-    "density",
-  ] as const) {
-    req(
-      `device.${k}`,
-      d.device[k],
-      {
-        model: "设备型号",
-        androidVersion: "Android 版本",
-        totalMemKb: "总内存（kB）",
-        availableMemKb: "当前可用内存（kB）",
-        resolution: "像素分辨率",
-        density: "屏幕密度（dpi）",
-      }[k],
-    );
-    if (
-      useful(d.device[k]) &&
-      d.sources[`device.${k}`]?.status !== "collected" &&
-      !useful(d.manualNote)
-    )
-      add("manualNote", "人工补充设备信息时需注明来源");
-  }
-  for (const k of ["totalMemKb", "availableMemKb", "density"] as const)
-    if (
-      !/^\d+(\.\d+)?$/.test(d.device[k]) ||
-      Number(d.device[k]) < 0 ||
-      (k !== "availableMemKb" && Number(d.device[k]) === 0)
-    )
-      add(`device.${k}`, "请输入有效数值和界面指定单位");
-  if (Number(d.device.availableMemKb) > Number(d.device.totalMemKb))
-    add("device.availableMemKb", "可用内存不能大于总内存");
-  if (!/^\d+[x×]\d+$/.test(d.device.resolution))
-    add("device.resolution", "分辨率格式为 1080x2400");
-  if (!zonedTime(d.event.occurredAt))
-    add("event.occurredAt", "问题时间必须包含时区");
-  if (
-    d.event.source === "manual" ||
-    (d.event.originalAt && d.event.originalAt !== d.event.occurredAt)
-  )
-    req("event.sourceNote", d.event.sourceNote, "人工事件时间来源或修改依据");
-  if (
-    d.event.lateCapture &&
-    !d.attachments.some(
-      (a) => a.confirmed && a.size > 0 && a.source.startsWith("导入"),
-    )
-  )
-    add("event.lateCapture", "事后补采需导入已有证据或重新复现并自动标记");
-  req("preconditions", d.preconditions, "前置条件");
+  req("title", d.title, "问题标题");
+  req("app.packageName", d.app.packageName, "当前项目的 Android 包名配置");
+  req("preconditions", d.preconditions, "复现条件");
   const steps = d.steps
     .split("\n")
     .map((s) => s.replace(/^\s*\d+[.、)]\s*/, "").trim())
@@ -212,8 +122,8 @@ export function validateDraft(
     )
   )
     add("steps", "请逐行填写可执行的复现步骤");
-  req("expected", d.expected, "预期结果");
-  req("actual", d.actual, "实际结果");
+  req("expected", d.expected, "期望表现");
+  req("actual", d.actual, "问题表现");
   if (!d.frequency.firstDiscovery) {
     const { attempts, occurrences } = d.frequency;
     if (
@@ -225,7 +135,27 @@ export function validateDraft(
     )
       add("frequency", "发生次数应为 1 至尝试次数之间的整数");
   }
-  for (const a of d.attachments.filter((a) => a.confirmed)) {
+  for (const a of d.attachments) {
+    if (a.role === "log") {
+      if (!a.size || !useful(a.source))
+        add(
+          `attachment.${a.id}.confirmed`,
+          "所选日志为空或来源缺失，请重新导入",
+        );
+      if (!zonedTime(a.coverageStart))
+        add(
+          `attachment.${a.id}.coverageStart`,
+          "请填写日志的真实覆盖起点（含时区）",
+        );
+      if (
+        !zonedTime(a.coverageEnd) ||
+        Date.parse(a.coverageEnd) < Date.parse(a.coverageStart)
+      )
+        add(
+          `attachment.${a.id}.coverageEnd`,
+          "请填写日志的真实覆盖终点，且不得早于起点（含时区）",
+        );
+    }
     const paired = d.attachments.filter(
       (r) => r.role === "report" && r.derivedFrom === a.id,
     );
@@ -233,6 +163,7 @@ export function validateDraft(
     const redacted = a.source.startsWith("文本派生副本");
     const rangeRequired =
       window ||
+      a.source.includes("来源为问题日志窗口") ||
       (redacted &&
         d.attachments.some(
           (parent) =>
@@ -242,70 +173,25 @@ export function validateDraft(
     if (
       a.role === "log" &&
       (window || redacted || paired.length) &&
-      (paired.some((r) => !r.confirmed) ||
-        (rangeRequired &&
-          !paired.some((r) => r.source === "日志窗口范围与缺口记录")) ||
+      ((rangeRequired &&
+        !paired.some((r) => r.source === "日志窗口范围与缺口记录")) ||
         (redacted &&
           !paired.some((r) => r.source === "文本替换记录（请核对副本）")))
     )
-      add("attachments", "派生副本必须携带并确认全部来源回执");
+      add("attachments", "派生副本必须携带全部来源回执");
     if (
       a.role === "report" &&
       a.derivedFrom &&
-      !d.attachments.some(
-        (parent) => parent.id === a.derivedFrom && parent.confirmed,
-      )
+      !d.attachments.some((parent) => parent.id === a.derivedFrom)
     )
-      add("attachments", "来源回执必须与关联副本一起确认");
+      add("attachments", "来源回执必须保留关联副本");
   }
-  if (
-    !d.attachments.some(
-      (a) =>
-        a.role === "log" &&
-        a.size > 0 &&
-        a.confirmed &&
-        useful(a.source) &&
-        zonedTime(a.coverageStart) &&
-        zonedTime(a.coverageEnd) &&
-        Date.parse(a.coverageEnd) >= Date.parse(a.coverageStart),
-    )
-  )
-    add("attachments", "请添加并确认非空日志及真实覆盖起止时间");
-  if (
-    ["UI", "多语言", "动态过程"].includes(d.kind) &&
-    !d.attachments.some(
-      (a) => ["image", "video"].includes(a.role) && a.confirmed && a.size > 0,
-    )
-  )
-    add("attachments", "显示问题需要截图或视频");
-  if (
-    d.kind === "动态过程" &&
-    !d.attachments.some((a) => a.role === "video" && a.confirmed) &&
-    d.attachments.filter((a) => a.role === "image" && a.confirmed).length < 2
-  )
-    add("attachments", "动态过程需要视频或连续多张截图");
   if (d.kind === "网络")
     for (const k of ["operation", "type", "error", "collectionStatus"] as const)
       req(`network.${k}`, d.network[k], "网络操作、类型、可观察错误及采集状态");
   if (d.kind === "数据")
     for (const k of ["type", "count", "source"] as const)
       req(`data.${k}`, d.data[k], "数据类型、数量及来源");
-  if (d.cloud.applicability === "unset")
-    add("cloud.applicability", "请声明云控适用性");
-  if (d.cloud.applicability === "no")
-    req("cloud.reason", d.cloud.reason, "该功能无云控的依据");
-  if (d.cloud.applicability === "yes") {
-    for (const k of ["name", "effectiveValue", "source", "override"] as const)
-      req(`cloud.${k}`, d.cloud[k], "设备云控有效值、来源和测试覆盖声明");
-    if (
-      !["应用调试面板", "应用导出", "相关运行日志", "用户可观察行为"].includes(
-        d.cloud.source,
-      )
-    )
-      add("cloud.source", "请选择设备生效证据来源");
-    if (!zonedTime(d.cloud.observedAt))
-      add("cloud.observedAt", "云控观察时间必须包含时区");
-  }
   if (online && metadata) {
     if (!metadata.members.some((m) => m.id === d.assignedTo))
       add("assignedTo", "请选择当前项目真实成员");
@@ -319,6 +205,15 @@ export function validateDraft(
       const target = nativeTarget(field, profile);
       const required =
         field.required || profile.requiredFieldIds.includes(field.id);
+      if (excludedField(field, profile)) {
+        if (required)
+          add(
+            `customFields.${field.id}`,
+            `云效项目将已移除字段「${field.name}」设为必填，请调整项目配置后提交`,
+          );
+        continue;
+      }
+      if (hiddenOptionalField(field, profile)) continue;
       let value: string | string[] | undefined =
         target === "subject"
           ? d.title
@@ -408,6 +303,7 @@ export function validateDraft(
     for (const [id, v] of Object.entries(d.customFields))
       if (
         (Array.isArray(v) ? v.length > 0 : useful(v)) &&
+        !excludedFieldId(id, profile) &&
         !metadata.fields.some((f) => f.id === id)
       )
         add(`customFields.${id}`, `字段 ${id} 已不在当前配置中，请核对后移除`);
@@ -416,6 +312,6 @@ export function validateDraft(
         add("project", `项目必填字段 ${id} 未出现在云效元数据中`);
   }
   if (online && !d.previewConfirmed)
-    add("previewConfirmed", "请预览并确认项目、构建、描述和附件");
+    add("previewConfirmed", "请预览并确认项目、描述和附件");
   return [...new Map(issues.map((i) => [i.field + i.message, i])).values()];
 }

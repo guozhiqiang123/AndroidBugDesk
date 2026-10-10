@@ -1,0 +1,65 @@
+.login-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: #eff3f9;
+  border-radius: 10px;
+  margin-bottom: 24px;
+}
+.login-tabs [role="tab"] {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: #708099;
+  padding: 10px 12px;
+  border-radius: 7px;
+}
+.login-tabs [aria-selected="true"] {
+  background: white;
+  color: #2864d8;
+  box-shadow: 0 2px 7px #243b6810;
+}
+.oauth-description {
+  color: #78859a;
+  line-height: 1.8;
+  font-size: 13px;
+  margin: 0 0 20px;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.oauth-login {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+}
+.oauth-login .error-text {
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.oauth-cancel {
+  width: 100%;
+}
+.login-restoring {
+  text-align: center;
+  color: #708099;
+}
+.login-spinner {
+  display: inline-block;
+  width: 26px;
+  height: 26px;
+  border: 3px solid #e1e8f5;
+  border-top-color: #2864d8;
+  border-radius: 50%;
+  animation: login-spin 0.9s linear infinite;
+}
+@keyframes login-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-spinner {
+    animation: none;
+  }
+}

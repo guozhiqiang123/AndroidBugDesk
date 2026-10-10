@@ -1,13 +1,23 @@
 pub mod adb;
 pub mod capture;
 pub mod commands;
+pub mod drafts;
 pub mod evidence;
+pub mod history;
+#[cfg(test)]
+mod inspection_tests;
+pub mod login_memory;
 pub mod model;
+pub mod oauth;
+pub mod post_capture;
+pub mod project_settings;
 pub mod store;
 pub mod submission;
+pub mod submission_fields;
 #[cfg(test)]
 mod tests;
 pub mod validation;
+pub mod workitem_links;
 pub mod workspace;
 pub mod yunxiao;
 pub fn run() {
@@ -24,9 +34,13 @@ pub fn run() {
             commands::bootstrap,
             commands::check_auth,
             commands::login,
+            oauth::oauth_login,
+            oauth::cancel_oauth_login,
             commands::list_organizations,
             commands::list_projects,
             commands::select_project,
+            project_settings::load_project_settings,
+            project_settings::save_project_settings,
             commands::load_selection_memory,
             commands::remember_selections,
             commands::list_remote_history,
@@ -35,20 +49,25 @@ pub fn run() {
             commands::load_metadata,
             commands::import_profile,
             commands::new_draft,
+            drafts::delete_draft,
+            drafts::delete_drafts,
             commands::save_draft,
             commands::validate_draft,
             commands::choose_adb,
             commands::list_devices,
+            commands::inspect_device,
             commands::start_session,
             commands::stop_session,
             commands::mark_problem,
             commands::pin_logs,
             commands::capture_bugreport,
+            post_capture::start_post_capture,
+            post_capture::post_capture_status,
             commands::redact_log,
             commands::import_attachment,
-            commands::confirm_attachment,
+            commands::preview_attachment,
+            commands::save_attachment_coverage,
             commands::remove_attachment,
-            commands::read_log,
             commands::export_evidence,
             commands::submit_bug,
             commands::reconcile_submission,

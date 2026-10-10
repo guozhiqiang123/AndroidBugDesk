@@ -1,11 +1,29 @@
 import type {
   Draft,
+  Field,
   Metadata,
   Profile,
   Session,
   Submission,
 } from "../shared/domain";
 import type { AuthResult, SelectionMemory } from "../shared/workspace";
+import {
+  excludedField,
+  hiddenOptionalField,
+} from "../shared/submission-fields";
+import { nativeTarget } from "../shared/validation";
+
+export function defaultUnchecked(
+  field: Field,
+  profile?: Profile | null,
+): boolean {
+  const target = profile
+    ? nativeTarget(field, profile)
+    : ["NativeField", "Role"].includes(field.type)
+      ? field.id
+      : undefined;
+  return target === "participants" || target === "trackers";
+}
 
 export type AppTab = "auth" | "new" | "history";
 
@@ -97,14 +115,12 @@ export function applySelectionMemory(
     "assignedTo",
     "sprint",
     "kind",
-    "business",
   ] as const;
   for (const key of scalarKeys) {
     const value = memory[key];
     if (typeof value !== "string" || !value) continue;
     const allowed =
       key in options ? options[key as keyof typeof options] : undefined;
-    const businessAllowed = profile?.businessProfiles;
     if (
       allowed?.length &&
       allowed.includes(value) &&
@@ -119,8 +135,7 @@ export function applySelectionMemory(
           "性能",
           "网络",
           "数据",
-        ].includes(value)) &&
-      (key !== "business" || businessAllowed?.includes(value))
+        ].includes(value))
     ) {
       next[key] = value as never;
     }
@@ -139,11 +154,6 @@ export function applySelectionMemory(
       ].includes(value)
     )
       next.kind = value as Draft["kind"];
-    if (
-      key === "business" &&
-      (!businessAllowed || businessAllowed.includes(value))
-    )
-      next.business = value;
   }
   if (Array.isArray(memory.versions) && options.versions?.length) {
     next.versions = memory.versions.filter((value) =>
@@ -156,6 +166,12 @@ export function applySelectionMemory(
     typeof memory.customFields === "object"
   ) {
     for (const field of metadata.fields) {
+      if (defaultUnchecked(field, profile ?? metadata.profile)) continue;
+      if (
+        profile &&
+        (excludedField(field, profile) || hiddenOptionalField(field, profile))
+      )
+        continue;
       const value = memory.customFields[field.id];
       if (typeof value !== "string" && !Array.isArray(value)) continue;
       const dropdown = [
@@ -185,6 +201,67 @@ export function applySelectionMemory(
       next.customFields[field.id] = Array.isArray(values)
         ? [...values]
         : values;
+    }
+  }
+  return initializeSelectionDefaults(next, metadata, profile);
+}
+
+/** Fill only genuinely absent selections for a new draft. Saved invalid ids stay visible. */
+export function initializeSelectionDefaults(
+  draft: Draft,
+  metadata: Metadata | null,
+  profile?: Profile | null,
+): Draft {
+  const next = structuredClone(draft);
+  const first = (items?: { id: string }[]) => items?.[0]?.id ?? "";
+  if (!next.workitemTypeId && metadata?.types?.length)
+    next.workitemTypeId = first(metadata.types);
+  if (!next.assignedTo && metadata?.members?.length)
+    next.assignedTo = first(metadata.members);
+  if (!next.sprint && metadata?.sprints?.length)
+    next.sprint = first(metadata.sprints);
+  if (!next.versions.length && metadata?.versions?.length)
+    next.versions = [first(metadata.versions)];
+  if (metadata) {
+    for (const field of metadata.fields) {
+      if (defaultUnchecked(field, profile ?? metadata.profile)) continue;
+      if (
+        profile &&
+        (excludedField(field, profile) || hiddenOptionalField(field, profile))
+      )
+        continue;
+      const format = field.format;
+      const dropdown = [
+        "list",
+        "multiList",
+        "user",
+        "multiUser",
+        "sprint",
+        "version",
+        "tag",
+      ].includes(format);
+      if (!dropdown) continue;
+      const source = ["user", "multiUser"].includes(format)
+        ? metadata.members
+        : format === "sprint"
+          ? metadata.sprints
+          : format === "version"
+            ? metadata.versions
+            : field.options;
+      const current = next.customFields[field.id];
+      const absent =
+        current == null ||
+        current === "" ||
+        (Array.isArray(current) && !current.length);
+      if (absent && source.length)
+        next.customFields[field.id] = [
+          "multiList",
+          "multiUser",
+          "version",
+          "tag",
+        ].includes(format)
+          ? [source[0].id]
+          : source[0].id;
     }
   }
   return next;

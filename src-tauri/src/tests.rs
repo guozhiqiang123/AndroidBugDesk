@@ -33,36 +33,568 @@ fn rust_and_ui_fixture_accept_version_zero() {
     let d = fixture();
     assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
 }
+
+#[test]
+fn late_capture_field_is_removed_from_draft_and_report() {
+    let mut d = fixture();
+    assert!(d["event"].get("lateCapture").is_none());
+    validation::check_shape(&d).unwrap();
+    assert!(!evidence::report(&d, &metadata().profile).contains("事后补采"));
+    d["event"]["lateCapture"] = json!(true);
+    assert!(validation::check_shape(&d).is_err());
+}
+
+#[test]
+fn attachments_are_optional_for_all_kinds() {
+    let m = metadata();
+    for kind in [
+        "功能",
+        "UI",
+        "多语言",
+        "动态过程",
+        "崩溃",
+        "ANR",
+        "性能",
+        "网络",
+        "数据",
+    ] {
+        let mut d = fixture();
+        d["kind"] = json!(kind);
+        d["attachments"] = json!([]);
+        d["network"] = json!({"operation":"请求接口","type":"Wi-Fi","error":"超时","collectionStatus":"已记录"});
+        d["data"] = json!({"type":"图片","count":"1","source":"本地测试数据"});
+        for online in [false, true] {
+            let issues = validation::validate(&d, &m.profile, Some(&m), true, online);
+            assert!(issues.is_empty(), "{kind}, online={online}: {issues:?}");
+        }
+    }
+}
+
+#[test]
+fn every_log_is_validated_independently_of_legacy_confirmation() {
+    let m = metadata();
+    let mut d = fixture();
+    let mut invalid = d["attachments"][0].clone();
+    invalid["id"] = json!("00000000-0000-4000-8000-000000000077");
+    invalid["size"] = json!(0);
+    invalid["source"] = json!("");
+    invalid["coverageStart"] = json!("");
+    invalid["coverageEnd"] = json!("");
+    d["attachments"].as_array_mut().unwrap().push(invalid);
+    let issues = validation::validate(&d, &m.profile, Some(&m), true, true);
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|i| i
+                .field
+                .starts_with("attachment.00000000-0000-4000-8000-000000000077."))
+            .count(),
+        3
+    );
+    d["attachments"][1]["confirmed"] = json!(false);
+    assert_eq!(
+        validation::validate(&d, &m.profile, Some(&m), true, true)
+            .iter()
+            .filter(|i| i
+                .field
+                .starts_with("attachment.00000000-0000-4000-8000-000000000077."))
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn mock_submission_without_imported_attachments_completes() {
+    let (_server, remote, api) = mock(Remote::default()).await;
+    let (_temp, store, mut d) = setup();
+    d["attachments"] = json!([]);
+    d["kind"] = json!("动态过程");
+    store.put("draft", &string(&d, "id"), &d).unwrap();
+    let result = Submitter { store }
+        .submit(&string(&d, "id"), &api)
+        .await
+        .unwrap();
+    assert_eq!(result.state, "submitted");
+    assert!(result.evidence.files.is_empty());
+    let r = remote.lock().unwrap();
+    assert_eq!(r.creates, 1);
+    assert_eq!(r.files.len(), 1); // Only the client's generated report/manifest ZIP.
+}
+
+#[tokio::test]
+async fn legacy_confirmation_flag_does_not_exclude_imported_files() {
+    let (_server, remote, api) = mock(Remote::default()).await;
+    let (_temp, store, mut d) = setup();
+    d["attachments"][0]["confirmed"] = json!(false);
+    let id = string(&d, "id");
+    store.put("draft", &id, &d).unwrap();
+    let exported = evidence::build(&store, &d, &api.profile, true).unwrap();
+    assert_eq!(exported.files.len(), 1);
+    assert_eq!(
+        exported.files[0].id,
+        d["attachments"][0]["id"].as_str().unwrap()
+    );
+    let result = Submitter { store }.submit(&id, &api).await.unwrap();
+    assert_eq!(result.state, "submitted");
+    assert_eq!(
+        result.uploads.len(),
+        2,
+        "original attachment and evidence ZIP"
+    );
+    assert_eq!(remote.lock().unwrap().files.len(), 2);
+}
+
+#[tokio::test]
+async fn unified_attachment_import_classifies_mixed_files_and_preserves_batch_on_error() {
+    let (server, _remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures");
+    let json_path = store.root.join("测试 数据.JSON");
+    std::fs::write(&json_path, "{\"value\":1}").unwrap();
+    let text_path = store.root.join("notes.txt");
+    std::fs::write(&text_path, format!("{}中", "x".repeat(4095))).unwrap();
+    let zip_path = store.root.join("report.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    zip.start_file("report.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut zip, b"report").unwrap();
+    zip.finish().unwrap();
+    let paths = [
+        fixtures.join("evidence.png"),
+        fixtures.join("evidence.jpg"),
+        fixtures.join("evidence.mp4"),
+        zip_path,
+        json_path,
+        text_path,
+    ];
+    let imported = crate::commands::import_attachment_paths(&state, &id, &paths).unwrap();
+    let files = attachments(&imported).unwrap();
+    assert_eq!(
+        files
+            .iter()
+            .skip(1)
+            .map(|a| a.role.as_str())
+            .collect::<Vec<_>>(),
+        ["image", "image", "video", "report", "sample", "log"]
+    );
+    for a in files.iter().skip(1) {
+        assert!(!a.confirmed);
+        assert!(a.coverage_start.is_empty() && a.coverage_end.is_empty());
+        evidence::verify_attachment(a).unwrap();
+        let verified = crate::commands::preview_attachment_for_state(&state, &id, &a.id).unwrap();
+        let mut dispatched = false;
+        crate::commands::open_attachment_with(&verified, |path, _| {
+            assert_eq!(path, Path::new(&verified.path));
+            dispatched = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(dispatched);
+    }
+    let broken = store.root.join("broken.png");
+    std::fs::write(&broken, b"\x89PNG\r\n\x1a\ninvalid").unwrap();
+    assert!(
+        crate::commands::import_attachment_paths(&state, &id, &[paths[5].clone(), broken]).is_err()
+    );
+    assert_eq!(store.draft(&id).unwrap(), imported);
+    change_identity(&state, &api.profile, "account");
+    assert!(crate::commands::import_attachment_paths(&state, &id, &paths).is_err());
+    assert_eq!(store.draft(&id).unwrap(), imported);
+}
+
+#[tokio::test]
+async fn attachment_system_preview_rejects_wrong_scope_changed_files_and_external_paths() {
+    let (server, _remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let a = attachments(&d).unwrap().remove(0);
+    assert!(crate::commands::preview_attachment_for_state(&state, &id, "missing").is_err());
+    for dimension in ["account", "organization", "project"] {
+        change_identity(&state, &api.profile, dimension);
+        assert!(crate::commands::preview_attachment_for_state(&state, &id, &a.id).is_err());
+    }
+    change_identity(&state, &api.profile, "original");
+    let verified = crate::commands::preview_attachment_for_state(&state, &id, &a.id).unwrap();
+    let error = crate::commands::open_attachment_with(&verified, |_, _| {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    })
+    .unwrap_err();
+    assert!(error.contains("默认打开应用"));
+    state.locks.lock().unwrap().insert(id.clone());
+    assert!(crate::commands::preview_attachment_for_state(&state, &id, &a.id).is_ok());
+    state.locks.lock().unwrap().clear();
+    let mut foreign = d.clone();
+    foreign["attachments"][0]["path"] = json!(store.root.join("logcat.log").to_string_lossy());
+    store.put("draft", &id, &foreign).unwrap();
+    assert!(crate::commands::preview_attachment_for_state(&state, &id, &a.id).is_err());
+    store.put("draft", &id, &d).unwrap();
+    std::fs::write(&a.path, "changed").unwrap();
+    assert!(crate::commands::preview_attachment_for_state(&state, &id, &a.id).is_err());
+    let mut called = false;
+    assert!(crate::commands::open_attachment_with(&a, |_, _| {
+        called = true;
+        Ok(())
+    })
+    .is_err());
+    assert!(!called);
+}
+
+#[test]
+fn mac_image_preview_uses_preview_instead_of_file_associations() {
+    let (_temp, store, _) = setup();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures");
+    for name in ["evidence.png", "evidence.jpg"] {
+        // Dispatch is based on the inspected image type even with an unrelated extension.
+        let source = store.root.join(format!("{name}.txt"));
+        std::fs::copy(fixtures.join(name), &source).unwrap();
+        let a = evidence::inspect_import(&source, &store.root).unwrap();
+        assert_eq!(a.role, "image");
+        let expected = cfg!(target_os = "macos").then_some("/System/Applications/Preview.app");
+        let mut calls = 0;
+        crate::commands::open_attachment_with(&a, |path, application| {
+            assert_eq!(path, Path::new(&a.path));
+            assert_eq!(application, expected);
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        let error = crate::commands::open_attachment_with(&a, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        if cfg!(target_os = "macos") {
+            assert!(error.contains("macOS“预览”"));
+        } else {
+            assert!(error.contains("默认打开应用"));
+        }
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            std::fs::read(&a.path).unwrap()
+        );
+    }
+    let video = evidence::inspect_import(&fixtures.join("evidence.mp4"), &store.root).unwrap();
+    crate::commands::open_attachment_with(&video, |_, application| {
+        assert_eq!(application, None);
+        Ok(())
+    })
+    .unwrap();
+    let log = evidence::inspect_import(&store.root.join("logcat.log"), &store.root).unwrap();
+    crate::commands::open_attachment_with(&log, |_, application| {
+        assert_eq!(application, None);
+        Ok(())
+    })
+    .unwrap();
+    let mut report = log.clone();
+    report.role = "report".into();
+    report.mime = "application/zip".into();
+    assert_eq!(
+        crate::commands::uses_macos_quick_look(&report),
+        cfg!(target_os = "macos")
+    );
+    assert!(!crate::commands::uses_macos_quick_look(&log));
+}
+
+#[tokio::test]
+async fn system_attachment_preview_does_not_execute_programs_or_scripts() {
+    let (server, _remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    for (name, bytes) in [
+        ("test.command", b"echo hello".as_slice()),
+        ("renamed.bin", b"\x7fELF\0payload".as_slice()),
+        ("renamed.txt", b"#!/bin/sh\necho hello".as_slice()),
+    ] {
+        let path = store.root.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let changed = crate::commands::import_attachment_paths(&state, &id, &[path]).unwrap();
+        let a = attachments(&changed).unwrap().pop().unwrap();
+        assert!(
+            crate::commands::preview_attachment_for_state(&state, &id, &a.id)
+                .unwrap_err()
+                .contains("程序或脚本")
+        );
+    }
+}
+
+#[test]
+fn bug_page_is_optional_and_report_uses_the_effective_value() {
+    let m = metadata();
+    for page in [None, Some(""), Some("恢复结果页")] {
+        let mut d = fixture();
+        if let Some(page) = page {
+            d["bugPage"] = json!(page);
+        } else {
+            d.as_object_mut().unwrap().remove("bugPage");
+        }
+        assert!(validation::check_shape(&d).is_ok());
+        for online in [true, false] {
+            assert!(validation::validate(&d, &m.profile, Some(&m), true, online).is_empty());
+        }
+        let report = evidence::report(&d, &m.profile);
+        assert_eq!(
+            report.contains("## Bug所在页面"),
+            page.is_some_and(|v| !v.is_empty())
+        );
+        if let Some(page) = page.filter(|v| !v.is_empty()) {
+            assert!(report.contains(page));
+        }
+    }
+}
+
+#[test]
+fn cloud_configuration_is_removed_and_old_field_is_rejected() {
+    let m = metadata();
+    let mut d = fixture();
+    assert!(d.get("cloud").is_none());
+    assert!(validation::check_shape(&d).is_ok());
+    for online in [true, false] {
+        assert!(validation::validate(&d, &m.profile, Some(&m), true, online).is_empty());
+    }
+    assert!(!evidence::report(&d, &m.profile).contains("云控"));
+    d["cloud"] = json!({
+        "applicability": "no", "reason": "旧云控依据", "name": "",
+        "effectiveValue": "", "source": "", "observedAt": "", "override": ""
+    });
+    assert!(validation::check_shape(&d).is_err());
+}
+
+#[test]
+fn hardening_status_is_removed_and_old_field_is_rejected() {
+    let m = metadata();
+    let mut d = fixture();
+    assert!(d["app"].get("hardening").is_none());
+    assert!(validation::check_shape(&d).is_ok());
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
+    d["app"]["hardening"] = json!("旧加固状态");
+    assert!(validation::check_shape(&d).is_err());
+}
+
+#[test]
+fn test_environment_is_removed_and_old_field_is_rejected() {
+    let m = metadata();
+    let mut d = fixture();
+    assert!(d["app"].get("environment").is_none());
+    for online in [true, false] {
+        assert!(validation::validate(&d, &m.profile, Some(&m), true, online).is_empty());
+    }
+    d["app"]["environment"] = json!("旧测试包");
+    assert!(validation::check_shape(&d).is_err());
+}
+
+#[test]
+fn obfuscation_status_is_removed_and_old_field_is_rejected() {
+    let m = metadata();
+    let mut d = fixture();
+    assert!(d["app"].get("obfuscation").is_none());
+    for online in [true, false] {
+        assert!(validation::validate(&d, &m.profile, Some(&m), true, online).is_empty());
+    }
+    assert!(!evidence::report(&d, &m.profile).contains("obfuscation"));
+    d["app"]["obfuscation"] = json!("已混淆");
+    assert!(validation::check_shape(&d).is_err());
+}
+
+#[test]
+fn removed_submission_fields_are_skipped_but_near_names_remain() {
+    let mut m = metadata();
+    m.fields.extend([
+        Field {
+            id: "customAlias".into(),
+            name: "自定义标签映射".into(),
+            format: "string".into(),
+            field_type: "CustomField".into(),
+            required: false,
+            show_when_create: true,
+            option_error: None,
+            options: vec![],
+        },
+        Field {
+            id: "labels".into(),
+            name: "标签容器".into(),
+            format: "string".into(),
+            field_type: "CustomField".into(),
+            required: false,
+            show_when_create: true,
+            option_error: None,
+            options: vec![],
+        },
+        Field {
+            id: "planStartTimestamp".into(),
+            name: "计划开始时间戳".into(),
+            format: "string".into(),
+            field_type: "CustomField".into(),
+            required: false,
+            show_when_create: true,
+            option_error: None,
+            options: vec![],
+        },
+        Field {
+            id: "estimate".into(),
+            name: "预计工时".into(),
+            format: "string".into(),
+            field_type: "CustomField".into(),
+            required: false,
+            show_when_create: true,
+            option_error: None,
+            options: vec![],
+        },
+        Field {
+            id: "hiddenOptional".into(),
+            name: "隐藏可选字段".into(),
+            format: "unsupported".into(),
+            field_type: "UnknownField".into(),
+            required: false,
+            show_when_create: false,
+            option_error: None,
+            options: vec![],
+        },
+        Field {
+            id: "hiddenRequiredByProfile".into(),
+            name: "隐藏但项目必填".into(),
+            format: "string".into(),
+            field_type: "CustomField".into(),
+            required: false,
+            show_when_create: false,
+            option_error: None,
+            options: vec![],
+        },
+    ]);
+    m.profile
+        .field_mappings
+        .insert("customAlias".into(), "labels".into());
+    let mut d = fixture();
+    d["customFields"]["customAlias"] = json!("stale-alias");
+    d["customFields"]["labels"] = json!("stale-label");
+    d["customFields"]["planStartTimestamp"] = json!("2026-01-01");
+    d["customFields"]["estimate"] = json!("2h");
+    d["customFields"]["hiddenOptional"] = json!("stale-invalid-value");
+    d["customFields"]["hiddenRequiredByProfile"] = json!("must-be-sent");
+    m.profile
+        .required_field_ids
+        .push("hiddenRequiredByProfile".into());
+    let payload = crate::yunxiao::create_payload(&d, &m, "actual".into()).unwrap();
+    assert!(payload["customFieldValues"]["labels"].is_null());
+    assert!(payload["customFieldValues"]["customAlias"].is_null());
+    assert_eq!(
+        payload["customFieldValues"]["planStartTimestamp"],
+        "2026-01-01"
+    );
+    assert!(payload["customFieldValues"]["estimate"].is_null());
+    assert!(payload["customFieldValues"]["hiddenOptional"].is_null());
+    assert_eq!(
+        payload["customFieldValues"]["hiddenRequiredByProfile"],
+        "must-be-sent"
+    );
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
+    d["customFields"]["hiddenRequiredByProfile"] = json!("");
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true)
+        .iter()
+        .any(|issue| issue.field == "customFields.hiddenRequiredByProfile"));
+}
+
+#[test]
+fn removed_required_field_is_rejected_for_validation_and_payload() {
+    let mut m = metadata();
+    m.fields.push(Field {
+        id: "labels".into(),
+        name: "标签".into(),
+        format: "string".into(),
+        field_type: "CustomField".into(),
+        required: true,
+        show_when_create: true,
+        option_error: None,
+        options: vec![],
+    });
+    let d = fixture();
+    let errors = validation::validate(&d, &m.profile, Some(&m), true, true);
+    assert!(errors
+        .iter()
+        .any(|e| e.message.contains("已移除字段「标签」设为必填")));
+    let error = crate::yunxiao::create_payload(&d, &m, "actual".into()).unwrap_err();
+    assert!(error.contains("已移除字段「标签」设为必填"));
+}
+
+#[test]
+fn removed_estimated_time_required_field_remains_blocking() {
+    let mut m = metadata();
+    m.fields.push(Field {
+        id: "estimatedTime".into(),
+        name: "预计工时".into(),
+        format: "int".into(),
+        field_type: "CustomField".into(),
+        required: true,
+        show_when_create: true,
+        option_error: None,
+        options: vec![],
+    });
+    let d = fixture();
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true)
+        .iter()
+        .any(|issue| issue.message.contains("已移除字段「预计工时」设为必填")));
+    assert!(crate::yunxiao::create_payload(&d, &m, "actual".into())
+        .unwrap_err()
+        .contains("已移除字段「预计工时」设为必填"));
+}
+
+#[test]
+fn removed_ids_are_ignored_when_metadata_no_longer_contains_them() {
+    let m = metadata();
+    let mut d = fixture();
+    d["customFields"]["labels"] = json!("stale-invalid-label");
+    d["customFields"]["plannedStartTime"] = json!("stale-invalid-time");
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true)
+        .iter()
+        .all(|issue| !issue.field.starts_with("customFields.labels")
+            && !issue.field.starts_with("customFields.plannedStartTime")));
+    d["customFields"]["arbitraryUnknown"] = json!("stale-value");
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true)
+        .iter()
+        .any(|issue| issue.field == "customFields.arbitraryUnknown"));
+}
+
+#[test]
+fn removed_submission_inputs_do_not_block_online_or_offline_validation() {
+    let m = metadata();
+    let mut d = fixture();
+    d["business"] = json!("");
+    d["manualNote"] = json!("");
+    d["buildUrl"] = json!("");
+    d["buildStatus"] = json!("unconfirmed");
+    for online in [true, false] {
+        let issues = validation::validate(&d, &m.profile, Some(&m), true, online);
+        assert!(issues.iter().all(|issue| {
+            !["business", "manualNote", "buildUrl", "buildStatus"].contains(&issue.field.as_str())
+        }));
+    }
+}
+
+#[test]
+fn report_omits_removed_business_and_build_sections() {
+    let d = fixture();
+    let report = evidence::report(&d, &metadata().profile);
+    assert!(!report.contains("方向："));
+    assert!(!report.contains("Jenkins 固定构建"));
+    assert!(!report.contains("人工补充来源"));
+}
 #[test]
 fn every_base_missing_field_is_blocked() {
     let m = metadata();
     for path in [
         "title",
-        "business",
         "workitemTypeId",
         "assignedTo",
-        "buildUrl",
         "preconditions",
         "steps",
         "expected",
         "actual",
-        "app.packageName",
-        "app.versionName",
-        "app.versionCode",
-        "app.channel",
-        "app.environment",
-        "app.obfuscation",
-        "app.hardening",
-        "device.model",
-        "device.androidVersion",
-        "device.totalMemKb",
-        "device.availableMemKb",
-        "device.resolution",
-        "device.density",
-        "event.occurredAt",
-        "event.sourceNote",
-        "manualNote",
-        "cloud.reason",
     ] {
         let mut d = fixture();
         let keys: Vec<_> = path.split('.').collect();
@@ -76,6 +608,74 @@ fn every_base_missing_field_is_blocked() {
             "missing {path}"
         );
     }
+}
+#[test]
+fn problem_fields_are_required_and_manual_time_is_not_a_submission_gate() {
+    let m = metadata();
+    for (path, label) in [
+        ("title", "问题标题"),
+        ("actual", "问题表现"),
+        ("preconditions", "复现条件"),
+        ("steps", "复现步骤"),
+        ("expected", "期望表现"),
+    ] {
+        let mut d = fixture();
+        d[path] = json!(" \n\t ");
+        for online in [true, false] {
+            let issues = validation::validate(&d, &m.profile, Some(&m), true, online);
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.field == path && issue.message.contains(label)),
+                "{path}"
+            );
+        }
+    }
+    for time in ["", "2026-10-09T08:00:00", "旧时间记录"] {
+        let mut d = fixture();
+        d["title"] = json!("闪退");
+        d["event"]["occurredAt"] = json!(time);
+        d["event"]["source"] = json!("manual");
+        d["event"]["sourceNote"] = json!("");
+        assert!(validation::check_shape(&d).is_ok());
+        for online in [true, false] {
+            assert!(validation::validate(&d, &m.profile, Some(&m), true, online).is_empty());
+        }
+    }
+}
+#[test]
+fn evidence_report_uses_the_problem_form_labels() {
+    let report = evidence::report(&fixture(), &metadata().profile);
+    for label in ["复现条件", "期望表现", "问题表现"] {
+        assert!(report.contains(&format!("## {label}\n")));
+    }
+    for label in ["前置条件", "预期结果", "实际结果"] {
+        assert!(!report.contains(&format!("## {label}\n")));
+    }
+}
+#[test]
+fn project_package_is_required_while_device_fields_and_page_are_optional() {
+    let m = metadata();
+    for blank in ["", " ", "\n\t"] {
+        let mut d = fixture();
+        d["app"]["packageName"] = json!(blank);
+        for online in [true, false] {
+            let issues = validation::validate(&d, &m.profile, Some(&m), true, online);
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].field, "app.packageName");
+            assert_eq!(issues[0].message, "请补充当前项目的 Android 包名配置");
+        }
+    }
+    let mut d = fixture();
+    d.as_object_mut().unwrap().remove("bugPage");
+    for value in d["device"].as_object_mut().unwrap().values_mut() {
+        *value = json!("");
+    }
+    d["app"]["versionName"] = json!("");
+    d["app"]["versionCode"] = json!("");
+    d["app"]["channel"] = json!("");
+    assert!(validation::check_shape(&d).is_ok());
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
 }
 #[test]
 fn schema_rejects_injected_keys_and_invalid_hash() {
@@ -134,6 +734,16 @@ fn evidence_hashes_and_managed_merge_are_stable() {
     let schema: Value =
         serde_json::from_str(include_str!("../../schemas/manifest.schema.json")).unwrap();
     assert!(jsonschema::is_valid(&schema, &manifest));
+    assert_eq!(manifest["problem"]["bugPage"], d["bugPage"]);
+    let mut report = String::new();
+    zip.by_name(&format!("{}/report.md", e.id))
+        .unwrap()
+        .read_to_string(&mut report)
+        .unwrap();
+    assert!(report.contains(&string(&d, "bugPage")));
+    assert!(manifest.get("cloudConfig").is_none());
+    assert!(zip.by_name(&format!("{}/cloud-config.json", e.id)).is_err());
+    assert!(!Path::new(&e.directory).join("cloud-config.json").exists());
     assert_eq!(manifest["installedArtifact"]["fingerprints"], Value::Null);
     assert_eq!(
         manifest["files"][0]["sha256"],
@@ -347,7 +957,24 @@ async fn mock_complete_upload_reads_all_pages_and_hashes() {
     let s = submitter.submit(&string(&d, "id"), &api).await.unwrap();
     assert_eq!(s.state, "submitted");
     assert_eq!(s.identifier.as_deref(), Some("TEST-1"));
-    assert!(s.url.is_none());
+    assert_eq!(
+        s.url.as_deref(),
+        Some("https://devops.aliyun.com/projex/bug/TEST-1")
+    );
+    let receipt: Value = serde_json::from_slice(
+        &std::fs::read(Path::new(&s.evidence.directory).with_extension("receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["url"], s.url.as_deref().unwrap());
+    let mut legacy = s.clone();
+    legacy.url = None;
+    let text = crate::workitem_links::receipt_text(&legacy, &d, true).unwrap();
+    assert!(text.contains("链接：https://devops.aliyun.com/projex/bug/TEST-1"));
+    assert!(!text.contains("API 未返回"));
+    assert_eq!(
+        crate::workitem_links::receipt_text(&legacy, &d, false).unwrap(),
+        s.url.as_deref().unwrap()
+    );
     let hash = evidence::hash_file(Path::new(&s.evidence.zip_path))
         .unwrap()
         .1;
@@ -359,6 +986,8 @@ async fn mock_complete_upload_reads_all_pages_and_hashes() {
     assert_eq!(r.files.len(), 2);
     assert!(!r.download_saw_token);
     assert!(string(&r.body, "description").contains("测试人员在云效追加的说明"));
+    assert!(string(&r.body, "description")
+        .contains(&format!("## Bug所在页面\n\n{}", string(&d, "bugPage"))));
 }
 #[tokio::test]
 async fn missing_fields_and_new_unsupported_field_make_zero_create_calls() {
@@ -482,6 +1111,25 @@ fn submission_state(
         last_organization: profile.organization_id.clone(),
         ..Default::default()
     });
+    let package_name = store
+        .list("draft")
+        .unwrap()
+        .first()
+        .map(|draft| string(draft, "app.packageName"))
+        .filter(|package| !package.is_empty())
+        .unwrap_or_else(|| "com.example.test".into());
+    crate::project_settings::save_for_state(
+        &state,
+        &profile.organization_id,
+        crate::project_settings::ProjectSettings {
+            entries: vec![crate::project_settings::ProjectSetting {
+                project_id: profile.project_id.clone(),
+                enabled: true,
+                package_name,
+            }],
+        },
+    )
+    .unwrap();
     state
 }
 fn bind_alice(store: &Store, id: &str) {
@@ -508,6 +1156,56 @@ fn change_identity(state: &crate::commands::AppState, original: &Profile, dimens
 fn write_counts(remote: &Arc<Mutex<Remote>>) -> (usize, usize, usize) {
     let r = remote.lock().unwrap();
     (r.creates, r.uploads, r.updates)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inspect_device_command_persists_snapshot_and_rejects_unauthorized_before_shell() {
+    use std::os::unix::fs::PermissionsExt;
+    use tauri::Manager;
+    let (server, _remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let adb = store.root.join("fake-inspect-adb");
+    std::fs::write(&adb, r#"#!/bin/sh
+if [ "$1" = devices ]; then printf 'List of devices attached\nUSB-A device product:x\nUSB-B unauthorized\n'; exit 0; fi
+if [ "$4" = dumpsys ] && [ "$5" = activity ]; then printf 'mResumedActivity: ActivityRecord{u0 com.example.app/.Main t1}\n'; exit 0; fi
+if [ "$4" = dumpsys ] && [ "$5" = window ]; then printf 'mCurrentFocus=Window{u0 com.example.app/.Main}\n'; exit 0; fi
+if [ "$4" = getprop ] && [ "$5" = ro.product.model ]; then printf 'Pixel Fake\n'; exit 0; fi
+if [ "$4" = getprop ] && [ "$5" = ro.build.version.release ]; then printf '14\n'; exit 0; fi
+if [ "$4" = cat ]; then printf 'MemTotal: 1234 kB\nMemAvailable: 456 kB\n'; exit 0; fi
+if [ "$4" = wm ]; then printf 'Physical size: 1080x2400\nPhysical density: 420\n'; exit 0; fi
+if [ "$4" = am ]; then printf '0\n'; exit 0; fi
+if [ "$4" = pm ]; then printf 'package:com.example.test\n'; exit 0; fi
+if [ "$4" = date ]; then printf '2026-10-09T12:00:00+0800\n'; exit 0; fi
+if [ "$4" = dumpsys ] && [ "$6" = com.example.test ]; then printf 'versionName=1.2.3\nversionCode=42\n'; exit 0; fi
+exit 0
+"#).unwrap();
+    std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o700)).unwrap();
+    *state.adb.lock().unwrap() = Some(adb);
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let snapshot = crate::commands::inspect_device(id.clone(), "USB-A".into(), app.state())
+        .await
+        .unwrap();
+    assert_eq!(snapshot["details"]["foregroundActivity"], ".Main");
+    let saved = app
+        .state::<crate::commands::AppState>()
+        .store
+        .draft(&id)
+        .unwrap();
+    assert_eq!(saved["app"]["packageName"], "com.example.test");
+    assert!(crate::validation::check_shape(&saved).is_ok());
+    assert!(
+        crate::commands::inspect_device(id.clone(), "USB-B".into(), app.state())
+            .await
+            .unwrap_err()
+            .contains("尚未授权")
+    );
 }
 async fn rejected_recovery_matrix(
     server: &MockServer,
@@ -961,6 +1659,7 @@ if args[:1]==['-s']:
  args=args[2:]
 if args[:1]==['devices']: print('List of devices attached\nintegration-device device model:Mock');sys.exit(0)
 if args[:1]==['logcat']:
+ assert '--uid=10123' in args,args
  if '-d' in args:
   for offset in [-125,-120,-119]: print(f'{time.time()+offset:.6f} 11 11 I Mock: secret@example.test before')
  else:
@@ -976,8 +1675,8 @@ if args[:1]==['bugreport']:
 if args[:2]==['shell','date']:
  print(int(time.time()) if args[-1]=='+%s' else '2026-10-09T08:00:00+0800');sys.exit(0)
 if args[:3]==['shell','am','get-current-user']: print('0');sys.exit(0)
-if args[:3]==['shell','pm','list']: print('package:com.example.app');sys.exit(0)
-if args[:3]==['shell','dumpsys','package']: print('versionName=1.0\nversionCode=0 minSdk=24');sys.exit(0)
+if args[:3]==['shell','pm','list']: print('package:com.example.test');sys.exit(0)
+if args[:3]==['shell','dumpsys','package']: print('Package [com.example.test]\n  userId=10123\nversionName=1.0\nversionCode=0 minSdk=24');sys.exit(0)
 if args[:2]==['shell','getprop']: print('14' if args[-1]=='ro.build.version.release' else 'mock-model');sys.exit(0)
 if args[:2]==['shell','cat']: print('MemTotal: 8192000 kB\nMemAvailable: 4096000 kB');sys.exit(0)
 if args[:3]==['shell','wm','size']: print('Physical size: 1080x2400');sys.exit(0)
@@ -1021,6 +1720,8 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
     let marked = crate::commands::mark_problem(id.clone(), app.state())
         .await
         .unwrap();
+    assert!(marked["event"].get("lateCapture").is_none());
+    validation::check_shape(&marked).unwrap();
     assert!(crate::capture::pending(&store, &id).unwrap());
     assert!(crate::commands::submit_bug(id.clone(), app.state())
         .await
@@ -1104,7 +1805,7 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
         2,
         "redaction and inherited window receipts travel with selected derivative"
     );
-    assert!(!rows.iter().find(|a| a.id == wid).unwrap().confirmed);
+    assert!(rows.iter().all(|a| a.id != wid));
     for receipt in rows
         .iter()
         .filter(|a| a.role == "report" && a.derived_from.as_deref() == Some(&derived.id))
@@ -1119,25 +1820,17 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
             confirmed["attachments"]
         );
     }
-    for remove in [false, true] {
+    {
         let mut broken = confirmed.clone();
         let receipt_id = &rows
             .iter()
             .find(|a| a.role == "report" && a.derived_from.as_deref() == Some(&derived.id))
             .unwrap()
             .id;
-        if remove {
-            broken["attachments"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|a| string(a, "id") != *receipt_id);
-        } else {
-            for a in broken["attachments"].as_array_mut().unwrap() {
-                if string(a, "id") == *receipt_id {
-                    a["confirmed"] = json!(false);
-                }
-            }
-        }
+        broken["attachments"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| string(a, "id") != *receipt_id);
         assert!(evidence::build(&store, &broken, &api.profile, false).is_err());
         store.put("draft", &id, &broken).unwrap();
         assert!(crate::commands::submit_bug(id.clone(), app.state())
@@ -1188,8 +1881,15 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
         }
     }
     final_d["app"]["channel"] = d["app"]["channel"].clone();
-    final_d["app"]["environment"] = d["app"]["environment"].clone();
     final_d["previewConfirmed"] = json!(true);
+    // Every listed attachment uploads without a per-file confirmation gate.
+    for row in final_d["attachments"].as_array_mut().unwrap() {
+        if string(row, "role") == "log" && string(row, "coverageStart").is_empty() {
+            row["coverageStart"] = d["attachments"][0]["coverageStart"].clone();
+            row["coverageEnd"] = d["attachments"][0]["coverageEnd"].clone();
+        }
+    }
+    let expected_uploads = attachments(&final_d).unwrap().len() + 1;
     validation::check_shape(&final_d).unwrap();
     store.put("draft", &id, &final_d).unwrap();
     let (first, second) = tokio::join!(
@@ -1202,7 +1902,11 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
     };
     assert!(duplicate.contains("请勿重复点击"));
     assert_eq!(submitted.state, "submitted");
-    assert_eq!(submitted.uploads.len(), 9, "bundle + original selected log + redacted window + two receipts + PNG/JPEG/MP4 + system report");
+    assert_eq!(
+        submitted.uploads.len(),
+        expected_uploads,
+        "bundle + every draft attachment, regardless of the legacy confirmation flag"
+    );
     assert_eq!(remote.lock().unwrap().creates, 1);
     assert!(!remote.lock().unwrap().download_saw_token);
     let again = crate::commands::submit_bug(id.clone(), app.state())

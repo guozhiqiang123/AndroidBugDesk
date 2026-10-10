@@ -15,10 +15,12 @@ npm run dev
 
 ```sh
 npm run check
-npm run bundle
+npm run bundle:local # 本机 macOS：从首次构建带签名，并自动校验应用和 DMG
 ```
 
 Linux 编译需要 WebKitGTK 4.1、GTK 3、DBus、librsvg、patchelf 和 OpenSSL 开发包。保存 PAT 需要可用且已解锁的 Secret Service；否则选择“仅本次使用”。macOS 使用钥匙串，Windows 使用系统凭据库。PAT 不存入 SQLite 或项目配置。
+
+本机打包、验证复用、界面失败诊断及覆盖安装步骤见 [本地开发与打包约定](docs/local-workflow.md)。本机 macOS 打包只生成当前架构的开发包，不自动安装；Windows/Linux 和正式候选继续使用现有平台/Actions 流程。
 
 ## 结构
 

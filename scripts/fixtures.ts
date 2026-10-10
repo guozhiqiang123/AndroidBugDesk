@@ -19,6 +19,7 @@ const d = emptyDraft(
 );
 Object.assign(d, {
   title: "点击恢复按钮后页面闪退",
+  bugPage: "com.example.test.RecoveryActivity",
   business: "测试方向",
   workitemTypeId: "bug-type",
   assignedTo: "member-1",
@@ -37,9 +38,6 @@ d.app = {
   versionName: "1.0",
   versionCode: "0",
   channel: "internal",
-  environment: "测试包",
-  obfuscation: "已混淆，构建配置确认",
-  hardening: "未加固，构建配置确认",
 };
 d.device = {
   model: "模拟设备",
@@ -54,16 +52,6 @@ d.event = {
   originalAt: "",
   source: "manual",
   sourceNote: "测试人员操作记录",
-  lateCapture: false,
-};
-d.cloud = {
-  applicability: "no",
-  reason: "该入口为本地固定功能，应用调试面板确认没有开关",
-  name: "",
-  effectiveValue: "",
-  source: "",
-  observedAt: "",
-  override: "",
 };
 d.customFields = { priority: "p2" };
 d.attachments = [

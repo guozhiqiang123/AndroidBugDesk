@@ -18,6 +18,7 @@
       ]
     },
     "title": { "type": "string", "maxLength": 50000 },
+    "bugPage": { "type": "string", "maxLength": 50000 },
     "kind": {
       "type": "string",
       "enum": [
@@ -84,20 +85,9 @@
         "packageName": { "type": "string", "maxLength": 50000 },
         "versionName": { "type": "string", "maxLength": 50000 },
         "versionCode": { "type": "string", "maxLength": 50000 },
-        "channel": { "type": "string", "maxLength": 50000 },
-        "environment": { "type": "string", "maxLength": 50000 },
-        "obfuscation": { "type": "string", "maxLength": 50000 },
-        "hardening": { "type": "string", "maxLength": 50000 }
+        "channel": { "type": "string", "maxLength": 50000 }
       },
-      "required": [
-        "packageName",
-        "versionName",
-        "versionCode",
-        "channel",
-        "environment",
-        "obfuscation",
-        "hardening"
-      ],
+      "required": ["packageName", "versionName", "versionCode", "channel"],
       "additionalProperties": false
     },
     "device": {
@@ -126,16 +116,9 @@
         "occurredAt": { "type": "string", "maxLength": 50000 },
         "originalAt": { "type": "string", "maxLength": 50000 },
         "source": { "type": "string", "enum": ["auto", "manual"] },
-        "sourceNote": { "type": "string", "maxLength": 50000 },
-        "lateCapture": { "type": "boolean" }
+        "sourceNote": { "type": "string", "maxLength": 50000 }
       },
-      "required": [
-        "occurredAt",
-        "originalAt",
-        "source",
-        "sourceNote",
-        "lateCapture"
-      ],
+      "required": ["occurredAt", "originalAt", "source", "sourceNote"],
       "additionalProperties": false
     },
     "preconditions": { "type": "string", "maxLength": 50000 },
@@ -150,28 +133,6 @@
         "occurrences": { "type": "string", "maxLength": 50000 }
       },
       "required": ["firstDiscovery", "attempts", "occurrences"],
-      "additionalProperties": false
-    },
-    "cloud": {
-      "type": "object",
-      "properties": {
-        "applicability": { "type": "string", "enum": ["yes", "no", "unset"] },
-        "reason": { "type": "string", "maxLength": 50000 },
-        "name": { "type": "string", "maxLength": 50000 },
-        "effectiveValue": { "type": "string", "maxLength": 50000 },
-        "source": { "type": "string", "maxLength": 50000 },
-        "observedAt": { "type": "string", "maxLength": 50000 },
-        "override": { "type": "string", "maxLength": 50000 }
-      },
-      "required": [
-        "applicability",
-        "reason",
-        "name",
-        "effectiveValue",
-        "source",
-        "observedAt",
-        "override"
-      ],
       "additionalProperties": false
     },
     "network": {
@@ -305,7 +266,6 @@
     "expected",
     "actual",
     "frequency",
-    "cloud",
     "network",
     "data",
     "customFields",

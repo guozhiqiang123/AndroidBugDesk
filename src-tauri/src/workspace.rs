@@ -88,7 +88,11 @@ fn login_failure(error: &str) -> AuthResult {
     // Error strings are produced locally; never return the server body/PAT.
     auth_result(status, None, error)
 }
-fn accept_identity(state: &AppState, user: UserIdentity, epoch: u64) -> Result<AuthResult> {
+pub(crate) fn accept_identity(
+    state: &AppState,
+    user: UserIdentity,
+    epoch: u64,
+) -> Result<AuthResult> {
     let mut current_user = state.user.lock().unwrap();
     if epoch != state.auth_epoch.load(Ordering::SeqCst) {
         return Err("本次登录已取消，请重新校验".into());
@@ -105,6 +109,25 @@ fn accept_identity(state: &AppState, user: UserIdentity, epoch: u64) -> Result<A
 pub async fn check_auth(state: &AppState) -> Result<AuthResult> {
     invalidate(state);
     let epoch = state.auth_epoch.load(Ordering::SeqCst);
+    let oauth = state.oauth.lock().unwrap().clone();
+    if let Some(session) = oauth {
+        let result = async {
+            let mut token = session.access_token().await?;
+            let user = Api::with_base(empty_profile(), &token, &state.api_base)?
+                .with_oauth(Some(session.clone()))
+                .verify_user()
+                .await?;
+            session.verify_user(&user.id).await?;
+            if epoch != state.auth_epoch.load(Ordering::SeqCst) {
+                token.zeroize();
+                return Err("本次登录已取消，请重新校验".into());
+            }
+            *state.token.lock().unwrap() = Some(token);
+            accept_identity(state, user, epoch)
+        }
+        .await;
+        return result.or_else(|error| Ok(login_failure(&error)));
+    }
     let token = state.token.lock().unwrap().clone();
     let Some(mut token) = token else {
         return Ok(auth_result("missing", None, "请输入个人访问令牌"));
@@ -119,6 +142,7 @@ pub async fn check_auth(state: &AppState) -> Result<AuthResult> {
     }
 }
 pub async fn login(state: &AppState, mut token: String, remember: bool) -> Result<AuthResult> {
+    state.oauth_flow.cancel();
     invalidate(state);
     let collector = { state.collector.lock().unwrap().take() };
     if let Some(collector) = collector {
@@ -146,13 +170,13 @@ pub async fn login(state: &AppState, mut token: String, remember: bool) -> Resul
     }
     if remember {
         let entry = keyring::Entry::new(super::commands::SERVICE, "personal-pat")
-            .map_err(|_| "系统安全存储不可用，请选择仅本次使用")?;
+            .map_err(|_| "系统安全存储不可用，请取消“记住登录”后重试")?;
         if entry.set_password(&token).is_err() {
             token.zeroize();
             return Ok(auth_result(
                 "unverified",
                 None,
-                "系统安全存储不可用，未保存令牌；请选择仅本次使用",
+                "系统安全存储不可用，未保存令牌；请取消“记住登录”后重试",
             ));
         }
     } else if state
@@ -170,7 +194,20 @@ pub async fn login(state: &AppState, mut token: String, remember: bool) -> Resul
             }
         }
     }
-    state.store.put("settings", "remembered", &remember)?;
+    let oauth = state.oauth.lock().unwrap().take();
+    if let Some(session) = oauth {
+        session.close_and_wait().await;
+    }
+    if state
+        .store
+        .get::<String>("settings", "login_method")?
+        .as_deref()
+        == Some("oauth")
+    {
+        crate::oauth::clear_saved()?;
+    }
+    state.store.put("settings", "login_method", &"pat")?;
+    crate::login_memory::set_enabled(&state.store, remember)?;
     let mut old = state.token.lock().unwrap();
     if let Some(value) = old.as_mut() {
         value.zeroize();
@@ -229,6 +266,7 @@ pub(crate) fn submission_api(state: &AppState, id: &str) -> Result<Api> {
         token.as_deref().ok_or("请填写个人 PAT")?,
         &state.api_base,
     )
+    .map(|api| api.with_oauth(state.oauth.lock().unwrap().clone()))
 }
 pub fn check_metadata_scope(state: &AppState, metadata: &Metadata) -> Result<()> {
     let profile = state.profile.lock().unwrap();
@@ -687,9 +725,7 @@ mod field_tests {
                 {"id":"priority","name":"优先级","type":"SystemCustomField","format":"list","required":true,"options":[{"id":"p2","displayValue":"中"}]}
             ]))).mount(&server).await;
         for page in [1, 2] {
-            for (endpoint, id_key, name_key) in
-                [("members", "userId", "userName"), ("labels", "id", "name")]
-            {
+            for (endpoint, id_key, name_key) in [("members", "userId", "userName")] {
                 Mock::given(method("GET"))
                     .and(path(format!("{prefix}/{endpoint}")))
                     .and(query_param("page", page.to_string()))
@@ -708,7 +744,7 @@ mod field_tests {
         }
         let m = api.metadata("").await.unwrap();
         assert_eq!(m.members.len(), 2);
-        assert_eq!(m.fields[0].options.len(), 2);
+        assert!(m.fields[0].options.is_empty());
         assert_eq!(m.fields[1].options[0].name, "中");
         assert!(m.fields[0].show_when_create);
     }
@@ -724,13 +760,13 @@ mod field_tests {
         d["customFields"]["verifier"] = json!(m.members[0].id);
         assert!(crate::validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
         let payload = crate::yunxiao::create_payload(&d, &m, "description".into()).unwrap();
-        assert_eq!(payload["labels"], json!(["label-1"]));
+        assert!(payload["labels"].is_null());
         assert_eq!(payload["verifier"], json!(m.members[0].id));
         d["customFields"]["labels"] = json!(["deleted-label"]);
         assert!(
             crate::validation::validate(&d, &m.profile, Some(&m), true, true)
                 .iter()
-                .any(|e| e.field == "customFields.labels")
+                .all(|e| e.field != "customFields.labels")
         );
     }
     #[tokio::test]
@@ -753,12 +789,6 @@ mod field_tests {
                 {"id":"labels","name":"标签","type":"Application","format":"tag","required":false},
                 {"id":"priority","name":"优先级","type":"SystemCustomField","format":"list","required":true,"options":[{"id":"p1","displayValue":"高"}]}
             ]))).mount(&server).await;
-        Mock::given(method("GET"))
-            .and(path(format!("{prefix}/labels")))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
         for endpoint in ["members", "versions", "sprints"] {
             Mock::given(method("GET"))
                 .and(path(format!("{prefix}/{endpoint}")))
@@ -775,7 +805,7 @@ mod field_tests {
         }
         let metadata = api.metadata("").await.unwrap();
         assert!(metadata.fields[0].options.is_empty());
-        assert!(metadata.fields[0].option_error.is_some());
+        assert!(metadata.fields[0].option_error.is_none());
         assert_eq!(metadata.fields[1].options[0].id, "p1");
         assert!(metadata.versions.is_empty());
     }

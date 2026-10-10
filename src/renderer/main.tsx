@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoke, convertFileSrc, isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   draftSchema,
   type Draft,
@@ -9,25 +9,51 @@ import {
   type Submission,
   type Device,
   type Session,
+  type Snapshot,
   type Attachment,
   type Option,
 } from "../shared/domain";
 import type {
   AuthResult,
-  HistoryPage,
   SelectionMemory,
   UserIdentity,
+  ProjectSettings,
+  DraftProjectScope,
 } from "../shared/workspace";
 import {
   nativeTarget,
   validateDraft,
   supportedFormats,
 } from "../shared/validation";
+import { excludedField } from "../shared/submission-fields";
 import { enqueueSelectionWrite, tabForAuth } from "./session";
-import { applySelectionMemory, profileConfigured } from "./session";
+import {
+  applySelectionMemory,
+  defaultUnchecked,
+  profileConfigured,
+} from "./session";
 import { initialWorkspace, remoteAuthReaction } from "./session";
 import "./style.css";
 import { UserProfile } from "./user-profile";
+import { HistoryView } from "./history-view";
+import { EnvironmentSnapshotEntry, PostCaptureEntry } from "./post-capture";
+import {
+  splitPostCaptureAttachmentDescription,
+  type PostCaptureSnapshot,
+} from "../shared/post-capture";
+import { LoginCard, LoginRestoring } from "./login-card";
+import { CustomSelect } from "./custom-select";
+import { NotificationToast, useTransientNotice } from "./notification-toast";
+import {
+  attachmentIssueKey,
+  groupIssuesByNavigationTarget,
+  routeIssues,
+} from "./issue-routing";
+import {
+  configuredProjectPackage,
+  enabledProjects,
+  normalizeProjectSettings,
+} from "./project-settings";
 
 interface CaptureStatus {
   id: string;
@@ -49,6 +75,8 @@ interface CaptureStatus {
 interface Bootstrap {
   profile: Profile;
   authorized: boolean;
+  rememberLogin?: boolean;
+  loginMethod?: "pat" | "oauth";
   user?: UserIdentity | null;
   metadata: Metadata | null;
   adbPath: string | null;
@@ -56,6 +84,7 @@ interface Bootstrap {
   submissions: Submission[];
   sessions: Session[];
   captures?: CaptureStatus[];
+  draftScopes?: Record<string, DraftProjectScope>;
 }
 const stateLabels: Record<string, string> = {
   ready: "证据已固定",
@@ -72,27 +101,44 @@ function App() {
     [draft, setDraft] = useState<Draft | null>(null);
   const [tab, setTab] = useState("auth"),
     [busy, setBusy] = useState(""),
-    [notice, setNotice] = useState(""),
     [error, setError] = useState("");
+  const { notice, setNotice } = useTransientNotice();
+  const [rememberLogin, setRememberLogin] = useState(false);
+  const [restoringLogin, setRestoringLogin] = useState(isTauri);
   const [token, setToken] = useState(""),
     [devices, setDevices] = useState<Device[]>([]),
     [serial, setSerial] = useState("");
-  const [packageName, setPackageName] = useState(""),
-    [buildUrl, setBuildUrl] = useState(""),
+  const [buildUrl, setBuildUrl] = useState(""),
     [business, setBusiness] = useState("");
   const [session, setSession] = useState<Session | null>(null),
     [preview, setPreview] = useState(false),
-    [log, setLog] = useState(""),
     [dirty, setDirty] = useState(false);
   const [remoteId, setRemoteId] = useState("");
+  const [draftsToDelete, setDraftsToDelete] = useState<Draft[] | null>(null);
   const [auth, setAuth] = useState<AuthResult | null>(null);
-  const [remoteHistory, setRemoteHistory] = useState<HistoryPage | null>(null);
-  const [remoteHistoryPage, setRemoteHistoryPage] = useState(1);
-  const [remoteHistoryError, setRemoteHistoryError] = useState("");
   const [organizations, setOrganizations] = useState<Option[]>([]);
   const [projects, setProjects] = useState<Option[]>([]);
+  const [projectSettings, setProjectSettings] = useState<ProjectSettings>({
+    entries: [],
+  });
+  const [appliedProjectSettings, setAppliedProjectSettings] =
+    useState<ProjectSettings>({ entries: [] });
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsQuery, setSettingsQuery] = useState("");
+  const [settingsEnabledOnly, setSettingsEnabledOnly] = useState(false);
+  const [settingsPackageOnly, setSettingsPackageOnly] = useState(false);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [backendIssues, setBackendIssues] = useState<
+    { field: string; message: string }[]
+  >([]);
   const [organizationId, setOrganizationId] = useState("");
   const [projectId, setProjectId] = useState("");
+  const deviceReadEpoch = useRef(0);
+  const selectedSerialRef = useRef("");
+  const homeDeviceRefreshKey = useRef("");
+  const activeDraftRef = useRef<Draft | null>(null);
   const memoryWrite = useRef<Promise<unknown>>(Promise.resolve());
   const busyGate = useRef(false);
   const workspaceEpoch = useRef(0);
@@ -101,17 +147,30 @@ function App() {
     setBoot(b);
     return b;
   };
-  const run = async (name: string, work: () => Promise<unknown>) => {
+  useEffect(() => {
+    activeDraftRef.current = draft;
+  }, [draft]);
+  const run = async (
+    name: string,
+    work: () => Promise<unknown>,
+    target?: string,
+  ) => {
     if (busyGate.current) return;
     busyGate.current = true;
     setBusy(name);
     setError("");
     setNotice("");
+    if (target) setFieldErrors((current) => ({ ...current, [target]: "" }));
     try {
       await work();
     } catch (e) {
       if (isAuthExpired(e))
         await invalidateAuth(`授权已失效：${remoteErrorMessage(e)}`);
+      else if (target)
+        setFieldErrors((current) => ({
+          ...current,
+          [target]: typeof e === "string" ? e : String(e),
+        }));
       else setError(typeof e === "string" ? e : String(e));
     } finally {
       busyGate.current = false;
@@ -126,17 +185,40 @@ function App() {
     setPreview(false);
     setSession(null);
     setDevices([]);
+    selectedSerialRef.current = "";
     setSerial("");
-    setPackageName("");
     setBuildUrl("");
     setBusiness("");
     setAuth({ status: "invalid", user: null, message });
+    setRememberLogin(false);
     setOrganizations([]);
     setProjects([]);
-    setRemoteHistory(null);
-    setRemoteHistoryError(message);
+    setProjectSettings({ entries: [] });
+    setAppliedProjectSettings({ entries: [] });
+    setSettingsDirty(false);
+    setFieldErrors({});
+    setBackendIssues([]);
+    setSettingsError("");
+    setSettingsQuery("");
+    setSettingsEnabledOnly(false);
+    setSettingsPackageOnly(false);
+    setOrganizationId("");
+    setProjectId("");
     setBoot((b) =>
-      b ? { ...b, authorized: false, user: null, metadata: null } : b,
+      b
+        ? {
+            ...b,
+            profile: initialWorkspace().profile,
+            authorized: false,
+            user: null,
+            metadata: null,
+            drafts: [],
+            draftScopes: {},
+            submissions: [],
+            sessions: [],
+            captures: [],
+          }
+        : b,
     );
     setTab("auth");
   };
@@ -144,43 +226,226 @@ function App() {
     typeof error === "string" ? error : String(error);
   const isAuthExpired = (error: unknown) =>
     remoteAuthReaction(error) === "logout";
-  const handleRemoteError = async (error: unknown, context: string) => {
+  const handleRemoteError = async (
+    error: unknown,
+    context: string,
+    target?: string,
+  ) => {
     const message = `${context}：${remoteErrorMessage(error)}`;
     if (isAuthExpired(error)) await invalidateAuth(message);
+    else if (target)
+      setFieldErrors((current) => ({ ...current, [target]: message }));
     else setError(message);
   };
-  const loadWorkspace = async (profile: Profile): Promise<boolean> => {
+  const fieldError = (path: string) =>
+    fieldErrors[path] ? (
+      <small className="error-text" role="alert">
+        {fieldErrors[path]}
+      </small>
+    ) : null;
+  const loadWorkspace = async (
+    profile: Profile,
+  ): Promise<{ valid: boolean; packageReady: boolean; profile: Profile }> => {
+    const epoch = workspaceEpoch.current;
     const orgs = await invoke<Option[]>("list_organizations");
+    if (epoch !== workspaceEpoch.current)
+      return { valid: false, packageReady: false, profile };
     setOrganizations(orgs);
     const rememberedOrg = orgs.some((o) => o.id === profile.organizationId)
       ? profile.organizationId
-      : "";
+      : (orgs[0]?.id ?? "");
     setOrganizationId(rememberedOrg);
     if (!rememberedOrg) {
       setProjects([]);
+      setProjectSettings({ entries: [] });
+      setAppliedProjectSettings({ entries: [] });
+      setSettingsDirty(false);
+      setSettingsQuery("");
+      setSettingsEnabledOnly(false);
+      setSettingsPackageOnly(false);
       setProjectId("");
-      return false;
+      return { valid: false, packageReady: false, profile };
     }
     const nextProjects = await invoke<Option[]>("list_projects", {
       organizationId: rememberedOrg,
     });
+    if (epoch !== workspaceEpoch.current)
+      return { valid: false, packageReady: false, profile };
     setProjects(nextProjects);
-    const validProject = nextProjects.some((p) => p.id === profile.projectId);
-    setProjectId(validProject ? profile.projectId : "");
-    return validProject;
+    const loadedSettings = await invoke<ProjectSettings>(
+      "load_project_settings",
+      {
+        organizationId: rememberedOrg,
+      },
+    );
+    if (epoch !== workspaceEpoch.current)
+      return { valid: false, packageReady: false, profile };
+    const normalized = normalizeProjectSettings(nextProjects, loadedSettings);
+    setProjectSettings(normalized);
+    setAppliedProjectSettings(normalized);
+    setSettingsDirty(false);
+    const availableProjects = enabledProjects(nextProjects, normalized);
+    const selectedProject = availableProjects.some(
+      (p) => p.id === profile.projectId,
+    )
+      ? profile.projectId
+      : (availableProjects[0]?.id ?? "");
+    setProjectId(selectedProject);
+    if (
+      selectedProject &&
+      (rememberedOrg !== profile.organizationId ||
+        selectedProject !== profile.projectId)
+    ) {
+      const selected = await invoke<Profile>("select_project", {
+        organizationId: rememberedOrg,
+        projectId: selectedProject,
+      });
+      setBoot((current) =>
+        current ? { ...current, profile: selected } : current,
+      );
+      return {
+        valid: true,
+        packageReady: Boolean(
+          configuredProjectPackage(normalized, selectedProject),
+        ),
+        profile: selected,
+      };
+    }
+    return {
+      valid: Boolean(selectedProject),
+      packageReady: Boolean(
+        configuredProjectPackage(normalized, selectedProject),
+      ),
+      profile,
+    };
+  };
+  const persistProjectSettings = async () => {
+    if (!organizationId) return false;
+    await memoryWrite.current;
+    if (dirty && draft) await save();
+    const epoch = workspaceEpoch.current;
+    setSettingsBusy(true);
+    setSettingsError("");
+    try {
+      const saved = await invoke<ProjectSettings>("save_project_settings", {
+        organizationId,
+        settings: projectSettings,
+      });
+      if (epoch !== workspaceEpoch.current) return false;
+      const normalized = normalizeProjectSettings(projects, saved);
+      setProjectSettings(normalized);
+      setAppliedProjectSettings(normalized);
+      setSettingsDirty(false);
+      const available = enabledProjects(projects, saved);
+      if (!available.length) {
+        setProjectId("");
+        setDraft(null);
+        setBoot((current) =>
+          current ? { ...current, metadata: null } : current,
+        );
+      } else if (!available.some((item) => item.id === projectId) && !session) {
+        try {
+          await selectProject(organizationId, available[0].id);
+        } catch (error) {
+          setProjectId("");
+          setDraft(null);
+          setBoot((current) =>
+            current ? { ...current, metadata: null } : current,
+          );
+          setSettingsError(
+            `项目设置已保存，但切换当前项目失败：${remoteErrorMessage(error)}`,
+          );
+        }
+      }
+      return true;
+    } catch (error) {
+      setSettingsError(`项目设置保存失败：${remoteErrorMessage(error)}`);
+      return false;
+    } finally {
+      setSettingsBusy(false);
+    }
+  };
+  const selectOrganization = async (nextOrganizationId: string) => {
+    if (!nextOrganizationId || session) return;
+    if (settingsDirty && !(await persistProjectSettings())) return;
+    if (dirty && draft) await save();
+    const epoch = ++workspaceEpoch.current;
+    const nextProjects = await invoke<Option[]>("list_projects", {
+      organizationId: nextOrganizationId,
+    });
+    const loaded = await invoke<ProjectSettings>("load_project_settings", {
+      organizationId: nextOrganizationId,
+    });
+    if (epoch !== workspaceEpoch.current) return;
+    const normalized = normalizeProjectSettings(nextProjects, loaded);
+    const enabled = enabledProjects(nextProjects, normalized);
+    if (!enabled.length) {
+      setOrganizationId(nextOrganizationId);
+      setSettingsQuery("");
+      setSettingsEnabledOnly(false);
+      setSettingsPackageOnly(false);
+      setProjects(nextProjects);
+      setProjectSettings(normalized);
+      setAppliedProjectSettings(normalized);
+      setProjectId("");
+      setDraft(null);
+      setBoot((current) =>
+        current ? { ...current, metadata: null } : current,
+      );
+      setNotice(
+        "当前组织没有启用项目，请在设置中启用至少一个项目。",
+        "warning",
+      );
+      return;
+    }
+    const profile = await invoke<Profile>("select_project", {
+      organizationId: nextOrganizationId,
+      projectId: enabled[0].id,
+    });
+    setOrganizationId(nextOrganizationId);
+    setSettingsQuery("");
+    setSettingsEnabledOnly(false);
+    setSettingsPackageOnly(false);
+    setProjects(nextProjects);
+    setProjectSettings(normalized);
+    setAppliedProjectSettings(normalized);
+    setProjectId(enabled[0].id);
+    setBoot((current) =>
+      current ? { ...current, profile, metadata: null } : current,
+    );
+    if (configuredProjectPackage(normalized, enabled[0].id)) {
+      await loadProjectMetadataAndDraft(profile);
+    } else {
+      setDraft(null);
+      setBoot((current) =>
+        current ? { ...current, metadata: null } : current,
+      );
+    }
   };
   const retryWorkspace = async () => {
     if (!boot?.authorized) return;
     try {
-      const validProject = await loadWorkspace(boot.profile);
-      if (validProject && profileConfigured(boot.profile))
-        await loadProjectMetadataAndDraft(boot.profile);
-      else {
+      const workspace = await loadWorkspace(boot.profile);
+      if (workspace.valid && profileConfigured(workspace.profile)) {
+        if (workspace.packageReady)
+          await loadProjectMetadataAndDraft(workspace.profile);
+        else {
+          setDraft(null);
+          setFieldErrors((current) => {
+            const next = { ...current };
+            delete next.projectId;
+            return next;
+          });
+        }
+      } else {
         setDraft(null);
-        setError("当前项目已不可访问，请重新选择组织和项目。");
+        setFieldErrors((current) => ({
+          ...current,
+          projectId: "当前项目已不可访问，请重新选择组织和项目。",
+        }));
       }
     } catch (error) {
-      await handleRemoteError(error, "云效项目读取失败");
+      await handleRemoteError(error, "云效项目读取失败", "projectId");
     }
   };
   const loadProjectMetadataAndDraft = async (profile: Profile) => {
@@ -210,6 +475,24 @@ function App() {
       setError(`读取选择记忆失败：${remoteErrorMessage(error)}`);
     }
     if (epoch === workspaceEpoch.current) {
+      setBoot((current) =>
+        current
+          ? {
+              ...current,
+              drafts: [
+                initialized,
+                ...current.drafts.filter((item) => item.id !== initialized.id),
+              ],
+              draftScopes: {
+                ...(current.draftScopes ?? {}),
+                [initialized.id]: {
+                  organizationId: profile.organizationId,
+                  projectId: profile.projectId,
+                },
+              },
+            }
+          : current,
+      );
       setDraft(initialized);
       setDirty(false);
       setPreview(false);
@@ -230,43 +513,38 @@ function App() {
     setBoot({ ...b, profile, authorized: true, metadata: null });
     setOrganizationId(nextOrganizationId);
     setProjectId(nextProjectId);
-    await loadProjectMetadataAndDraft(profile);
+    if (configuredProjectPackage(appliedProjectSettings, nextProjectId)) {
+      await loadProjectMetadataAndDraft(profile);
+      setNotice("项目已切换，已建立新的项目草稿；旧草稿保留在本机历史中。");
+    } else {
+      setDraft(null);
+      setNotice("项目已切换，请先在设置中补全该项目的 Android 包名。");
+    }
     setDirty(false);
     setPreview(false);
-    setNotice("项目已切换，已建立新的项目草稿；旧草稿保留在本机历史中。");
   };
   useEffect(() => {
-    if (isTauri())
-      void run("打开登录页", async () => {
+    if (!isTauri()) return;
+    void (async () => {
+      try {
         const b = await invoke<Bootstrap>("bootstrap");
-        setAuth({
-          status: "missing",
-          user: null,
-          message: "请输入个人访问令牌",
-        });
         setBoot({ ...b, authorized: false, user: null, metadata: null });
         setDraft(null);
+        if (b.rememberLogin) {
+          setRememberLogin(true);
+          await confirmLogin(await invoke<AuthResult>("check_auth"), true);
+        } else {
+          setAuth({ status: "missing", user: null, message: "请选择登录方式" });
+          setTab("auth");
+        }
+      } catch (failure) {
         setTab("auth");
-      });
-  }, []);
-  useEffect(() => {
-    if (!isTauri() || tab !== "history" || !boot?.authorized) return;
-    void run("读取云效历史", async () => {
-      setRemoteHistoryError("");
-      try {
-        const page = await invoke<HistoryPage>("list_remote_history", {
-          page: 1,
-        });
-        setRemoteHistory(page);
-        setRemoteHistoryPage(1);
-      } catch (e) {
-        setRemoteHistory(null);
-        const message = `云效历史读取失败：${remoteErrorMessage(e)}`;
-        setRemoteHistoryError(message);
-        await handleRemoteError(e, "云效历史读取失败");
+        setError(`登录恢复失败：${remoteErrorMessage(failure)}`);
+      } finally {
+        setRestoringLogin(false);
       }
-    });
-  }, [tab, boot?.authorized]);
+    })();
+  }, []);
   useEffect(() => {
     if (!isTauri() || !boot?.authorized || !draft?.sessionId) return;
     let active = true;
@@ -306,8 +584,14 @@ function App() {
       window.clearInterval(timer);
     };
   }, [boot?.authorized, draft?.id, draft?.sessionId]);
+  useEffect(() => {
+    setFieldErrors({});
+    setBackendIssues([]);
+    setDraftsToDelete(null);
+  }, [draft?.id, organizationId]);
   const update = (path: string, value: unknown) => {
     if (!draft) return;
+    setBackendIssues([]);
     const next = structuredClone(draft);
     const parts = path.split(".");
     let obj: Record<string, unknown> = next as unknown as Record<
@@ -323,6 +607,7 @@ function App() {
   };
   const changeType = async (typeId: string) => {
     if (!draft || !typeId) return;
+    setBackendIssues([]);
     await memoryWrite.current;
     const saved = dirty ? await save() : draft;
     const next = structuredClone(saved);
@@ -366,24 +651,165 @@ function App() {
       },
     );
   };
+  const inspectDevice = async (selectedSerial: string) => {
+    if (!selectedSerial || !draft) return;
+    if (session && session.serial !== selectedSerial) {
+      setFieldErrors((current) => ({
+        ...current,
+        "device.serial": "当前会话已绑定另一台设备，请先停止采集后再切换。",
+      }));
+      return;
+    }
+    setBackendIssues([]);
+    const epoch = ++deviceReadEpoch.current;
+    setFieldErrors((current) => ({ ...current, "device.serial": "" }));
+    const accountEpoch = workspaceEpoch.current;
+    const draftId = draft.id;
+    // Persist manual edits before the backend binds the read to this draft.
+    // The backend owns clearing canonical identity values on partial results;
+    // do not save a synthetic cleared draft and turn observed fields manual.
+    if (dirty) await save(draft);
+    try {
+      const snapshot = await invoke<Snapshot>("inspect_device", {
+        id: draftId,
+        serial: selectedSerial,
+      });
+      const persisted = await invoke<Bootstrap>("bootstrap");
+      if (
+        epoch !== deviceReadEpoch.current ||
+        accountEpoch !== workspaceEpoch.current
+      )
+        return;
+      const currentDraft = activeDraftRef.current;
+      if (
+        !currentDraft ||
+        currentDraft.id !== draftId ||
+        selectedSerialRef.current !== selectedSerial
+      )
+        return;
+      setDraft((current) => {
+        if (
+          !current ||
+          current.id !== draftId ||
+          selectedSerialRef.current !== selectedSerial
+        )
+          return current;
+        const merged = structuredClone(current);
+        const stored = persisted.drafts.find((item) => item.id === draftId);
+        const observed = stored ?? null;
+        merged.app = {
+          ...merged.app,
+          ...(observed?.app ?? snapshot.app),
+        };
+        merged.device = { ...(observed?.device ?? snapshot.device) };
+        merged.bugPage = observed?.bugPage ?? snapshot.bugPage ?? "";
+        merged.sources = {
+          ...current.sources,
+          ...(observed?.sources ?? snapshot.sources),
+        };
+        merged.collectionErrors = observed?.collectionErrors ?? snapshot.errors;
+        if (observed?.buildStatus) merged.buildStatus = observed.buildStatus;
+        merged.previewConfirmed = false;
+        return merged;
+      });
+      setNotice(
+        snapshot.errors.length
+          ? "设备信息已读取，部分字段需要人工补充。"
+          : "已读取当前设备和配置应用信息。",
+        snapshot.errors.length ? "warning" : "success",
+      );
+      setDirty(false);
+    } catch (error) {
+      if (
+        epoch === deviceReadEpoch.current &&
+        accountEpoch === workspaceEpoch.current
+      )
+        setFieldErrors((current) => ({
+          ...current,
+          "device.serial": `设备信息读取失败：${remoteErrorMessage(error)}`,
+        }));
+    }
+  };
+  const refreshDevices = async (rereadSelected = true) => {
+    let found: Device[];
+    try {
+      found = await invoke<Device[]>("list_devices");
+    } catch (error) {
+      selectedSerialRef.current = "";
+      setSerial("");
+      setDevices([]);
+      throw error;
+    }
+    setDevices(found);
+    const boundSerial = session?.serial || selectedSerialRef.current;
+    const selected =
+      found.find((item) => item.serial === boundSerial) ??
+      found.find((item) => item.state === "device") ??
+      found[0];
+    if (selected) {
+      selectedSerialRef.current = selected.serial;
+      setSerial(selected.serial);
+      if (!session && (rereadSelected || selected.serial !== boundSerial))
+        await inspectDevice(selected.serial);
+    } else {
+      selectedSerialRef.current = "";
+      setSerial("");
+    }
+  };
+  useEffect(() => {
+    if (tab !== "new") {
+      homeDeviceRefreshKey.current = "";
+      return;
+    }
+    if (!boot?.authorized || !draft) return;
+    const key = `${organizationId}:${projectId}:${draft.id}`;
+    if (homeDeviceRefreshKey.current === key || busyGate.current) return;
+    homeDeviceRefreshKey.current = key;
+    void run("刷新设备", refreshDevices, "device.serial");
+  }, [tab, boot?.authorized, draft?.id, organizationId, projectId, busy]);
   const save = async (d = draft) => {
     if (!d) throw "请先创建草稿";
     const saved = await invoke<Draft>("save_draft", {
       draft: draftSchema.parse(d),
     });
     setDraft(saved);
+    setBoot((current) =>
+      current
+        ? {
+            ...current,
+            drafts: current.drafts.map((item) =>
+              item.id === saved.id ? saved : item,
+            ),
+          }
+        : current,
+    );
     setDirty(false);
+    setNotice("草稿已保存在本机。");
     return saved;
   };
   const mutate = async (
     command: string,
     args: Record<string, unknown> = {},
   ) => {
+    setBackendIssues([]);
     const d = await save();
     const next = await invoke<Draft>(command, { id: d.id, ...args });
     setDraft(next);
     setDirty(false);
     await refresh();
+  };
+  const importAttachments = async () => {
+    try {
+      await mutate("import_attachment");
+      setNotice("附件已导入");
+    } catch (failure) {
+      if (remoteErrorMessage(failure).trim() === "已取消") {
+        setNotice("已取消导入附件", "warning");
+        return;
+      }
+      setNotice("");
+      throw failure;
+    }
   };
   const newDraft = async () => {
     if (!boot?.authorized || !profileConfigured(boot.profile) || !projectId) {
@@ -396,13 +822,15 @@ function App() {
     setTab("new");
     await refresh();
   };
-  const confirmLogin = async () => {
+  const confirmLogin = async (restoredResult?: AuthResult, quiet = false) => {
     let result: AuthResult;
     try {
-      result = await invoke<AuthResult>("login", {
-        token,
-        remember: false,
-      });
+      result =
+        restoredResult ??
+        (await invoke<AuthResult>("login", {
+          token,
+          remember: rememberLogin,
+        }));
     } catch (e) {
       setToken("");
       await invalidateAuth(
@@ -413,22 +841,41 @@ function App() {
     setToken("");
     setAuth(result);
     if (result.status !== "valid") {
+      if (restoredResult && result.status === "invalid") {
+        await invoke("clear_auth");
+        setRememberLogin(false);
+      }
       setTab(tabForAuth(result));
-      setError(result.message || "令牌校验失败，请重新输入。");
+      setError(
+        result.status === "missing"
+          ? ""
+          : result.message || "登录校验失败，请重新登录。",
+      );
       setBoot((b) => (b ? { ...b, authorized: false, user: result.user } : b));
       return;
     }
+    setError("");
+    setNotice("");
     const next = await refresh();
     setBoot({ ...next, authorized: true, user: result.user });
     setTab("new");
     let validProject = false;
+    let packageReady = false;
     try {
-      validProject = await loadWorkspace(next.profile);
+      const workspace = await loadWorkspace(next.profile);
+      validProject = workspace.valid;
+      packageReady = workspace.packageReady;
+      if (workspace.valid) {
+        setBoot((current) =>
+          current ? { ...current, profile: workspace.profile } : current,
+        );
+        next.profile = workspace.profile;
+      }
     } catch (e) {
-      await handleRemoteError(e, "云效项目读取失败");
+      await handleRemoteError(e, "云效项目读取失败", "projectId");
       return;
     }
-    if (profileConfigured(next.profile) && validProject) {
+    if (profileConfigured(next.profile) && validProject && packageReady) {
       try {
         await loadProjectMetadataAndDraft(next.profile);
       } catch (e) {
@@ -437,79 +884,435 @@ function App() {
       }
     }
     setTab("new");
-    setNotice("登录成功，已进入新建提交。");
+    if (!quiet) setNotice("登录成功，已进入新建提交。");
   };
-  const issues =
+  const logout = async () => {
+    if (dirty && draft) await save();
+    await memoryWrite.current;
+    workspaceEpoch.current += 1;
+    await invoke("clear_auth");
+    setRememberLogin(false);
+    memoryWrite.current = Promise.resolve();
+    setSession(null);
+    selectedSerialRef.current = "";
+    setSerial("");
+    setDevices([]);
+    setBuildUrl("");
+    setBusiness("");
+    setDraft(null);
+    setDirty(false);
+    setProjectSettings({ entries: [] });
+    setAppliedProjectSettings({ entries: [] });
+    setSettingsDirty(false);
+    setSettingsQuery("");
+    setSettingsEnabledOnly(false);
+    setSettingsPackageOnly(false);
+    setFieldErrors({});
+    setAuth({ status: "missing", user: null, message: "未登录" });
+    setOrganizations([]);
+    setProjects([]);
+    setBoot((current) =>
+      current
+        ? {
+            ...current,
+            profile: initialWorkspace().profile,
+            authorized: false,
+            user: null,
+            metadata: null,
+            drafts: [],
+            draftScopes: {},
+            submissions: [],
+            sessions: [],
+            captures: [],
+          }
+        : current,
+    );
+    setTab("auth");
+  };
+  const clientIssues =
     draft && boot
       ? validateDraft(draft, boot.profile, boot.metadata, boot.authorized)
       : [];
+  const issues = [
+    ...new Map(
+      [...clientIssues, ...backendIssues].map((issue) => [
+        issue.field + "\0" + issue.message,
+        issue,
+      ]),
+    ).values(),
+  ];
   const frozen = !!boot?.submissions.some((s) => s.draftId === draft?.id);
   const capturePending = (boot?.captures ?? []).some(
     (t) => t.draftId === draft?.id && t.status === "pending",
   );
+  const deviceConnected = devices.some(
+    (device) => device.serial === serial && device.state === "device",
+  );
   const currentSubmission = boot?.submissions.find(
     (s) => s.draftId === draft?.id,
   );
+  const submittedDraftIds = new Set(
+    boot?.submissions
+      .filter((submission) => submission.state === "submitted")
+      .map((submission) => submission.draftId),
+  );
+  const selectableDrafts = (boot?.drafts ?? []).filter((item) => {
+    const scope = boot?.draftScopes?.[item.id];
+    return (
+      scope?.organizationId === organizationId &&
+      scope.projectId === projectId &&
+      !submittedDraftIds.has(item.id)
+    );
+  });
+  useEffect(() => {
+    if (currentSubmission?.state !== "submitted") return;
+    setDraft(selectableDrafts[0] ?? null);
+    setDirty(false);
+    setPreview(false);
+  }, [draft?.id, currentSubmission?.state]);
+  const changeDraft = async (id: string) => {
+    if (id === draft?.id) return;
+    if (dirty && draft && !frozen) await save();
+    const next = selectableDrafts.find((item) => item.id === id);
+    if (!next) throw "草稿已不可用，请刷新后重试";
+    setDraft(next);
+    setDirty(false);
+    setPreview(false);
+  };
+  const canDeleteDraft = (item: Draft) => {
+    if (boot?.submissions.some((submission) => submission.draftId === item.id))
+      return false;
+    if (
+      (boot?.captures ?? []).some(
+        (capture) =>
+          capture.draftId === item.id && capture.status === "pending",
+      )
+    )
+      return false;
+    if (item.sessionId)
+      return !!boot?.sessions.find(
+        (entry) => entry.id === item.sessionId && entry.stoppedAt,
+      );
+    return true;
+  };
+  const deleteDrafts = async () => {
+    if (!draftsToDelete?.length) return;
+    const ids = draftsToDelete.map((item) => item.id);
+    const removed = new Set(ids);
+    const deletingCurrent = !!draft && removed.has(draft.id);
+    await memoryWrite.current;
+    if (!deletingCurrent && dirty && draft && !frozen) await save();
+    if (ids.length === 1) await invoke("delete_draft", { id: ids[0] });
+    else await invoke("delete_drafts", { ids });
+    const next = selectableDrafts.find((item) => !removed.has(item.id)) ?? null;
+    setDraftsToDelete(null);
+    setBoot((current) => {
+      if (!current) return current;
+      const scopes = { ...current.draftScopes };
+      ids.forEach((id) => delete scopes[id]);
+      return {
+        ...current,
+        drafts: current.drafts.filter((item) => !removed.has(item.id)),
+        draftScopes: scopes,
+      };
+    });
+    if (deletingCurrent) {
+      setDraft(next);
+      setDirty(false);
+      setPreview(false);
+    }
+    setNotice(
+      ids.length > 1 ? `已删除 ${ids.length} 个草稿。` : "草稿已删除。",
+    );
+    await refresh();
+  };
+  const draftScope = draft ? boot?.draftScopes?.[draft.id] : undefined;
+  const configuredPackage = configuredProjectPackage(
+    appliedProjectSettings,
+    projectId,
+  );
+  const mainPackageReady = Boolean(projectId && configuredPackage);
+  useEffect(() => {
+    if (
+      !draft ||
+      !configuredPackage ||
+      draftScope?.organizationId !== organizationId ||
+      draftScope?.projectId !== projectId ||
+      draft.app.packageName === configuredPackage
+    )
+      return;
+    setDraft((current) =>
+      current && current.id === draft.id
+        ? {
+            ...current,
+            app: { ...current.app, packageName: configuredPackage },
+            previewConfirmed: false,
+          }
+        : current,
+    );
+    setDirty(true);
+    setPreview(false);
+  }, [
+    configuredPackage,
+    draft?.id,
+    draft?.app.packageName,
+    draftScope?.organizationId,
+    draftScope?.projectId,
+    organizationId,
+    projectId,
+  ]);
+  const updatePostCapture = ({ draft: stored, jobs }: PostCaptureSnapshot) => {
+    setBoot((current) =>
+      current
+        ? {
+            ...current,
+            captures: [
+              ...(current.captures || []).filter(
+                (task) =>
+                  task.kind !== "post-capture" || task.draftId !== stored.id,
+              ),
+              ...jobs,
+            ],
+          }
+        : current,
+    );
+    setDraft((current) => {
+      if (
+        !current ||
+        current.id !== stored.id ||
+        JSON.stringify(current.attachments) ===
+          JSON.stringify(stored.attachments)
+      )
+        return current;
+      setPreview(false);
+      return {
+        ...current,
+        attachments: stored.attachments,
+        previewConfirmed: false,
+      };
+    });
+  };
+  const noEnabledProjects = Boolean(
+    organizationId &&
+    projects.length &&
+    !enabledProjects(projects, appliedProjectSettings).length,
+  );
+  const normalizedSettingsQuery = settingsQuery.trim().toLocaleLowerCase();
+  const visibleSettingsProjects = projects.filter((project) => {
+    const setting = projectSettings.entries.find(
+      (item) => item.projectId === project.id,
+    );
+    if (settingsEnabledOnly && !setting?.enabled) return false;
+    if (settingsPackageOnly && !setting?.packageName.trim()) return false;
+    if (!normalizedSettingsQuery) return true;
+    return `${project.name} ${setting?.packageName ?? ""}`
+      .toLocaleLowerCase()
+      .includes(normalizedSettingsQuery);
+  });
   const value = (path: string) =>
     path
       .split(".")
       .reduce<unknown>((v, p) => (v as Record<string, unknown>)?.[p], draft) ??
     "";
+  const issueMessages = (path: string, aliases: string[] = []) =>
+    issues
+      .filter(
+        (item) =>
+          item.field === path ||
+          aliases.includes(item.field) ||
+          (nativeAliases[path] ?? []).includes(item.field),
+      )
+      .map((item) => item.message)
+      .filter((message, index, all) => all.indexOf(message) === index);
+  const issueRoutes = draft ? routeIssues(draft, issues) : {};
+  const routedMessages = (path: string) => issueRoutes[path] ?? [];
+  const nativeAliases = (() => {
+    const aliases: Record<string, string[]> = {};
+    for (const f of boot?.metadata?.fields ?? []) {
+      const target = nativeTarget(f, boot!.profile);
+      if (target) {
+        const path =
+          target === "subject"
+            ? "title"
+            : target === "description"
+              ? "actual"
+              : target;
+        (aliases[path] ??= []).push(`customFields.${f.id}`);
+      }
+    }
+    return aliases;
+  })();
+  const issueLabel = (path: string) =>
+    ({
+      title: "问题标题",
+      actual: "问题表现",
+      "app.packageName": "项目包名配置",
+      "app.versionName": "versionName",
+      "app.versionCode": "versionCode",
+      "app.channel": "渠道",
+      "device.model": "设备型号",
+      "device.androidVersion": "Android 版本",
+      "device.totalMemKb": "总内存（kB）",
+      "device.availableMemKb": "当前可用内存（kB）",
+      "device.resolution": "分辨率（像素）",
+      "device.density": "屏幕密度（dpi）",
+      "event.occurredAt": "真实问题时间（含时区）",
+      "event.sourceNote": "事件时间来源 / 修改依据",
+      preconditions: "复现条件",
+      steps: "复现步骤",
+      expected: "期望表现",
+      assignedTo: "负责人",
+      sprint: "迭代",
+      versions: "版本",
+      project: "当前项目配置",
+      scope: "迭代",
+      frequency: "发生频率",
+      attachments: "证据附件",
+      "network.operation": "网络操作",
+      "network.type": "网络类型",
+      "network.error": "可观察错误",
+      "network.collectionStatus": "错误码 / 请求 ID 采集状态",
+      "data.type": "数据类型",
+      "data.count": "数据数量",
+      "data.source": "数据来源",
+      "frequency.attempts": "尝试次数",
+      "frequency.occurrences": "发生次数",
+      workitemTypeId: "云效 Bug 类型",
+      kind: "问题类型",
+    })[path] ?? path;
+  const issueNavigationLabel = (path: string) => {
+    if (path.startsWith("attachment.")) return "证据附件";
+    if (path.startsWith("customFields.")) {
+      const id = path.slice("customFields.".length);
+      const f = boot?.metadata?.fields.find((item) => item.id === id);
+      return f?.name ?? id;
+    }
+    return issueLabel(path);
+  };
+  const issueNavigationTarget = (path: string) => {
+    if (path === "scope") return "field-sprint";
+    if (path === "project") return "field-projectId";
+    if (path === "frequency") return "field-frequency.occurrences";
+    if (path === "attachments") {
+      const target = Object.keys(issueRoutes).find((key) =>
+        key.startsWith("attachment"),
+      );
+      return target ? `field-${target}` : "field-attachment-import";
+    }
+    if (path.startsWith("customFields.")) {
+      const target = Object.entries(nativeAliases).find(([, ids]) =>
+        ids.includes(path),
+      )?.[0];
+      if (target) return `field-${target}`;
+    }
+    return `field-${path}`;
+  };
+  const issueNavigationGroups = groupIssuesByNavigationTarget(
+    issues.filter((item) => item.field !== "previewConfirmed"),
+    issueNavigationTarget,
+  );
   const field = (
     path: string,
     label: string,
-    opts: { type?: string; hint?: string; multi?: boolean } = {},
-  ) => (
-    <label className="field" id={`field-${path}`} key={path}>
-      <span>
-        {label}
-        {draft?.sources[path] && (
-          <small className={`source ${draft.sources[path].status}`}>
-            {draft.sources[path].status === "collected"
-              ? "自动采集"
-              : draft.sources[path].status === "failed"
-                ? "采集失败，待补"
+    opts: {
+      type?: string;
+      hint?: string;
+      multi?: boolean;
+      warning?: string;
+      aliases?: string[];
+      required?: boolean;
+      fullWidth?: boolean;
+    } = {},
+  ) => {
+    const text = String(value(path));
+    const messages = issueMessages(path, [
+      ...(nativeAliases[path] ?? []),
+      ...(opts.aliases ?? []),
+    ]);
+    const missingInput = (message: string) =>
+      message.startsWith("请补充") ||
+      message === "请逐行填写可执行的复现步骤" ||
+      message === "发生次数应为 1 至尝试次数之间的整数";
+    const hint =
+      opts.hint ??
+      (messages.some(missingInput)
+        ? `请填写${label.replace(/（必填）$/, "")}`
+        : undefined);
+    return (
+      <label
+        className={`field${opts.fullWidth ? " wide" : ""}`}
+        id={`field-${path}`}
+        key={path}
+      >
+        <span>
+          {label}
+          {draft?.sources[path] && draft.sources[path].status !== "failed" && (
+            <small className={`source ${draft.sources[path].status}`}>
+              {draft.sources[path].status === "collected"
+                ? "自动采集"
                 : "人工补充"}
+            </small>
+          )}
+        </span>
+        {opts.multi ? (
+          <textarea
+            value={text}
+            onChange={(e) => update(path, e.target.value)}
+            rows={3}
+            placeholder={hint}
+            required={opts.required}
+          />
+        ) : (
+          <input
+            type={opts.type ?? "text"}
+            value={text}
+            onChange={(e) => update(path, e.target.value)}
+            placeholder={hint}
+            required={opts.required}
+          />
+        )}
+        {!text.trim() && draft?.sources[path]?.status === "failed" && (
+          <small className="error-text">
+            {path === "bugPage" ? "未能自动读取当前页面" : "未能自动读取该信息"}
           </small>
         )}
-      </span>
-      {opts.multi ? (
-        <textarea
-          value={String(value(path))}
-          onChange={(e) => update(path, e.target.value)}
-          rows={3}
-        />
-      ) : (
-        <input
-          type={opts.type ?? "text"}
-          value={String(value(path))}
-          onChange={(e) => update(path, e.target.value)}
-          placeholder={opts.hint}
-        />
-      )}
-      <small>
-        {issues.find((i) => i.field === path)?.message ?? opts.hint}
-      </small>
-    </label>
-  );
+        {opts.warning && <small className="warning-text">{opts.warning}</small>}
+        {messages
+          .filter((message) => text.trim() || !missingInput(message))
+          .map((message) => (
+            <small className="error-text" key={message}>
+              {message}
+            </small>
+          ))}
+      </label>
+    );
+  };
   const select = (
     path: string,
     label: string,
     options: Option[],
     multiple = false,
     optionError?: string,
+    aliases: string[] = [],
+    autoSelectFirst = true,
   ) => (
     <label className="field" id={`field-${path}`} key={path}>
       <span>{label}</span>
-      <select
+      <CustomSelect
         multiple={multiple}
-        value={multiple ? (value(path) as string[]) : String(value(path))}
-        onChange={(e) => {
-          const nextValue = multiple
-            ? Array.from(e.target.selectedOptions, (o) => o.value)
-            : e.target.value;
+        autoSelectFirst={autoSelectFirst}
+        value={
+          multiple ? ((value(path) as string[]) ?? []) : String(value(path))
+        }
+        options={options}
+        label={label}
+        onChange={(nextValue) => {
           if (path === "workitemTypeId" && !multiple) {
-            void run("读取类型字段", () => changeType(String(nextValue)));
+            void run(
+              "读取类型字段",
+              () => changeType(String(nextValue)),
+              "workitemTypeId",
+            );
             return;
           }
           update(path, nextValue);
@@ -523,32 +1326,76 @@ function App() {
             rememberSelections(next);
           }
         }}
-      >
-        {!multiple && <option value="">请选择</option>}
-        {options.map((o) => (
-          <option key={o.id} value={o.id}>
-            {o.name}
-            {(o as Option & { description?: string }).description
-              ? ` · ${(o as Option & { description?: string }).description}`
-              : ""}
-          </option>
-        ))}
-      </select>
-      <small>
-        {issues.find((i) => i.field === path)?.message ??
-          optionError ??
-          (!options.length ? "API 暂未提供可选值" : "")}
-      </small>
+      />
+      {issueMessages(path, [
+        ...(nativeAliases[path] ?? []),
+        ...aliases,
+        ...(path === "versions" || path === "sprint" ? ["scope"] : []),
+      ]).map((message) => (
+        <small className="error-text" key={message}>
+          {message}
+        </small>
+      ))}
+      {optionError && <small className="error-text">{optionError}</small>}
+      {fieldError(path)}
     </label>
   );
-  const dynamicFields = boot?.metadata ? (
-    <section className="card dynamic-fields">
-      <div className="card-title">
-        <h2>云效关键字段</h2>
-        <span className="section-hint">选项来自当前项目</span>
-      </div>
-      <div className="grid">
+  const fallbackIssues = issues.filter(
+    (item) =>
+      !new Set([
+        "title",
+        "actual",
+        "kind",
+        "workitemTypeId",
+        "assignedTo",
+        "sprint",
+        "versions",
+        "scope",
+        "project",
+        "frequency",
+        "event.occurredAt",
+        "event.sourceNote",
+        "preconditions",
+        "steps",
+        "expected",
+        "attachments",
+        "previewConfirmed",
+        "app.packageName",
+        "app.versionName",
+        "app.versionCode",
+        "app.channel",
+        "device.model",
+        "device.androidVersion",
+        "device.totalMemKb",
+        "device.availableMemKb",
+        "device.resolution",
+        "device.density",
+        "frequency.attempts",
+        "frequency.occurrences",
+        "network.operation",
+        "network.type",
+        "network.error",
+        "network.collectionStatus",
+        "data.type",
+        "data.count",
+        "data.source",
+      ]).has(item.field) &&
+      !(item.field.startsWith("customFields.") && boot?.metadata),
+  );
+  const dropdownFormats = new Set([
+    "list",
+    "multiList",
+    "user",
+    "multiUser",
+    "sprint",
+    "version",
+    "tag",
+  ]);
+  const dynamicFields = (dropdowns: boolean) =>
+    boot?.metadata ? (
+      <>
         {boot.metadata.fields
+          .filter((f) => !excludedField(f, boot.profile))
           .filter(
             (f) =>
               ![
@@ -559,7 +1406,13 @@ function App() {
                 "versions",
               ].includes(nativeTarget(f, boot.profile) ?? ""),
           )
-          .filter((f) => f.showWhenCreate !== false || f.required)
+          .filter(
+            (f) =>
+              f.showWhenCreate !== false ||
+              f.required ||
+              boot.profile.requiredFieldIds.includes(f.id),
+          )
+          .filter((f) => dropdownFormats.has(f.format) === dropdowns)
           .map((f) => {
             const path = `customFields.${f.id}`;
             const opts = ["user", "multiUser"].includes(f.format)
@@ -571,38 +1424,97 @@ function App() {
                   : f.options;
             if (!supportedFormats.has(f.format))
               return (
-                <p className="banner error" key={f.id}>
-                  「{f.name}」格式 {f.format} 未支持，请完善映射或实现后再提交。
-                </p>
+                <div
+                  className="field field-error-item"
+                  id={`field-${path}`}
+                  key={f.id}
+                >
+                  <span>{f.name}</span>
+                  <small className="error-text">
+                    「{f.name}」格式 {f.format}{" "}
+                    未支持，请完善映射或实现后再提交。
+                  </small>
+                  {issueMessages(path, nativeAliases[path] ?? []).map(
+                    (message) => (
+                      <small className="error-text" key={message}>
+                        {message}
+                      </small>
+                    ),
+                  )}
+                </div>
               );
-            if (
-              [
-                "list",
-                "multiList",
-                "user",
-                "multiUser",
-                "sprint",
-                "version",
-                "tag",
-              ].includes(f.format)
-            ) {
+            if (dropdownFormats.has(f.format)) {
               return select(
                 path,
-                `${f.name}${f.required ? "（必填）" : ""}`,
+                f.name,
                 opts,
                 ["multiList", "multiUser", "version", "tag"].includes(f.format),
                 f.optionError,
+                [],
+                !defaultUnchecked(f, boot.profile),
               );
             }
-            return field(path, `${f.name}${f.required ? "（必填）" : ""}`, {
+            return field(path, f.name, {
               multi: f.format === "text",
               type: f.format === "date" ? "date" : "text",
+              hint:
+                f.format === "int"
+                  ? "请输入整数"
+                  : f.format === "float"
+                    ? "请输入数值"
+                    : f.format === "dateTime"
+                      ? "例如 2026-10-10T14:30:00+08:00"
+                      : undefined,
             });
           })}
-      </div>
-      {!boot.metadata.fields.length && <p>当前类型没有额外字段。</p>}
-    </section>
-  ) : null;
+        {!dropdowns &&
+          boot.metadata.fields
+            .filter((f) => excludedField(f, boot.profile))
+            .filter((f) => issueMessages(`customFields.${f.id}`).length > 0)
+            .map((f) => (
+              <div
+                className="field field-error-item"
+                id={`field-customFields.${f.id}`}
+                key={`removed-${f.id}`}
+              >
+                <span>{f.name}</span>
+                {issueMessages(`customFields.${f.id}`).map((message) => (
+                  <small className="error-text" key={message}>
+                    {message}
+                  </small>
+                ))}
+              </div>
+            ))}
+        {!dropdowns &&
+          issues
+            .filter((item) => item.field.startsWith("customFields."))
+            .filter(
+              (item, index, all) =>
+                all.findIndex((other) => other.field === item.field) ===
+                  index &&
+                !boot.metadata!.fields.some(
+                  (field) => `customFields.${field.id}` === item.field,
+                ),
+            )
+            .map((item) => (
+              <div
+                className="field field-error-item"
+                id={`field-${item.field}`}
+                key={`stale-${item.field}`}
+              >
+                <span>{issueNavigationLabel(item.field)}</span>
+                {issueMessages(item.field).map((message) => (
+                  <small className="error-text" key={message}>
+                    {message}
+                  </small>
+                ))}
+              </div>
+            ))}
+        {!dropdowns && !boot.metadata.fields.length && (
+          <p className="wide">当前类型没有额外字段。</p>
+        )}
+      </>
+    ) : null;
   if (!isTauri())
     return (
       <main className="browser-message">
@@ -611,10 +1523,11 @@ function App() {
         <code>npm run dev</code>
       </main>
     );
+  if (restoringLogin) return <LoginRestoring />;
   if (!boot)
     return (
       <main className="browser-message">
-        <h1>打开登录页</h1>
+        <h1>Android Bug Desk</h1>
         <p>{error || "正在读取本机数据…"}</p>
       </main>
     );
@@ -628,46 +1541,114 @@ function App() {
               Android Bug Desk<small>测试证据工作台</small>
             </div>
           </div>
-          <div className="nav-caption">工作台</div>
           <nav>
             {[
-              ["new", "01", "新建提交"],
-              ["history", "02", "历史提交"],
-            ].map(([id, num, title]) => (
+              ["new", "新建提交"],
+              ["history", "历史提交"],
+              ["settings", "设置"],
+            ].map(([id, title]) => (
               <button
                 className={tab === id ? "active" : ""}
                 onClick={() => setTab(id)}
                 key={id}
               >
-                <span>{num}</span>
                 {title}
               </button>
             ))}
           </nav>
           <div className="aside-status">
             <UserProfile key={boot.user?.id || "anonymous"} user={boot.user} />
-            <small>
-              {boot.profile.name}
-              <br />
-              v0.1.0 · 本地优先
-            </small>
           </div>
         </aside>
       )}
-      <main>
-        {boot.authorized && (
-          <header>
-            <div>
-              <span className="eyebrow">Android 缺陷工作台</span>
-              <h1>{tab === "history" ? "历史提交" : "新建提交"}</h1>
-              <p>
-                {tab === "history"
-                  ? "查看本机持久记录和云效已创建的历史 Bug。"
-                  : "连接设备，补齐 Bug 关键信息并提交可追溯证据。"}
-              </p>
-            </div>
-            <div className="header-actions">
+      <main className={tab === "new" ? "home-main" : undefined}>
+        {boot.authorized && tab === "new" && (
+          <header className="page-header">
+            <h1>新建提交</h1>
+            <div className="header-selectors">
+              <label className="field" id="field-projectId">
+                <span>项目</span>
+                <CustomSelect
+                  value={projectId}
+                  options={enabledProjects(projects, appliedProjectSettings)}
+                  label="当前项目"
+                  disabled={
+                    !organizationId || noEnabledProjects || !!busy || !!session
+                  }
+                  onChange={(next) =>
+                    void run(
+                      "切换项目",
+                      async () => {
+                        try {
+                          await selectProject(organizationId, String(next));
+                        } catch (error) {
+                          await handleRemoteError(
+                            error,
+                            "云效项目切换失败",
+                            "projectId",
+                          );
+                        }
+                      },
+                      "projectId",
+                    )
+                  }
+                />
+                {issueMessages("project").map((message) => (
+                  <small className="error-text" key={message}>
+                    {message}
+                  </small>
+                ))}
+                {fieldError("projectId")}
+                {noEnabledProjects && (
+                  <small className="error-text" role="alert">
+                    当前组织没有启用项目，请前往“设置”启用至少一个项目后再新建或提交。
+                  </small>
+                )}
+              </label>
+              <label className="field header-draft-field" id="field-draft.id">
+                <span>草稿</span>
+                <CustomSelect
+                  value={draft?.id ?? ""}
+                  options={selectableDrafts.map((item) => ({
+                    id: item.id,
+                    name: `${item.title || "未命名草稿"} · ${new Date(item.createdAt).toLocaleString()}`,
+                  }))}
+                  label="当前草稿"
+                  selectionIndicator="start"
+                  optionAction={{
+                    label: "删除",
+                    disabled: (option) => {
+                      const item = selectableDrafts.find(
+                        (entry) => entry.id === option.id,
+                      );
+                      return !item || !canDeleteDraft(item);
+                    },
+                    onClick: (option) => {
+                      const item = selectableDrafts.find(
+                        (entry) => entry.id === option.id,
+                      );
+                      if (item && canDeleteDraft(item))
+                        setDraftsToDelete([item]);
+                    },
+                  }}
+                  footerAction={{
+                    label: "删除全部",
+                    disabled: !selectableDrafts.every(canDeleteDraft),
+                    onClick: () => setDraftsToDelete([...selectableDrafts]),
+                  }}
+                  disabled={!!busy || !!session || !selectableDrafts.length}
+                  onChange={(next) =>
+                    void run(
+                      "切换草稿",
+                      () => changeDraft(String(next)),
+                      "draft.id",
+                    )
+                  }
+                />
+                {fieldError("draft.id")}
+              </label>
               <button
+                className="header-action-button primary"
                 disabled={
                   !profileConfigured(boot.profile) || !projectId || !!busy
                 }
@@ -676,364 +1657,261 @@ function App() {
               >
                 ＋ 新建问题
               </button>
-              {draft && (
-                <span className="pill">
-                  {frozen ? "证据已固定" : dirty ? "草稿未保存" : "草稿已保存"}
-                </span>
-              )}
-              <button
-                onClick={() =>
-                  void run("退出登录", async () => {
-                    if (dirty && draft) await save();
-                    await memoryWrite.current;
-                    workspaceEpoch.current += 1;
-                    await invoke("clear_auth");
-                    memoryWrite.current = Promise.resolve();
-                    setSession(null);
-                    setSerial("");
-                    setDevices([]);
-                    setPackageName("");
-                    setBuildUrl("");
-                    setBusiness("");
-                    setDraft(null);
-                    setDirty(false);
-                    setAuth({
-                      status: "missing",
-                      user: null,
-                      message: "未登录",
-                    });
-                    setOrganizations([]);
-                    setProjects([]);
-                    setRemoteHistory(null);
-                    setBoot((b) =>
-                      b
-                        ? {
-                            ...b,
-                            authorized: false,
-                            user: null,
-                            metadata: null,
-                          }
-                        : b,
-                    );
-                    setTab("auth");
-                  })
-                }
-              >
-                退出登录
-              </button>
             </div>
           </header>
         )}
-        {boot.authorized && busy && (
-          <div className="banner loading" role="status">
-            {busy}…
-          </div>
-        )}
-        {boot.authorized && error && (
-          <div className="banner error" role="alert">
-            {error}
-          </div>
-        )}
-        {boot.authorized && notice && (
-          <div className="banner success" role="status">
-            {notice}
-          </div>
-        )}
         {tab === "auth" && (
-          <section className="card login-card" aria-labelledby="login-title">
-            <div className="login-brand">
-              <span className="login-mark" aria-hidden="true">
-                A
-              </span>
-              <span>Android Bug Desk</span>
-            </div>
-            <h2 id="login-title">登录云效</h2>
-            <p className="login-intro">输入个人访问令牌，进入缺陷工作台。</p>
-            {(error ||
-              (auth &&
-                auth.status !== "missing" &&
-                auth.status !== "valid" &&
-                auth.message)) && (
-              <div className="banner error" role="alert">
-                {error || auth?.message}
-              </div>
-            )}
-            {busy && (
-              <div className="banner loading" role="status">
-                {busy}…
-              </div>
-            )}
-            <form
-              className="login-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void run("验证授权", confirmLogin);
-              }}
-            >
-              <label className="field">
-                <span>个人访问令牌</span>
-                <input
-                  autoComplete="off"
-                  type="password"
-                  value={token}
-                  onChange={(e) => setToken(e.target.value)}
-                  placeholder="输入你的个人访问令牌"
-                />
-              </label>
-              <button
-                type="submit"
-                className="primary"
-                disabled={!token || !!busy}
-              >
-                确定
-              </button>
-            </form>
-            <p className="login-note">令牌仅在本次会话中使用</p>
-          </section>
+          <LoginCard
+            token={token}
+            setToken={setToken}
+            remember={rememberLogin}
+            setRemember={setRememberLogin}
+            method={boot.loginMethod ?? (rememberLogin ? "pat" : "oauth")}
+            error={
+              error ||
+              (auth && auth.status !== "missing" && auth.status !== "valid"
+                ? auth.message
+                : "")
+            }
+            busy={!!busy}
+            onPatLogin={() => void run("验证登录", () => confirmLogin())}
+            onAuthorized={async (result) => {
+              await run("载入工作台", () => confirmLogin(result));
+            }}
+          />
         )}
-        {tab === "new" && (
+        {tab === "settings" && (
           <>
-            <section className="card connection-card">
+            <section className="card settings-card">
               <div className="card-title">
-                <h2>USB 设备</h2>
+                <h2>账号与组织</h2>
                 <button
-                  onClick={() =>
-                    void run("刷新设备", async () =>
-                      setDevices(await invoke<Device[]>("list_devices")),
+                  disabled={!!session || !!busy || settingsBusy}
+                  onClick={() => void run("退出登录", logout)}
+                >
+                  退出登录
+                </button>
+              </div>
+              <label className="field">
+                <span>组织</span>
+                <CustomSelect
+                  value={organizationId}
+                  options={organizations}
+                  label="组织"
+                  disabled={!!session || !!busy || settingsBusy}
+                  onChange={(next) =>
+                    void run(
+                      "切换组织",
+                      () => selectOrganization(String(next)),
+                      "organizationId",
                     )
                   }
-                >
-                  刷新设备
-                </button>
-              </div>
-              <p className="muted-text">
-                {boot.adbPath
-                  ? `已找到 ADB：${boot.adbPath}`
-                  : "未检测到 Platform Tools。请选择 adb，或从 Android 官方网站安装。"}
-              </p>
-              <button
-                onClick={() =>
-                  void run("选择 ADB", async () => {
-                    await invoke("choose_adb");
-                    await refresh();
-                  })
-                }
-              >
-                选择 ADB 路径
-              </button>
-              <label className="field">
-                <span>目标设备</span>
-                <select
-                  value={serial}
-                  onChange={(e) => setSerial(e.target.value)}
-                >
-                  <option value="">明确选择一台设备</option>
-                  {devices.map((d) => (
-                    <option key={d.serial} value={d.serial}>
-                      {d.label}
-                    </option>
-                  ))}
-                </select>
-                <small>
-                  {devices.find((d) => d.serial === serial)?.state ===
-                  "unauthorized"
-                    ? "请在手机上允许 USB 调试授权"
-                    : devices.find((d) => d.serial === serial)?.state ===
-                        "offline"
-                      ? "设备离线，请重新连接 USB"
-                      : ""}
-                </small>
+                />
+                {fieldError("organizationId")}
               </label>
+              <p className="muted-text">
+                组织切换会保存当前草稿，并建立新的项目草稿。
+              </p>
             </section>
-            {tab === "new" && boot.authorized && (
-              <section className="card project-selector">
-                <div className="card-title">
-                  <h2>云效项目</h2>
-                  <div className="actions">
-                    <span className="pill">当前账号可访问范围</span>
+            <section className="card settings-card">
+              <div className="card-title">
+                <h2>项目配置</h2>
+                <div className="actions">
+                  <button
+                    disabled={!!session || !!busy || settingsBusy}
+                    onClick={() =>
+                      void run("刷新项目设置", async () => {
+                        if (settingsDirty && !(await persistProjectSettings()))
+                          return;
+                        if (dirty && draft) await save();
+                        const epoch = workspaceEpoch.current;
+                        const rows = await invoke<Option[]>("list_projects", {
+                          organizationId,
+                        });
+                        const loaded = await invoke<ProjectSettings>(
+                          "load_project_settings",
+                          {
+                            organizationId,
+                          },
+                        );
+                        if (epoch !== workspaceEpoch.current) return;
+                        setProjects(rows);
+                        const normalized = normalizeProjectSettings(
+                          rows,
+                          loaded,
+                        );
+                        setProjectSettings(normalized);
+                        setAppliedProjectSettings(normalized);
+                        setSettingsDirty(false);
+                      })
+                    }
+                  >
+                    刷新项目
+                  </button>
+                  <div className="action-item">
                     <button
-                      disabled={!!busy}
-                      onClick={() => void run("重试读取项目", retryWorkspace)}
+                      className="primary"
+                      disabled={
+                        !settingsDirty || settingsBusy || !!session || !!busy
+                      }
+                      onClick={() =>
+                        void run("保存项目设置", persistProjectSettings)
+                      }
                     >
-                      刷新项目列表
+                      {settingsBusy ? "保存中…" : "保存设置"}
                     </button>
+                    {settingsError &&
+                      !projects.some((item) =>
+                        settingsError.includes(
+                          `项目 ${item.id} 的包名格式不正确`,
+                        ),
+                      ) && (
+                        <small className="error-text" role="alert">
+                          {settingsError}
+                        </small>
+                      )}
                   </div>
                 </div>
-                <div className="grid">
-                  <label className="field">
-                    <span>组织</span>
-                    <select
-                      value={organizationId}
-                      disabled={!!busy}
-                      onChange={(e) =>
-                        void run("读取项目", async () => {
-                          const id = e.target.value;
-                          setOrganizationId(id);
-                          setProjectId("");
-                          try {
-                            setProjects(
-                              id
-                                ? await invoke<Option[]>("list_projects", {
-                                    organizationId: id,
-                                  })
-                                : [],
-                            );
-                          } catch (error) {
-                            await handleRemoteError(error, "云效项目读取失败");
-                          }
-                        })
+              </div>
+              <div className="project-settings-toolbar">
+                <label className="settings-search">
+                  <span>搜索项目</span>
+                  <input
+                    type="search"
+                    value={settingsQuery}
+                    placeholder="项目名或 Android 包名"
+                    disabled={!!session || !!settingsBusy || !!busy}
+                    onChange={(event) => setSettingsQuery(event.target.value)}
+                  />
+                </label>
+                <div className="settings-filters">
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={settingsEnabledOnly}
+                      disabled={!!session || !!settingsBusy || !!busy}
+                      onChange={(event) =>
+                        setSettingsEnabledOnly(event.target.checked)
                       }
-                    >
-                      <option value="">请选择组织</option>
-                      {organizations.map((o) => (
-                        <option key={o.id} value={o.id}>
-                          {o.name}
-                        </option>
-                      ))}
-                    </select>
-                    {!organizations.length && (
-                      <small>API 暂未返回可用组织。</small>
-                    )}
+                    />
+                    已勾选
                   </label>
-                  <label className="field">
-                    <span>项目</span>
-                    <select
-                      value={projectId}
-                      disabled={!organizationId || !!busy}
-                      onChange={(e) =>
-                        void run("切换项目", async () => {
-                          try {
-                            await selectProject(organizationId, e.target.value);
-                          } catch (error) {
-                            await handleRemoteError(error, "云效项目切换失败");
-                          }
-                        })
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={settingsPackageOnly}
+                      disabled={!!session || !!settingsBusy || !!busy}
+                      onChange={(event) =>
+                        setSettingsPackageOnly(event.target.checked)
                       }
-                    >
-                      <option value="">请选择项目</option>
-                      {projects.map((o) => (
-                        <option key={o.id} value={o.id}>
-                          {o.name}
-                        </option>
-                      ))}
-                    </select>
-                    {organizationId && !projects.length && (
-                      <small>API 暂未返回该组织的可用项目。</small>
-                    )}
+                    />
+                    包名非空
                   </label>
                 </div>
-                <p className="muted-text">
-                  当前项目：{boot.profile.name}
-                  。切换项目会建立新的当前草稿，旧草稿和提交记录保留。
-                </p>
-              </section>
-            )}
-            <details className="card" open={!!session}>
-              <summary>设备采集与固定构建</summary>
-              <h2>测试会话</h2>
-              <div className="grid">
-                <label className="field">
-                  <span>业务方向</span>
-                  <select
-                    value={business}
-                    onChange={(e) => setBusiness(e.target.value)}
+                {settingsQuery && (
+                  <button
+                    type="button"
+                    disabled={!!settingsBusy || !!busy}
+                    onClick={() => setSettingsQuery("")}
                   >
-                    <option value="">请选择</option>
-                    {boot.profile.businessProfiles.map((p) => (
-                      <option key={p}>{p}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>目标包名</span>
-                  <input
-                    value={packageName}
-                    onChange={(e) => setPackageName(e.target.value)}
-                    placeholder="例如 com.example.app"
-                  />
-                </label>
-                <label className="field wide">
-                  <span>Jenkins 固定构建 URL</span>
-                  <input
-                    value={buildUrl}
-                    onChange={(e) => setBuildUrl(e.target.value)}
-                    placeholder="https://jenkins.example/job/App/123/"
-                  />
-                </label>
+                    清空搜索
+                  </button>
+                )}
               </div>
-              <div className="actions">
-                <button
-                  className="primary"
-                  disabled={!serial || !packageName || !business || !!busy}
-                  onClick={() =>
-                    void run("开始采集", async () => {
-                      const s = await invoke<Session>("start_session", {
-                        serial,
-                        packageName,
-                        buildUrl,
-                        business,
-                      });
-                      setSession(s);
-                      setNotice(
-                        "正在记录 main / system / crash 日志。复现后点击“记录问题”。",
-                      );
-                    })
-                  }
-                >
-                  开始采集
-                </button>
-                <button
-                  disabled={!session}
-                  onClick={() =>
-                    void run("停止采集", async () => {
-                      await invoke("stop_session");
-                      setSession(null);
-                      await refresh();
-                      setNotice("会话已结束，日志已保留。");
-                    })
-                  }
-                >
-                  停止采集
-                </button>
-                <button
-                  disabled={!session || frozen || capturePending || !!busy}
-                  onClick={() =>
-                    void run("记录问题", async () => {
-                      let d = draft;
-                      if (!d) d = await invoke<Draft>("new_draft");
-                      else if (dirty) d = await save();
-                      setDraft(
-                        await invoke<Draft>("mark_problem", { id: d.id }),
-                      );
-                      setDirty(false);
-                      setTab("new");
-                      await refresh();
-                    })
-                  }
-                >
-                  记录问题并截图
-                </button>
-              </div>
-              {session && (
-                <div className="session-live">
-                  <span className="dot" />
-                  正在采集 · {session.serial} · {session.packageName}
+              {!projects.length ? (
+                <p className="muted-text">当前组织没有可访问项目。</p>
+              ) : !visibleSettingsProjects.length ? (
+                <div className="empty">
+                  <p>没有符合搜索和筛选条件的项目。</p>
+                </div>
+              ) : (
+                <div className="project-settings-list">
+                  {visibleSettingsProjects.map((project) => {
+                    const setting = projectSettings.entries.find(
+                      (item) => item.projectId === project.id,
+                    ) ?? {
+                      projectId: project.id,
+                      enabled: false,
+                      packageName: "",
+                    };
+                    const bound = session?.serial && project.id === projectId;
+                    return (
+                      <div className="project-setting-row" key={project.id}>
+                        <label className="check">
+                          <input
+                            type="checkbox"
+                            checked={setting.enabled}
+                            disabled={
+                              !!bound || !!session || !!settingsBusy || !!busy
+                            }
+                            onChange={(event) => {
+                              setProjectSettings((current) => ({
+                                entries: current.entries.map((item) =>
+                                  item.projectId === project.id
+                                    ? { ...item, enabled: event.target.checked }
+                                    : item,
+                                ),
+                              }));
+                              setSettingsDirty(true);
+                            }}
+                          />
+                          <span title={project.name}>{project.name}</span>
+                        </label>
+                        <div className="project-package-setting">
+                          <input
+                            aria-label={`${project.name} Android 包名`}
+                            value={setting.packageName}
+                            disabled={!!session || !!settingsBusy || !!busy}
+                            placeholder="主页面功能依赖此包名，如 com.example.app"
+                            onChange={(event) => {
+                              setProjectSettings((current) => ({
+                                entries: current.entries.map((item) =>
+                                  item.projectId === project.id
+                                    ? {
+                                        ...item,
+                                        packageName: event.target.value,
+                                      }
+                                    : item,
+                                ),
+                              }));
+                              setSettingsDirty(true);
+                            }}
+                          />
+                          {settingsError.includes(
+                            `项目 ${project.id} 的包名格式不正确`,
+                          ) && (
+                            <small className="error-text" role="alert">
+                              {settingsError}
+                            </small>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
-              <p className="muted-text">
-                开始新会话会结束原会话。断线不会自动切换设备。记录问题后保持采集，
-                30 秒后自动固定日志；提前结束会如实记录缺口。
-              </p>
-            </details>
+            </section>
           </>
         )}
         {tab === "new" &&
-          (!draft ? (
+          (!mainPackageReady ? (
+            <section className="card empty package-required-card" role="alert">
+              <h2>请先配置当前项目包名</h2>
+              <p>
+                设备读取、环境快照、补采证据和提交都会使用设置页中的项目包名。
+                请为当前项目填写合法的 Android 包名并保存设置。
+              </p>
+              <button className="primary" onClick={() => setTab("settings")}>
+                前往设置
+              </button>
+            </section>
+          ) : !draft ? (
             <section className="card empty">
               <h2>记录第一个问题</h2>
               <p>请选择云效项目，创建草稿后连接设备采集或导入已有证据。</p>
               <button
                 className="primary"
+                disabled={!projectId || !boot.authorized || !!busy}
                 onClick={() => void run("创建草稿", newDraft)}
               >
                 新建问题草稿
@@ -1041,33 +1919,6 @@ function App() {
             </section>
           ) : (
             <>
-              <div className="draft-switch">
-                <select
-                  value={draft.id}
-                  onChange={(e) =>
-                    void run("切换草稿", async () => {
-                      if (dirty && !frozen) await save();
-                      setDraft(
-                        boot.drafts.find((d) => d.id === e.target.value) ??
-                          null,
-                      );
-                      setDirty(false);
-                      setPreview(false);
-                    })
-                  }
-                >
-                  {boot.drafts.map((d) => (
-                    <option value={d.id} key={d.id}>
-                      {d.title || "未命名草稿"} ·{" "}
-                      {new Date(d.createdAt).toLocaleString()}
-                    </option>
-                  ))}
-                </select>
-                <small>
-                  {draft.title || "未命名草稿"} ·{" "}
-                  {new Date(draft.createdAt).toLocaleString()}
-                </small>
-              </div>
               {frozen && (
                 <div className="banner">
                   {stateLabels[currentSubmission?.state ?? "ready"]}
@@ -1075,159 +1926,71 @@ function App() {
                 </div>
               )}
               <fieldset disabled={frozen || !!busy}>
-                <section className="card">
-                  <h2>问题与范围</h2>
-                  <div className="grid">
-                    {field("title", "具体问题标题", {
-                      hint: "写清在什么操作下发生什么行为",
-                    })}
-                    {field("actual", "问题描述 / 实际结果", { multi: true })}
-                    {select(
-                      "kind",
-                      "问题类型",
-                      [
-                        "功能",
-                        "UI",
-                        "多语言",
-                        "动态过程",
-                        "崩溃",
-                        "ANR",
-                        "性能",
-                        "网络",
-                        "数据",
-                      ].map((v) => ({ id: v, name: v })),
-                    )}
-                    {select(
-                      "business",
-                      "业务方向",
-                      boot.profile.businessProfiles.map((p) => ({
-                        id: p,
-                        name: p,
-                      })),
-                    )}
-                    {select(
-                      "workitemTypeId",
-                      "云效 Bug 类型",
-                      boot.metadata?.types ?? [],
-                    )}
-                  </div>
-                  <button
-                    disabled={!boot.authorized}
-                    onClick={() =>
-                      void run("刷新类型字段", async () => {
-                        await save();
-                        await invoke("load_metadata", {
-                          typeId: draft.workitemTypeId,
-                        });
-                        await refresh();
-                      })
-                    }
-                  >
-                    读取此类型的最新字段
-                  </button>
-                  <div className="grid">
-                    {select(
-                      "assignedTo",
-                      "负责人",
-                      boot.metadata?.members ?? [],
-                    )}
-                    {select(
-                      "sprint",
-                      "迭代（版本或迭代至少一项）",
-                      boot.metadata?.sprints ?? [],
-                    )}
-                    {select(
-                      "versions",
-                      "版本（可多选）",
-                      boot.metadata?.versions ?? [],
-                      true,
-                    )}
-                    {field("buildUrl", "固定 Jenkins 构建 URL")}
-                  </div>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={draft.buildStatus === "manual_confirmed"}
-                      onChange={(e) =>
-                        update(
-                          "buildStatus",
-                          e.target.checked ? "manual_confirmed" : "unconfirmed",
+                <section className="card issue-details-card">
+                  <div className="card-title">
+                    <h2>问题信息与复现</h2>
+                    <button
+                      disabled={!boot.authorized}
+                      onClick={() =>
+                        void run(
+                          "刷新云效配置",
+                          async () => {
+                            setBackendIssues([]);
+                            await save();
+                            await invoke("load_metadata", {
+                              typeId: draft.workitemTypeId,
+                            });
+                            await refresh();
+                          },
+                          "workitemTypeId",
                         )
                       }
-                    />
-                    我已确认此固定构建对应当前测试安装包（人工确认）
-                  </label>
-                  <p className="muted-text">
-                    精确产物与 mapping 匹配仍需构建清单和安装指纹验证。
-                  </p>
-                </section>
-                {dynamicFields}
-                <section className="card">
-                  <h2>应用与设备</h2>
-                  <div className="grid">
-                    {field("app.packageName", "包名")}
-                    {field("app.versionName", "versionName")}
-                    {field("app.versionCode", "versionCode（允许 0）")}
-                    {field("app.channel", "渠道")}
-                    {field("app.environment", "测试环境")}
-                    {field("app.obfuscation", "混淆状态", {
-                      hint: "例如 已混淆 / 未混淆，注明依据",
-                    })}
-                    {field("app.hardening", "加固状态", {
-                      hint: "例如 已加固 / 未加固，注明依据",
-                    })}
-                    {field("device.model", "设备型号")}
-                    {field("device.androidVersion", "Android 版本")}
-                    {field("device.totalMemKb", "总内存（kB）")}
-                    {field("device.availableMemKb", "当前可用内存（kB）")}
-                    {field("device.resolution", "分辨率（像素）", {
-                      hint: "1080x2400",
-                    })}
-                    {field("device.density", "屏幕密度（dpi）")}
-                    {field("manualNote", "人工补充信息来源", {
-                      hint: "例如 设备设置截图 / 应用详情页面",
-                    })}
+                    >
+                      刷新云效配置
+                    </button>
                   </div>
-                </section>
-                <section className="card">
-                  <h2>复现事实</h2>
-                  <div className="grid">
-                    {field("event.occurredAt", "真实问题时间（含时区）", {
-                      hint: "2026-10-09T14:30:00+08:00",
+                  <div className="grid problem-fields-grid">
+                    {field("title", "问题标题（必填）", {
+                      aliases: ["customFields.subject"],
+                      required: true,
+                      fullWidth: true,
                     })}
-                    {field("event.sourceNote", "事件时间来源 / 修改依据")}
-                    {field("preconditions", "前置条件", {
+                    {field("actual", "问题表现（必填）", {
                       multi: true,
-                      hint: "安装方式、清数据、账号、权限与网络状态",
+                      required: true,
+                      hint: "描述实际发生的问题表现",
+                      aliases: ["customFields.description"],
                     })}
-                    {field("steps", "复现步骤（每行一步）", { multi: true })}
-                    {field("expected", "预期结果", { multi: true })}
+                    {field("expected", "期望表现（必填）", {
+                      multi: true,
+                      required: true,
+                      hint: "需要描述清楚应该是什么表现，越清楚越好",
+                    })}
+                    {field("steps", "复现步骤（必填）", {
+                      multi: true,
+                      required: true,
+                      hint: "每行填写一步，描述可执行的操作",
+                    })}
+                    {field("preconditions", "复现条件（必填）", {
+                      multi: true,
+                      required: true,
+                      hint: "补充安装方式、账号（如有）、网络情况、涉及的云控（如有）",
+                    })}
                   </div>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={draft.event.lateCapture}
-                      onChange={(e) =>
-                        update("event.lateCapture", e.target.checked)
-                      }
-                    />
-                    问题发生后才开始采集（事后补采）
-                  </label>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={draft.frequency.firstDiscovery}
-                      onChange={(e) =>
-                        update("frequency.firstDiscovery", e.target.checked)
-                      }
-                    />
-                    首次发现，尚未重复
-                  </label>
-                  {!draft.frequency.firstDiscovery && (
-                    <div className="grid">
-                      {field("frequency.attempts", "尝试次数")}
-                      {field("frequency.occurrences", "发生次数")}
-                    </div>
+                  <div className="grid">{dynamicFields(false)}</div>
+                  {issueMessages("versions").length > 0 && (
+                    <label
+                      className="field field-error-item"
+                      id="field-versions"
+                    >
+                      <span>旧草稿版本</span>
+                      <input readOnly value={draft.versions.join(", ")} />
+                      {issueMessages("versions").map((message) => (
+                        <small className="error-text" key={message}>
+                          {message}
+                        </small>
+                      ))}
+                    </label>
                   )}
                   {draft.kind === "网络" && (
                     <div className="grid">
@@ -1247,89 +2010,216 @@ function App() {
                       {field("data.source", "数据来源")}
                     </div>
                   )}
-                </section>
-                <section className="card">
-                  <h2>设备有效云控</h2>
-                  {select("cloud.applicability", "此功能是否有云控", [
-                    { id: "yes", name: "适用：填写设备实际生效证据" },
-                    { id: "no", name: "不适用：填写功能依据" },
-                  ])}
-                  {draft.cloud.applicability === "no"
-                    ? field("cloud.reason", "该功能无云控的依据", {
-                        multi: true,
-                      })
-                    : draft.cloud.applicability === "yes" && (
-                        <div className="grid">
-                          {field("cloud.name", "配置 / 实验名称")}
-                          {field("cloud.effectiveValue", "设备实际生效值")}
-                          {select(
-                            "cloud.source",
-                            "判断来源",
-                            [
-                              "应用调试面板",
-                              "应用导出",
-                              "相关运行日志",
-                              "用户可观察行为",
-                            ].map((v) => ({ id: v, name: v })),
-                          )}
-                          {field("cloud.observedAt", "观察时间（含时区）")}
-                          {field("cloud.override", "测试覆盖值声明", {
-                            hint: "例如 未设置覆盖 / 覆盖为 true",
-                          })}
-                        </div>
-                      )}
+                  <div className="grid issue-select-grid">
+                    {select(
+                      "kind",
+                      "问题类型",
+                      [
+                        "功能",
+                        "UI",
+                        "多语言",
+                        "动态过程",
+                        "崩溃",
+                        "ANR",
+                        "性能",
+                        "网络",
+                        "数据",
+                      ].map((v) => ({ id: v, name: v })),
+                    )}
+                    {select(
+                      "workitemTypeId",
+                      "云效 Bug 类型",
+                      boot.metadata?.types ?? [],
+                    )}
+                    {select(
+                      "assignedTo",
+                      "负责人",
+                      boot.metadata?.members ?? [],
+                      false,
+                      undefined,
+                      ["customFields.assignedTo"],
+                    )}
+                    {select(
+                      "sprint",
+                      "迭代",
+                      boot.metadata?.sprints ?? [],
+                      false,
+                      undefined,
+                      ["customFields.sprint"],
+                    )}
+                    {dynamicFields(true)}
+                  </div>
+                  <div className="frequency-row">
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        checked={draft.frequency.firstDiscovery}
+                        onChange={(e) =>
+                          update("frequency.firstDiscovery", e.target.checked)
+                        }
+                      />
+                      首次发现，尚未重复
+                    </label>
+                    {!draft.frequency.firstDiscovery && (
+                      <>
+                        {field("frequency.attempts", "尝试次数", {
+                          hint: "尝试次数应为大于 0 的整数",
+                        })}
+                        {field("frequency.occurrences", "发生次数", {
+                          hint: "发生次数应为 1 至尝试次数之间的整数",
+                          aliases: ["frequency"],
+                        })}
+                      </>
+                    )}
+                  </div>
                 </section>
               </fieldset>
-              <section className="card">
+              <section className="card" id="field-attachments">
                 <div className="card-title">
                   <h2>
                     证据附件 <small>{draft.attachments.length} 份</small>
                   </h2>
-                  <span className="pill">逐份预览并确认上传</span>
                 </div>
-                <div className="actions">
-                  {[
-                    ["log", "导入日志"],
-                    ["image", "导入截图"],
-                    ["video", "导入 MP4"],
-                    ["report", "导入系统报告 ZIP"],
-                    ["sample", "导入数据样例"],
-                  ].map(([role, label]) => (
+                <fieldset
+                  className="evidence-device-connection"
+                  disabled={frozen || !!busy}
+                >
+                  <span className="section-hint">设备连接</span>
+                  <div className="device-connection-row">
+                    <label className="field" id="field-device.serial">
+                      <span>目标设备</span>
+                      <CustomSelect
+                        value={serial}
+                        options={devices.map((d) => ({
+                          id: d.serial,
+                          name: d.label,
+                        }))}
+                        label="目标设备"
+                        disabled={!!session || !!busy}
+                        onChange={(next) => {
+                          const selected = String(next);
+                          selectedSerialRef.current = selected;
+                          setSerial(selected);
+                          void run(
+                            "读取设备信息",
+                            () => inspectDevice(selected),
+                            "device.serial",
+                          );
+                        }}
+                      />
+                      <small>
+                        {devices.find((d) => d.serial === serial)?.state ===
+                        "unauthorized"
+                          ? "请在手机上允许 USB 调试授权"
+                          : devices.find((d) => d.serial === serial)?.state ===
+                              "offline"
+                            ? "设备离线，请重新连接 USB"
+                            : ""}
+                      </small>
+                      {fieldError("device.serial")}
+                    </label>
+                    <div
+                      className="field connection-button-field adb-control"
+                      id="field-adbPath"
+                    >
+                      <span className="connection-button-label" aria-hidden>
+                        操作
+                      </span>
+                      <button
+                        onClick={() =>
+                          void run(
+                            "选择 ADB",
+                            async () => {
+                              await invoke("choose_adb");
+                              await refresh();
+                            },
+                            "adbPath",
+                          )
+                        }
+                      >
+                        选择 ADB 路径
+                      </button>
+                      {!boot.adbPath && (
+                        <small className="warning-text">
+                          未检测到 Platform Tools。请选择 adb，或从 Android
+                          官方网站安装。
+                        </small>
+                      )}
+                      {fieldError("adbPath")}
+                    </div>
+                    <div className="field connection-button-field">
+                      <span className="connection-button-label" aria-hidden>
+                        操作
+                      </span>
+                      <button
+                        disabled={!!session || !!busy}
+                        onClick={() =>
+                          void run("刷新设备", refreshDevices, "device.serial")
+                        }
+                      >
+                        刷新设备
+                      </button>
+                    </div>
+                  </div>
+                </fieldset>
+                <div className="actions attachment-actions">
+                  <EnvironmentSnapshotEntry
+                    key={`environment:${organizationId}:${projectId}:${draft.id}`}
+                    draft={draft}
+                    serial={serial}
+                    disabled={
+                      frozen ||
+                      !!busy ||
+                      !!session ||
+                      capturePending ||
+                      !deviceConnected
+                    }
+                    onPrepare={() => save()}
+                    onUpdate={updatePostCapture}
+                    onComplete={() =>
+                      setNotice("设备环境快照已获取，文本已加入附件")
+                    }
+                  />
+                  <PostCaptureEntry
+                    key={`post-capture:${organizationId}:${projectId}:${draft.id}`}
+                    draft={draft}
+                    serial={serial}
+                    disabled={
+                      frozen ||
+                      !!busy ||
+                      !!session ||
+                      capturePending ||
+                      !deviceConnected
+                    }
+                    onPrepare={() => save()}
+                    onUpdate={updatePostCapture}
+                    onComplete={() => setNotice("补采完成")}
+                  />
+                  <div className="action-item" id="field-attachment-import">
                     <button
                       disabled={frozen || !!busy}
-                      key={role}
                       onClick={() =>
-                        void run(label, () =>
-                          mutate("import_attachment", { role }),
+                        void run(
+                          "导入附件",
+                          importAttachments,
+                          "attachment-import",
                         )
                       }
                     >
-                      {label}
+                      导入附件
                     </button>
-                  ))}
-                  <button
-                    disabled={frozen || !draft.sessionId || !!busy}
-                    onClick={() =>
-                      void run("固定日志", () => mutate("pin_logs"))
-                    }
-                  >
-                    恢复中断窗口记录
-                  </button>
-                </div>
-                <div className="actions">
-                  <button
-                    disabled={frozen || !draft.sessionId || !!busy}
-                    onClick={() =>
-                      void run("采集系统报告（最长两分钟）", () =>
-                        mutate("capture_bugreport"),
-                      )
-                    }
-                  >
-                    采集系统报告
-                  </button>
+                    {fieldError("attachment-import")}
+                    {routedMessages("attachment-import").map((message) => (
+                      <small className="error-text" key={message}>
+                        {message}
+                      </small>
+                    ))}
+                  </div>
                 </div>
                 {(boot.captures ?? [])
-                  .filter((t) => t.draftId === draft.id)
+                  .filter(
+                    (t) => t.draftId === draft.id && t.kind !== "post-capture",
+                  )
                   .map((t) => (
                     <div className="capture-status" role="status" key={t.id}>
                       <strong>
@@ -1375,22 +2265,16 @@ function App() {
                       )}
                     </div>
                   ))}
-                <p className="muted-text">
-                  派生副本与来源回执一起选择；移除副本会同时移除关联回执，回执不能单独移除。
-                  文件先保存为本地副本。勾选后才进入证据包和上传；日志请填真实覆盖范围。超过{" "}
-                  {boot.profile.attachmentWarningMb} MB
-                  为本地提醒，不代表云效限制。
-                </p>
                 {draft.attachments.map((a) => (
                   <AttachmentCard
                     key={a.id}
                     attachment={a}
+                    issueRoutes={issueRoutes}
                     disabled={frozen || !!busy}
-                    onConfirm={(confirmed, start, end) =>
-                      void run("保存附件确认", () =>
-                        mutate("confirm_attachment", {
+                    onSaveCoverage={(start, end) =>
+                      void run("保存覆盖时间", () =>
+                        mutate("save_attachment_coverage", {
                           attachmentId: a.id,
-                          confirmed,
                           coverageStart: start,
                           coverageEnd: end,
                         }),
@@ -1406,14 +2290,17 @@ function App() {
                         mutate("remove_attachment", { attachmentId: a.id }),
                       )
                     }
-                    onRead={() =>
-                      void run("预览日志", async () =>
-                        setLog(
-                          await invoke<string>("read_log", {
+                    previewError={fieldErrors[`attachment.${a.id}.preview`]}
+                    previewBusy={!!busy}
+                    onPreview={() =>
+                      void run(
+                        "打开附件",
+                        async () =>
+                          await invoke("preview_attachment", {
                             id: draft.id,
                             attachmentId: a.id,
                           }),
-                        ),
+                        `attachment.${a.id}.preview`,
                       )
                     }
                   />
@@ -1421,26 +2308,49 @@ function App() {
               </section>
               <section className="card">
                 <h2>提交前核对</h2>
-                {issues.filter((i) => i.field !== "previewConfirmed").length >
-                0 ? (
-                  <div className="missing-list">
-                    {issues
-                      .filter((i) => i.field !== "previewConfirmed")
-                      .map((i, n) => (
-                        <button
-                          key={n}
-                          onClick={() =>
-                            document
-                              .getElementById(`field-${i.field}`)
-                              ?.scrollIntoView({
-                                behavior: "smooth",
-                                block: "center",
-                              })
-                          }
-                        >
-                          {i.message}
-                        </button>
+                {[...new Set(fallbackIssues.map((item) => item.field))].map(
+                  (path) => (
+                    <div
+                      className="field field-error-item"
+                      id={`field-${path}`}
+                      key={path}
+                    >
+                      <span>待核对的校验项</span>
+                      <input
+                        readOnly
+                        value={path}
+                        aria-label="待核对的校验项"
+                      />
+                      {issueMessages(path).map((message) => (
+                        <small className="error-text" key={message}>
+                          {message}
+                        </small>
                       ))}
+                    </div>
+                  ),
+                )}
+                {issueNavigationGroups.length > 0 ? (
+                  <div className="missing-list">
+                    {issueNavigationGroups.map((group) => (
+                      <button
+                        key={group.target}
+                        onClick={() => {
+                          if (group.field === "app.packageName") {
+                            setPreview(false);
+                            setTab("settings");
+                            return;
+                          }
+                          document
+                            .getElementById(group.target)
+                            ?.scrollIntoView({
+                              behavior: "smooth",
+                              block: "center",
+                            });
+                        }}
+                      >
+                        {issueNavigationLabel(group.field)}（1项）
+                      </button>
+                    ))}
                   </div>
                 ) : (
                   <p className="success-text">基础信息已齐全，可以进入预览。</p>
@@ -1464,7 +2374,6 @@ function App() {
                       void run("保存草稿", async () => {
                         await save();
                         await refresh();
-                        setNotice("草稿已保存在本机。");
                       })
                     }
                   >
@@ -1491,7 +2400,7 @@ function App() {
                       frozen ||
                       !!busy ||
                       capturePending ||
-                      issues.some((i) => i.field !== "previewConfirmed")
+                      clientIssues.some((i) => i.field !== "previewConfirmed")
                     }
                     onClick={() =>
                       void run("核对主进程校验", async () => {
@@ -1499,8 +2408,15 @@ function App() {
                         const errors = await invoke<
                           { field: string; message: string }[]
                         >("validate_draft", { id: d.id });
-                        if (errors.some((i) => i.field !== "previewConfirmed"))
-                          throw errors.map((i) => i.message).join("；");
+                        setBackendIssues(
+                          errors.filter((i) => i.field !== "previewConfirmed"),
+                        );
+                        if (
+                          errors.some((i) => i.field !== "previewConfirmed")
+                        ) {
+                          setPreview(false);
+                          return;
+                        }
                         setPreview(true);
                       })
                     }
@@ -1521,33 +2437,29 @@ function App() {
                         (m) => m.id === draft.assignedTo,
                       )?.name ?? "未选择"}
                     </dd>
-                    <dt>业务与范围</dt>
+                    <dt>范围</dt>
                     <dd>
-                      {draft.business} · 版本 {draft.versions.join(", ")} · 迭代{" "}
-                      {draft.sprint}
+                      版本 {draft.versions.join(", ")} · 迭代 {draft.sprint}
                     </dd>
-                    <dt>构建</dt>
-                    <dd>{draft.buildUrl}</dd>
-                    <dt>标题</dt>
+                    <dt>问题标题</dt>
                     <dd>{draft.title}</dd>
-                    <dt>前置条件</dt>
+                    <dt>复现条件</dt>
                     <dd>{draft.preconditions}</dd>
-                    <dt>步骤</dt>
+                    <dt>复现步骤</dt>
                     <dd className="preserve">{draft.steps}</dd>
-                    <dt>预期 / 实际</dt>
+                    <dt>期望表现 / 问题表现</dt>
                     <dd>
                       {draft.expected}
                       <hr />
                       {draft.actual}
                     </dd>
-                    <dt>设备 / 应用 / 时间 / 云控</dt>
+                    <dt>设备 / 应用 / 时间</dt>
                     <dd className="preserve">
                       {JSON.stringify(
                         {
                           device: draft.device,
                           app: draft.app,
                           event: draft.event,
-                          cloud: draft.cloud,
                         },
                         null,
                         2,
@@ -1555,10 +2467,7 @@ function App() {
                     </dd>
                     <dt>将上传</dt>
                     <dd>
-                      {draft.attachments
-                        .filter((a) => a.confirmed)
-                        .map((a) => a.name)
-                        .join("、")}
+                      {draft.attachments.map((a) => a.name).join("、")}
                       ，以及不可变证据 ZIP
                     </dd>
                   </dl>
@@ -1575,7 +2484,7 @@ function App() {
                         setDirty(true);
                       }}
                     />
-                    我已核对项目、构建、描述与附件内容，并确认上传
+                    我已核对项目、描述与附件内容，并确认上传
                   </label>
                   <button
                     className="primary"
@@ -1601,257 +2510,266 @@ function App() {
             </>
           ))}
         {tab === "history" && (
-          <>
-            <section className="card">
-              <div className="card-title">
-                <h2>本机提交记录</h2>
-                <button onClick={() => void run("刷新记录", refresh)}>
-                  刷新
-                </button>
-              </div>
-              {!boot.submissions.length ? (
-                <div className="empty">
-                  <p>还没有本机提交记录。</p>
+          <HistoryView
+            key={`${boot.user?.id}:${organizationId}:${projectId}`}
+            profile={boot.profile}
+            metadata={boot.metadata}
+            drafts={boot.drafts}
+            submissions={boot.submissions}
+            configured={!!projectId && profileConfigured(boot.profile)}
+            busy={!!busy}
+            refresh={() => run("刷新记录", refresh)}
+            remoteError={(e) => handleRemoteError(e, "云效历史读取失败")}
+            renderSubmission={(s) => (
+              <article className="submission" key={s.draftId}>
+                <div className="card-title">
+                  <h3>{boot.drafts.find((d) => d.id === s.draftId)?.title}</h3>
+                  <span className="pill">
+                    {stateLabels[s.state] ?? s.state}
+                  </span>
                 </div>
-              ) : (
-                boot.submissions.map((s) => (
-                  <article className="submission" key={s.draftId}>
-                    <div className="card-title">
-                      <h3>
-                        {boot.drafts.find((d) => d.id === s.draftId)?.title}
-                      </h3>
-                      <span className="pill">
-                        {stateLabels[s.state] ?? s.state}
-                      </span>
-                    </div>
-                    <p>
-                      工作项 {s.identifier || s.workitemId || "尚未获得确定 ID"}{" "}
-                      ·{" "}
-                      {s.uploads.filter((a) => a.state === "confirmed").length}/
-                      {s.uploads.length} 份附件已核对
-                    </p>
-                    <code>evidenceId: {s.evidence.id}</code>
-                    {s.error && <p className="error-text">{s.error}</p>}
-                    <div className="actions">
-                      {s.url && (
-                        <>
-                          <button
-                            onClick={() =>
-                              void run("打开云效", () =>
-                                invoke("open_receipt", { id: s.draftId }),
-                              )
-                            }
-                          >
-                            打开云效
-                          </button>
-                          <button
-                            onClick={() =>
-                              void run("复制链接", () =>
-                                invoke("copy_receipt", {
-                                  id: s.draftId,
-                                  repair: false,
-                                }),
-                              )
-                            }
-                          >
-                            复制链接
-                          </button>
-                        </>
-                      )}
+                <p>
+                  工作项 {s.identifier || s.workitemId || "尚未获得确定 ID"} ·{" "}
+                  {s.uploads.filter((a) => a.state === "confirmed").length}/
+                  {s.uploads.length} 份附件已核对
+                </p>
+                <code>evidenceId: {s.evidence.id}</code>
+                {s.error && <p className="error-text">{s.error}</p>}
+                <div className="actions">
+                  {s.url && (
+                    <>
                       <button
                         onClick={() =>
-                          void run("复制修复输入", () =>
+                          void run("打开云效", () =>
+                            invoke("open_receipt", { id: s.draftId }),
+                          )
+                        }
+                      >
+                        打开云效
+                      </button>
+                      <button
+                        onClick={() =>
+                          void run("复制链接", () =>
                             invoke("copy_receipt", {
                               id: s.draftId,
-                              repair: true,
+                              repair: false,
                             }),
                           )
                         }
                       >
-                        复制修复任务输入
+                        复制链接
                       </button>
-                      {s.state === "partial" && (
-                        <button
-                          className="primary"
-                          onClick={() =>
-                            void run("核对并补传证据", async () => {
-                              await invoke("submit_bug", { id: s.draftId });
-                              await refresh();
-                            })
-                          }
-                        >
-                          核对并恢复
-                        </button>
-                      )}
-                      {s.state === "create_unknown" && (
-                        <>
-                          <input
-                            placeholder="可选：人工确认的工作项 ID"
-                            value={remoteId}
-                            onChange={(e) => setRemoteId(e.target.value)}
-                          />
-                          <button
-                            onClick={() =>
-                              void run("核对创建结果", async () => {
-                                await invoke("reconcile_submission", {
-                                  id: s.draftId,
-                                  remoteId: remoteId || null,
-                                });
-                                await refresh();
-                              })
-                            }
-                          >
-                            核对已有缺陷
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </article>
-                ))
-              )}
-            </section>
-            <section className="card">
-              <div className="card-title">
-                <h2>云效历史 Bug</h2>
+                    </>
+                  )}
+                  <button
+                    onClick={() =>
+                      void run("复制修复输入", () =>
+                        invoke("copy_receipt", {
+                          id: s.draftId,
+                          repair: true,
+                        }),
+                      )
+                    }
+                  >
+                    复制修复任务输入
+                  </button>
+                  {s.state === "partial" && (
+                    <button
+                      className="primary"
+                      onClick={() =>
+                        void run("核对并补传证据", async () => {
+                          await invoke("submit_bug", { id: s.draftId });
+                          await refresh();
+                        })
+                      }
+                    >
+                      核对并恢复
+                    </button>
+                  )}
+                  {s.state === "create_unknown" && (
+                    <>
+                      <input
+                        placeholder="可选：人工确认的工作项 ID"
+                        value={remoteId}
+                        onChange={(e) => setRemoteId(e.target.value)}
+                      />
+                      <button
+                        onClick={() =>
+                          void run("核对创建结果", async () => {
+                            await invoke("reconcile_submission", {
+                              id: s.draftId,
+                              remoteId: remoteId || null,
+                            });
+                            await refresh();
+                          })
+                        }
+                      >
+                        核对已有缺陷
+                      </button>
+                    </>
+                  )}
+                </div>
+              </article>
+            )}
+          />
+        )}
+        {draftsToDelete && (
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-draft-title"
+          >
+            <section className="delete-draft-dialog">
+              <h2 id="delete-draft-title">
+                {draftsToDelete.length > 1
+                  ? "删除当前项目全部草稿？"
+                  : "删除草稿？"}
+              </h2>
+              <p>
+                {draftsToDelete.length > 1
+                  ? `将删除当前项目的 ${draftsToDelete.length} 个草稿`
+                  : `将删除「${draftsToDelete[0]?.title || "未命名草稿"}」`}
+                及其本地草稿记录，无法撤销。已导出的证据包不受影响。
+              </p>
+              <div className="actions">
                 <button
+                  disabled={!!busy}
+                  onClick={() => setDraftsToDelete(null)}
+                >
+                  取消
+                </button>
+                <button
+                  className="danger"
                   disabled={!!busy}
                   onClick={() => {
-                    setRemoteHistoryError("");
-                    void run("读取云效历史", async () => {
-                      setRemoteHistory(
-                        await invoke<HistoryPage>("list_remote_history", {
-                          page: 1,
-                        }),
-                      );
-                    });
+                    void run(
+                      "删除草稿",
+                      async () => {
+                        try {
+                          await deleteDrafts();
+                        } catch (error) {
+                          setDraftsToDelete(null);
+                          throw error;
+                        }
+                      },
+                      "draft.id",
+                    );
                   }}
                 >
-                  刷新
+                  确认删除
                 </button>
               </div>
-              {remoteHistoryError ? (
-                <p className="banner error">
-                  云效历史读取失败：{remoteHistoryError}
-                </p>
-              ) : remoteHistory ? (
-                remoteHistory.items.length ? (
-                  remoteHistory.items.map((item) => (
-                    <article className="submission" key={item.id}>
-                      <div className="card-title">
-                        <h3>{item.title}</h3>
-                        <span className="pill">{item.status}</span>
-                      </div>
-                      <p>
-                        工作项 {item.identifier || item.id} · 创建于{" "}
-                        {item.createdAt}
-                      </p>
-                    </article>
-                  ))
-                ) : (
-                  <div className="empty">
-                    <p>云效没有返回当前用户在此项目中的历史 Bug。</p>
-                  </div>
-                )
-              ) : (
-                <p className="muted-text">
-                  正在读取云效历史；读取失败会明确提示，不会伪装为空记录。
-                </p>
-              )}
-              {remoteHistory?.hasMore && (
-                <button
-                  disabled={!!busy}
-                  onClick={() =>
-                    void run("加载更多历史", async () => {
-                      const nextPage = remoteHistoryPage + 1;
-                      const page = await invoke<HistoryPage>(
-                        "list_remote_history",
-                        { page: nextPage },
-                      );
-                      setRemoteHistory((current) =>
-                        current
-                          ? {
-                              ...page,
-                              items: [
-                                ...current.items,
-                                ...page.items.filter(
-                                  (item) =>
-                                    !current.items.some(
-                                      (old) => old.id === item.id,
-                                    ),
-                                ),
-                              ],
-                              page: nextPage,
-                            }
-                          : page,
-                      );
-                      setRemoteHistoryPage(nextPage);
-                    })
-                  }
-                >
-                  加载更多
-                </button>
-              )}
-            </section>
-          </>
-        )}
-        {log && (
-          <div className="modal">
-            <section>
-              <div className="card-title">
-                <h2>日志预览（前 100 KB）</h2>
-                <button onClick={() => setLog("")}>关闭</button>
-              </div>
-              <p>
-                请确认账号、路径、网络及业务信息。预览不表示所有敏感数据均已消除。
-              </p>
-              <pre>{log}</pre>
             </section>
           </div>
         )}
       </main>
+      <NotificationToast
+        notification={
+          boot.authorized && error
+            ? { id: `error:${error}`, message: error, kind: "error" }
+            : busy
+              ? { id: `busy:${busy}`, message: `${busy}…`, kind: "loading" }
+              : boot.authorized
+                ? notice
+                : null
+        }
+        onDismiss={() => {
+          setError("");
+          setNotice("");
+        }}
+      />
     </div>
   );
 }
 function AttachmentCard({
   attachment: a,
+  issueRoutes,
   disabled,
-  onConfirm,
+  onSaveCoverage,
   onRemove,
-  onRead,
+  onPreview,
+  previewError,
+  previewBusy,
   onRedact,
 }: {
   attachment: Attachment;
+  issueRoutes: Record<string, string[]>;
   disabled: boolean;
-  onConfirm: (c: boolean, s: string, e: string) => void;
+  onSaveCoverage: (s: string, e: string) => void;
   onRemove: () => void;
-  onRead: () => void;
+  onPreview: () => void;
+  previewError?: string;
+  previewBusy: boolean;
   onRedact: (literal: string) => void;
 }) {
   const [start, setStart] = useState(a.coverageStart),
     [end, setEnd] = useState(a.coverageEnd);
   const [literal, setLiteral] = useState("");
+  const attachmentDescription = splitPostCaptureAttachmentDescription(
+    a.name,
+    a.source,
+  );
+  const messages = (suffix: "coverageStart" | "coverageEnd" | "confirmed") =>
+    (issueRoutes[attachmentIssueKey(a, suffix)] ?? [])
+      .filter(
+        (message) =>
+          suffix === "confirmed" ||
+          (suffix === "coverageStart"
+            ? a.coverageStart
+            : a.coverageEnd
+          ).trim() ||
+          !message.startsWith("请填写日志的真实覆盖"),
+      )
+      .map((message) => (
+        <small className="error-text" key={message}>
+          {message}
+        </small>
+      ));
   return (
     <article className="attachment">
       <div className="attachment-body">
-        {a.role === "image" && (
-          <img src={convertFileSrc(a.path)} alt={a.name} />
-        )}{" "}
-        {a.role === "video" && (
-          <video controls preload="metadata" src={convertFileSrc(a.path)} />
-        )}
         <div>
           <strong>{a.name}</strong>
-          <small>
-            {a.role} · {(a.size / 1024 / 1024).toFixed(2)} MB · {a.source}
+          <small className="attachment-meta">
+            {
+              {
+                log: "日志",
+                image: "图片",
+                video: "视频",
+                report: "报告",
+                sample: "数据文件",
+              }[a.role]
+            }{" "}
+            · {(a.size / 1024 / 1024).toFixed(2)} MB
+            {!attachmentDescription.captureItem &&
+              attachmentDescription.description && (
+                <> · {attachmentDescription.description}</>
+              )}
           </small>
+          {attachmentDescription.captureItem && (
+            <>
+              <small className="attachment-capture-item">
+                <span>采集项</span>
+                <span>{attachmentDescription.captureItem}</span>
+              </small>
+              {attachmentDescription.description && (
+                <small className="attachment-source">
+                  {attachmentDescription.description}
+                </small>
+              )}
+            </>
+          )}
           <code>SHA256 {a.sha256}</code>
+          <div id={`field-${attachmentIssueKey(a, "confirmed")}`}>
+            {messages("confirmed")}
+          </div>
           {a.role === "log" && (
             <>
-              <button onClick={onRead}>预览日志</button>
               <details className="redaction-control">
                 <summary>生成脱敏副本</summary>
                 <p>
-                  指定需要替换的文字，原文件保留。生成后须重新预览并确认副本；只替换完全匹配的文字。
+                  指定需要替换的文字，原文件保留，草稿中改用脱敏副本；只替换完全匹配的文字。
                 </p>
                 <label className="field">
                   <span>需要替换的文字</span>
@@ -1860,6 +2778,7 @@ function AttachmentCard({
                     autoComplete="off"
                     disabled={disabled}
                     value={literal}
+                    placeholder="输入要精确匹配并替换的文字"
                     onChange={(e) => setLiteral(e.target.value)}
                   />
                 </label>
@@ -1874,48 +2793,55 @@ function AttachmentCard({
                 </button>
               </details>
               <div className="grid">
-                <label className="field">
+                <label
+                  className="field"
+                  id={`field-${attachmentIssueKey(a, "coverageStart")}`}
+                >
                   <span>真实覆盖起点（含时区）</span>
                   <input
                     disabled={disabled}
                     value={start}
+                    placeholder="例如 2026-10-10T14:30:00+08:00"
                     onChange={(e) => setStart(e.target.value)}
                   />
+                  {messages("coverageStart")}
                 </label>
-                <label className="field">
+                <label
+                  className="field"
+                  id={`field-${attachmentIssueKey(a, "coverageEnd")}`}
+                >
                   <span>真实覆盖终点（含时区）</span>
                   <input
                     disabled={disabled}
                     value={end}
+                    placeholder="填写不早于起点的时间，包含时区"
                     onChange={(e) => setEnd(e.target.value)}
                   />
+                  {messages("coverageEnd")}
                 </label>
               </div>
+              <button
+                disabled={disabled}
+                onClick={() => onSaveCoverage(start, end)}
+              >
+                保存覆盖时间
+              </button>
             </>
           )}
         </div>
-      </div>
-      <div className="actions">
-        <label className="check">
-          <input
-            disabled={disabled}
-            type="checkbox"
-            checked={a.confirmed}
-            onChange={(e) => onConfirm(e.target.checked, start, end)}
-          />
-          已预览，确认上传
-        </label>
-        {a.role === "log" && (
-          <button
-            disabled={disabled}
-            onClick={() => onConfirm(a.confirmed, start, end)}
-          >
-            保存覆盖时间
+        <div className="attachment-tools">
+          <div className="action-item" id={`field-attachment.${a.id}.preview`}>
+            <button disabled={previewBusy} onClick={onPreview}>
+              预览
+            </button>
+            {previewError && (
+              <small className="error-text">{previewError}</small>
+            )}
+          </div>
+          <button disabled={disabled} onClick={onRemove}>
+            移除
           </button>
-        )}
-        <button disabled={disabled} onClick={onRemove}>
-          从草稿移除
-        </button>
+        </div>
       </div>
     </article>
   );

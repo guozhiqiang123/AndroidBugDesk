@@ -16,6 +16,8 @@ pub struct AppState {
     pub user: Mutex<Option<crate::workspace::UserIdentity>>,
     pub auth_epoch: AtomicU64,
     pub workspace_epoch: AtomicU64,
+    pub(crate) oauth: Mutex<Option<std::sync::Arc<crate::oauth::OAuthSession>>>,
+    pub(crate) oauth_flow: crate::oauth::LoginFlow,
     pub(crate) api_base: String,
     pub metadata: Mutex<Option<Metadata>>,
     pub adb: Mutex<Option<PathBuf>>,
@@ -40,14 +42,17 @@ impl AppState {
         }
         // Restore only after validating the token's actual user. Never auto-select the example project.
         let profile = crate::workspace::empty_profile();
+        let token = crate::login_memory::load_token(&store)?;
+        let oauth = crate::oauth::restore(&store, "https://openapi-rdc.aliyuncs.com")?;
         Ok(Self {
             store,
             profile: Mutex::new(profile),
-            // Startup always requires manual entry, even if an older version saved a PAT.
-            token: Mutex::new(None),
+            token: Mutex::new(token),
             user: Mutex::new(None),
             auth_epoch: AtomicU64::new(0),
             workspace_epoch: AtomicU64::new(0),
+            oauth: Mutex::new(oauth),
+            oauth_flow: Default::default(),
             api_base: "https://openapi-rdc.aliyuncs.com".into(),
             metadata: Mutex::new(None),
             adb: Mutex::new(adb::discover()),
@@ -61,7 +66,8 @@ impl AppState {
         }
         let p = self.profile.lock().unwrap().clone();
         let t = self.token.lock().unwrap();
-        Api::with_base(p, t.as_deref().ok_or("请填写个人 PAT")?, &self.api_base)
+        Api::with_base(p, t.as_deref().ok_or("请先登录云效")?, &self.api_base)
+            .map(|api| api.with_oauth(self.oauth.lock().unwrap().clone()))
     }
     pub(crate) fn editable(&self, id: &str) -> Result<()> {
         if self.locks.lock().unwrap().contains(id) {
@@ -75,6 +81,11 @@ impl AppState {
         })
     }
     pub(crate) fn assert_no_token(&self, d: &Value) -> Result<()> {
+        if let Some(session) = self.oauth.lock().unwrap().as_ref() {
+            if session.contains_secret(&d.to_string())? {
+                return Err("草稿包含当前云效授权凭据，请移除后再保存或上传".into());
+            }
+        }
         let token = self.token.lock().unwrap().clone();
         if let Some(mut t) = token {
             if t.len() >= 8 {
@@ -82,7 +93,7 @@ impl AppState {
                     t.zeroize();
                     return Err("草稿包含当前 PAT，请移除凭据后再保存或上传".into());
                 }
-                for a in attachments(d)?.iter().filter(|a| a.confirmed) {
+                for a in &attachments(d)? {
                     use std::io::Read;
                     let mut f = std::fs::File::open(&a.path).map_err(|_| "附件不存在")?;
                     let mut buf = [0u8; 65536];
@@ -113,8 +124,12 @@ impl AppState {
 pub fn bootstrap(state: State<AppState>) -> Result<Value> {
     let user = state.user.lock().unwrap().clone();
     let authorized = user.is_some();
+    let remember_login = crate::login_memory::enabled(&state.store)?;
+    let drafts = state.store.list("draft")?;
+    let draft_scopes = crate::project_settings::draft_scopes_for_state(&state, &drafts)?;
+    let submissions = crate::workitem_links::history_with_urls(state.store.list("submission")?);
     Ok(
-        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":state.store.list("draft")?,"submissions":state.store.list("submission")?,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
+        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"rememberLogin":remember_login,"loginMethod":state.store.get::<String>("settings", "login_method")?.unwrap_or_else(|| if remember_login { "pat".into() } else { "oauth".into() }),"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":drafts,"draftScopes":draft_scopes,"submissions":submissions,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
     )
 }
 #[tauri::command]
@@ -144,8 +159,14 @@ pub async fn clear_auth(state: State<'_, AppState>) -> Result<()> {
         return Err("请等待本次提交结束后再退出登录".into());
     }
     crate::workspace::invalidate(&state);
+    state.oauth_flow.cancel();
+    let oauth = state.oauth.lock().unwrap().take();
+    if let Some(session) = oauth {
+        session.close_and_wait().await;
+    }
     stop_session(state.clone()).await?;
-    state.store.put("settings", "remembered", &false)?;
+    crate::login_memory::set_enabled(&state.store, false)?;
+    crate::oauth::clear_saved()?;
     let mut t = state.token.lock().unwrap();
     if let Some(s) = t.as_mut() {
         s.zeroize();
@@ -290,16 +311,17 @@ pub fn remember_selections(selection: Value, state: State<AppState>) -> Result<(
 #[tauri::command]
 pub async fn list_remote_history(
     page: usize,
+    filters: Option<crate::history::HistoryFilters>,
+    project_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<crate::workspace::HistoryPage> {
-    crate::workspace::current_scope(&state, "")?;
-    let user = state
-        .user
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or("请先验证登录令牌")?;
-    crate::workspace::observed_error(&state, state.api()?.history(&user.id, page).await)
+    crate::history::list_for_state(
+        &state,
+        page,
+        filters.unwrap_or_default(),
+        project_id.as_deref(),
+    )
+    .await
 }
 #[tauri::command]
 pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
@@ -340,6 +362,7 @@ pub fn new_draft(state: State<AppState>) -> Result<Value> {
     d["id"] = json!(uuid());
     d["createdAt"] = json!(now());
     d["updatedAt"] = json!(now());
+    crate::project_settings::apply_current_package(&state, &mut d)?;
     state.store.put("draft", &string(&d, "id"), &d)?;
     state.store.put("draft_scope", &string(&d, "id"), &scope)?;
     Ok(d)
@@ -347,6 +370,7 @@ pub fn new_draft(state: State<AppState>) -> Result<Value> {
 #[tauri::command]
 pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     let _write = state.store.writes.lock().unwrap();
+    crate::project_settings::apply_current_package(&state, &mut draft)?;
     validation::check_shape(&draft)?;
     let id = string(&draft, "id");
     state.editable(&id)?;
@@ -356,6 +380,11 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     draft["sessionId"] = old["sessionId"].clone();
     draft["collectionErrors"] = old["collectionErrors"].clone();
     draft["sources"] = old["sources"].clone();
+    if string(&draft, "bugPage") != string(&old, "bugPage") {
+        let prior = old["sources"]["bugPage"].clone();
+        draft["sources"]["bugPage"] =
+            json!({"status":"manual","at":now(),"detail":format!("人工输入；原始来源：{}",prior)});
+    }
     draft["event"]["originalAt"] = old["event"]["originalAt"].clone();
     draft["event"]["source"] = old["event"]["source"].clone();
     draft["buildManifest"] = old["buildManifest"].clone();
@@ -364,10 +393,15 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     }
     for group in ["app", "device"] {
         for (key, v) in draft[group].as_object().unwrap().clone() {
+            // The project mapping owns packageName. A renderer echo or a changed
+            // setting must never make it look like a manually edited device value.
+            if group == "app" && key == "packageName" {
+                continue;
+            }
             if old[group][&key] != v {
                 let path = format!("{group}.{key}");
                 let prior = old["sources"][&path].clone();
-                draft["sources"][&path] = json!({"status":"manual","at":now(),"detail":format!("人工输入，来源：{}；原始来源：{}",string(&draft,"manualNote"),prior)});
+                draft["sources"][&path] = json!({"status":"manual","at":now(),"detail":format!("人工输入；原始来源：{}",prior)});
                 if group == "app"
                     && ["packageName", "versionName", "versionCode"].contains(&key.as_str())
                     && prior["status"] == "collected"
@@ -396,21 +430,9 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
             draft["buildStatus"] = json!("conflict");
         }
     }
-    if !old["sessionId"].is_null() {
-        let session: Value = state
-            .store
-            .get("session", &string(&old, "sessionId"))?
-            .ok_or("会话不存在")?;
-        if let (Ok(event), Ok(start)) = (
-            chrono::DateTime::parse_from_rfc3339(&string(&draft, "event.occurredAt")),
-            chrono::DateTime::parse_from_rfc3339(&string(&session, "startedAt")),
-        ) {
-            if event < start {
-                draft["event"]["lateCapture"] = json!(true);
-                draft["event"]["source"] = json!("manual");
-            }
-        }
-    }
+    // Protected sources were restored from storage above, so stamp the
+    // authoritative mapping again immediately before persistence.
+    crate::project_settings::apply_current_package(&state, &mut draft)?;
     draft["updatedAt"] = json!(now());
     state.assert_no_token(&draft)?;
     state.store.put("draft", &id, &draft)?;
@@ -446,28 +468,131 @@ pub async fn list_devices(state: State<'_, AppState>) -> Result<Value> {
     adb::devices(&state.adb_path()?).await
 }
 #[tauri::command]
+pub async fn inspect_device(
+    id: String,
+    serial: String,
+    state: State<'_, AppState>,
+) -> Result<Value> {
+    state.editable(&id)?;
+    let scope = crate::workspace::current_scope(&state, "")?;
+    if state.store.get::<String>("draft_scope", &id)?.as_deref() != Some(&scope) {
+        return Err("草稿不属于当前账号或项目".into());
+    }
+    let original_draft = state.store.draft(&id)?;
+    let configured_package = crate::project_settings::current_package_for_state(&state)?;
+    let epoch = state
+        .workspace_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    adb::valid_serial(&serial)?;
+    let path = state.adb_path()?;
+    let listed = adb::devices(&path).await?;
+    let selected = listed
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| string(row, "serial") == serial));
+    match selected.map(|row| string(row, "state")).as_deref() {
+        Some("device") => {
+            let snapshot = adb::inspect_snapshot(&path, &serial, &configured_package).await?;
+            let _write = state.store.writes.lock().unwrap();
+            state.editable(&id)?;
+            if epoch
+                != state
+                    .workspace_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                || crate::workspace::current_scope(&state, "")? != scope
+                || crate::project_settings::current_package_for_state(&state)? != configured_package
+            {
+                return Err("账号或项目已变化，请重新选择设备".into());
+            }
+            let mut draft = state.store.draft(&id)?;
+            if draft != original_draft
+                || string(&draft, "updatedAt") != string(&original_draft, "updatedAt")
+            {
+                return Err("读取设备期间草稿已被修改，请保存后重新读取设备".into());
+            }
+            let session_id = string(&draft, "sessionId");
+            if !session_id.is_empty() {
+                let session: Value = state
+                    .store
+                    .get("session", &session_id)?
+                    .ok_or("草稿绑定的设备会话不存在，请新建草稿")?;
+                if string(&session, "serial") != serial {
+                    return Err("草稿已经绑定另一台设备，请新建草稿后读取设备信息".into());
+                }
+                let previous_package = string(&session, "packageName");
+                let observed_package = string(&snapshot, "app.packageName");
+                if previous_package != observed_package {
+                    return Err("草稿已经绑定另一应用，请新建草稿后读取设备信息".into());
+                }
+                let previous_version = string(&draft, "app.versionName");
+                let observed_version = string(&snapshot, "app.versionName");
+                if previous_version != observed_version {
+                    return Err(
+                        "草稿已经绑定另一应用版本或版本信息不可用，请新建草稿后读取设备信息".into(),
+                    );
+                }
+            }
+            let unbound_app_changed = session_id.is_empty()
+                && string(&draft, "app.versionName") != string(&snapshot, "app.versionName");
+            draft["device"] = snapshot["device"].clone();
+            for (key, value) in snapshot["app"].as_object().unwrap() {
+                draft["app"][key] = value.clone();
+            }
+            let mut sources = draft["sources"].as_object().cloned().unwrap_or_default();
+            let keep_manual_page = string(&snapshot, "bugPage").is_empty()
+                && sources
+                    .get("bugPage")
+                    .is_some_and(|source| source["status"] == "manual");
+            if !keep_manual_page {
+                draft["bugPage"] = snapshot["bugPage"].clone();
+            }
+            if let Some(observed) = snapshot["sources"].as_object() {
+                sources.extend(
+                    observed
+                        .iter()
+                        .filter(|(key, _)| !keep_manual_page || key.as_str() != "bugPage")
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+            }
+            draft["sources"] = json!(sources);
+            crate::project_settings::apply_current_package(&state, &mut draft)?;
+            let existing = draft["collectionErrors"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let mut errors = existing;
+            for error in snapshot["errors"].as_array().into_iter().flatten() {
+                if !errors.iter().any(|item| item == error) {
+                    errors.push(error.clone());
+                }
+            }
+            draft["collectionErrors"] = json!(errors);
+            draft["previewConfirmed"] = json!(false);
+            if unbound_app_changed {
+                draft["buildStatus"] = json!("unconfirmed");
+            }
+            draft["updatedAt"] = json!(now());
+            state
+                .store
+                .put_many(&[("draft", &id, &draft), ("snapshot", &id, &snapshot)])?;
+            Ok(snapshot)
+        }
+        Some("offline") => Err("所选 USB 设备处于离线状态，请重新连接后重试".into()),
+        Some("unauthorized") => Err("所选 USB 设备尚未授权，请在手机上允许 USB 调试".into()),
+        Some(state) if !state.is_empty() => Err(format!("所选 USB 设备状态不可用：{state}")),
+        _ => Err("所选 USB 设备已断开，请刷新设备列表".into()),
+    }
+}
+#[tauri::command]
 pub async fn start_session(
     serial: String,
-    package_name: String,
+    _package_name: String,
     build_url: String,
     business: String,
     state: State<'_, AppState>,
 ) -> Result<Value> {
     crate::workspace::current_scope(&state, "")?;
     adb::valid_serial(&serial)?;
-    adb::valid_package(&package_name)?;
-    if validation::fixed_build_url(&build_url).is_none() {
-        return Err("请填写 Jenkins 固定构建 URL".into());
-    }
-    if !state
-        .profile
-        .lock()
-        .unwrap()
-        .business_profiles
-        .contains(&business)
-    {
-        return Err("请选择配置中的业务方向".into());
-    }
+    let package_name = crate::project_settings::current_package_for_state(&state)?;
     let existing = { state.collector.lock().unwrap().take() };
     if let Some(c) = existing {
         adb::stop_logs(c).await;
@@ -561,9 +686,13 @@ pub async fn mark_problem(id: String, state: State<'_, AppState>) -> Result<Valu
     for (k, v) in snapshot["app"].as_object().ok_or("采集应用信息无效")? {
         d["app"][k] = v.clone();
     }
+    let page_source = d["sources"].get("bugPage").cloned();
     d["sources"] = snapshot["sources"].clone();
+    if let Some(source) = page_source {
+        d["sources"]["bugPage"] = source;
+    }
     d["collectionErrors"] = snapshot["errors"].clone();
-    d["event"] = json!({"occurredAt":marked,"originalAt":marked,"source":"auto","sourceNote":"电脑时钟标记；日志保存设备时钟估算依据","lateCapture":false});
+    d["event"] = json!({"occurredAt":marked,"originalAt":marked,"source":"auto","sourceNote":"电脑时钟标记；日志保存设备时钟估算依据"});
     d["previewConfirmed"] = json!(false);
     d["updatedAt"] = json!(now());
     match screenshot {
@@ -674,7 +803,7 @@ pub fn redact_log(
         .into_iter()
         .find(|a| a.id == attachment_id)
         .ok_or("日志不存在")?;
-    let redacted = evidence::redact_text(
+    let mut redacted = evidence::redact_text(
         &state.store.root,
         &original,
         &[evidence::TextRedactionRule {
@@ -682,6 +811,11 @@ pub fn redact_log(
             literal,
         }],
     )?;
+    if original.source.starts_with("ADB 问题日志窗口派生副本")
+        || original.source.contains("来源为问题日志窗口")
+    {
+        redacted.attachment.source.push_str("；来源为问题日志窗口");
+    }
     let receipt = crate::capture::paired_report(
         &state.store,
         &redacted.receipt_path,
@@ -701,13 +835,12 @@ pub fn redact_log(
             inherited.push(serde_json::to_value(copy).unwrap());
         }
     }
-    for a in d["attachments"].as_array_mut().unwrap() {
-        if string(a, "id") == original.id
-            || (string(a, "derivedFrom") == original.id && string(a, "role") == "report")
-        {
-            a["confirmed"] = json!(false);
-        }
-    }
+    // The draft uploads every listed file. Replace the source entry with the
+    // redacted copy while preserving its immutable file on disk.
+    d["attachments"].as_array_mut().unwrap().retain(|a| {
+        string(a, "id") != original.id
+            && !(string(a, "derivedFrom") == original.id && string(a, "role") == "report")
+    });
     d["attachments"].as_array_mut().unwrap().extend([
         serde_json::to_value(redacted.attachment).unwrap(),
         serde_json::to_value(receipt).unwrap(),
@@ -719,37 +852,203 @@ pub fn redact_log(
     Ok(d)
 }
 #[tauri::command]
-pub async fn import_attachment(
-    id: String,
-    role: String,
-    state: State<'_, AppState>,
-) -> Result<Value> {
+pub async fn import_attachment(id: String, state: State<'_, AppState>) -> Result<Value> {
     state.editable(&id)?;
+    check_attachment_scope(&state, &id)?;
     let files = rfd::AsyncFileDialog::new()
         .set_title("选择证据文件")
         .pick_files()
         .await
         .ok_or("已取消")?;
+    let paths = files
+        .iter()
+        .map(|file| file.path().to_path_buf())
+        .collect::<Vec<_>>();
+    import_attachment_paths(&state, &id, &paths)
+}
+
+pub(crate) fn import_attachment_paths(
+    state: &AppState,
+    id: &str,
+    paths: &[PathBuf],
+) -> Result<Value> {
     let _write = state.store.writes.lock().unwrap();
-    state.editable(&id)?;
-    let mut d = state.store.draft(&id)?;
-    for f in files {
-        let a = evidence::inspect(
-            f.path(),
-            &role,
-            "导入文件，覆盖时间由测试人员填写",
-            &state.store.root,
-        )?;
+    state.editable(id)?;
+    check_attachment_scope(state, id)?;
+    let mut d = state.store.draft(id)?;
+    for path in paths {
+        let a = evidence::inspect_import(path, &state.store.root).map_err(|error| {
+            format!(
+                "导入 {} 失败：{error}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
+        })?;
         d["attachments"]
             .as_array_mut()
             .unwrap()
             .push(serde_json::to_value(a).unwrap());
     }
     d["previewConfirmed"] = json!(false);
-    state.store.put("draft", &id, &d)?;
+    state.store.put("draft", id, &d)?;
     Ok(d)
 }
 #[tauri::command]
+pub async fn preview_attachment(
+    id: String,
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    let a = preview_attachment_for_state(&state, &id, &attachment_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if uses_macos_quick_look(&a) {
+            evidence::verify_attachment(&a)?;
+            return std::process::Command::new("/usr/bin/qlmanage")
+                .args(["-p", &a.path])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(|_| ())
+                .map_err(|_| "无法使用 macOS 快速查看预览 ZIP 报告".to_string());
+        }
+        open_attachment_with(&a, |path, application| match application {
+            Some(application) => open::with(path, application),
+            None => open::that(path),
+        })
+    })
+    .await
+    .map_err(|_| "预览启动失败".to_string())?
+}
+
+pub(crate) fn uses_macos_quick_look(a: &Attachment) -> bool {
+    cfg!(target_os = "macos") && a.role == "report" && a.mime == "application/zip"
+}
+
+fn check_attachment_scope(state: &AppState, id: &str) -> Result<()> {
+    let scope = crate::workspace::current_scope(state, "")?;
+    if state.store.get::<String>("draft_scope", id)?.as_deref() != Some(&scope) {
+        return Err("附件不属于当前账号或项目".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn open_attachment_with(
+    a: &Attachment,
+    open: impl FnOnce(&std::path::Path, Option<&str>) -> std::io::Result<()>,
+) -> Result<()> {
+    evidence::verify_attachment(a)?;
+    // A user's file association may point images to an app that cannot preview them.
+    // Use Apple's image viewer explicitly; ZIP reports are routed to Quick Look by
+    // preview_attachment so Archive Utility does not expand them beside the evidence.
+    let application = if cfg!(target_os = "macos")
+        && a.role == "image"
+        && ["image/png", "image/jpeg"].contains(&a.mime.as_str())
+    {
+        Some("/System/Applications/Preview.app")
+    } else {
+        None
+    };
+    open(std::path::Path::new(&a.path), application).map_err(|_| {
+        if application.is_some() {
+            "无法使用 macOS“预览”打开此图片，请确认系统“预览”应用可用后重试".to_string()
+        } else {
+            "无法使用系统应用打开此附件，请设置该格式的默认打开应用后重试".to_string()
+        }
+    })
+}
+
+pub(crate) fn preview_attachment_for_state(
+    state: &AppState,
+    id: &str,
+    attachment_id: &str,
+) -> Result<Attachment> {
+    check_attachment_scope(state, id)?;
+    let d = state.store.draft(id)?;
+    let mut a = attachments(&d)?
+        .into_iter()
+        .find(|a| a.id == attachment_id)
+        .ok_or("附件不存在")?;
+    let root = state
+        .store
+        .root
+        .join("attachments")
+        .canonicalize()
+        .map_err(|_| "附件目录不存在")?;
+    let path = PathBuf::from(&a.path)
+        .canonicalize()
+        .map_err(|_| "附件文件不存在")?;
+    if !path.starts_with(&root) {
+        return Err("只能预览当前草稿的本地附件".into());
+    }
+    evidence::verify_attachment(&a)?;
+    let extension = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    use std::io::Read;
+    let mut header = [0u8; 4];
+    let len = std::fs::File::open(&path)
+        .map_err(|_| "附件文件无法读取")?
+        .read(&mut header)
+        .map_err(|_| "附件文件无法读取")?;
+    let h = &header[..len];
+    if [
+        "exe",
+        "com",
+        "bat",
+        "cmd",
+        "ps1",
+        "command",
+        "sh",
+        "desktop",
+        "app",
+        "lnk",
+        "url",
+        "msi",
+        "vbs",
+        "js",
+        "py",
+        "pyw",
+        "rb",
+        "pl",
+        "jar",
+        "hta",
+        "scpt",
+        "applescript",
+        "bash",
+        "zsh",
+        "fish",
+    ]
+    .contains(&extension.as_str())
+        || h.starts_with(b"MZ")
+        || h.starts_with(b"\x7fELF")
+        || h.starts_with(b"#!")
+        || [
+            b"\xfe\xed\xfa\xce",
+            b"\xce\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xcf",
+            b"\xcf\xfa\xed\xfe",
+            b"\xca\xfe\xba\xbe",
+            b"\xbe\xba\xfe\xca",
+        ]
+        .iter()
+        .any(|magic| h.starts_with(*magic))
+    {
+        return Err("此附件是程序或脚本，不能作为预览启动".into());
+    }
+    a.path = path.to_string_lossy().into_owned();
+    Ok(a)
+}
+#[tauri::command]
+pub fn save_attachment_coverage(
+    id: String,
+    attachment_id: String,
+    coverage_start: String,
+    coverage_end: String,
+    state: State<AppState>,
+) -> Result<Value> {
+    confirm_attachment(id, attachment_id, true, coverage_start, coverage_end, state)
+}
 pub fn confirm_attachment(
     id: String,
     attachment_id: String,
@@ -821,28 +1120,6 @@ pub fn remove_attachment(
     Ok(d)
 }
 #[tauri::command]
-pub fn read_log(id: String, attachment_id: String, state: State<AppState>) -> Result<String> {
-    use std::io::Read;
-    let d = state.store.draft(&id)?;
-    let a = attachments(&d)?
-        .into_iter()
-        .find(|a| a.id == attachment_id && a.role == "log")
-        .ok_or("日志不存在")?;
-    let mut bytes = Vec::new();
-    std::fs::File::open(a.path)
-        .map_err(|_| "无法读取日志")?
-        .take(100_000)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    let token = state.token.lock().unwrap();
-    Ok(if let Some(t) = token.as_ref() {
-        text.replace(t, "[PAT 已隐藏]")
-    } else {
-        text
-    })
-}
-#[tauri::command]
 pub async fn export_evidence(
     id: String,
     include_media: bool,
@@ -881,6 +1158,10 @@ pub(crate) async fn submit_with_state(id: String, state: &AppState) -> Result<Su
             return Err("证据仍在采集中，请等待采集完成或中断记录落盘后提交".into());
         }
         let d = state.store.draft(&id)?;
+        let configured_package = crate::project_settings::current_package_for_state(state)?;
+        if string(&d, "app.packageName") != configured_package {
+            return Err("项目包名配置已变化，请返回新建提交页保存草稿后再提交".into());
+        }
         state.assert_no_token(&d)?;
         Submitter {
             store: state.store.clone(),
@@ -927,12 +1208,7 @@ pub(crate) async fn reconcile_with_state(
 pub fn copy_receipt(id: String, repair: bool, state: State<AppState>) -> Result<()> {
     let s: Submission = state.store.get("submission", &id)?.ok_or("提交不存在")?;
     let d = state.store.draft(&id)?;
-    let text = if repair {
-        format!("请修复 Android 缺陷：{}\n业务方向：{}\n云效工作项：{}\n链接：{}\n版本：{}；迭代：{}\nJenkins：{}\nevidenceId：{}\n证据状态：{}",string(&d,"title"),string(&d,"business"),s.workitem_id.unwrap_or_default(),s.url.unwrap_or("云效 API 未返回真实链接，请从项目中打开".into()),d["versions"],string(&d,"sprint"),string(&d,"buildUrl"),s.evidence.id,s.state)
-    } else {
-        s.url
-            .ok_or("云效 API 未返回真实链接；请按工作项 ID 在项目中查找")?
-    };
+    let text = crate::workitem_links::receipt_text(&s, &d, repair)?;
     arboard::Clipboard::new()
         .map_err(|_| "剪贴板不可用")?
         .set_text(text)
@@ -941,7 +1217,8 @@ pub fn copy_receipt(id: String, repair: bool, state: State<AppState>) -> Result<
 #[tauri::command]
 pub fn open_receipt(id: String, state: State<AppState>) -> Result<()> {
     let s: Submission = state.store.get("submission", &id)?.ok_or("提交不存在")?;
-    let url = s.url.ok_or("云效未返回真实缺陷链接")?;
+    let url = crate::workitem_links::bug_url(s.url.as_deref(), s.identifier.as_deref())
+        .ok_or("云效暂未提供可用工作项编号或链接")?;
     let u = reqwest::Url::parse(&url).map_err(|_| "链接不合法")?;
     if u.scheme() != "https" || u.host_str() != Some("devops.aliyun.com") {
         return Err("只允许打开已确认的云效链接".into());

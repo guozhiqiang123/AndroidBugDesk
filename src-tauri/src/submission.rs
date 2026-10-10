@@ -33,7 +33,7 @@ impl Submitter {
         if !errors.is_empty() {
             return Err(serde_json::to_string(&errors).unwrap());
         }
-        for a in attachments(&d)?.iter().filter(|a| a.confirmed) {
+        for a in &attachments(&d)? {
             evidence::verify_attachment(a)?;
         }
         let evidence = evidence::build(&self.store, &d, &api.profile, false)?;
@@ -236,16 +236,8 @@ impl Submitter {
             return Err("最终附件回读不完整".into());
         }
         s.identifier = Some(string(&confirmed, "serialNumber"));
-        // The detail API does not guarantee a URL. Only use a returned official HTTPS URL; do not invent a deep link.
         let url = string(&confirmed, "url");
-        s.url = if reqwest::Url::parse(&url)
-            .ok()
-            .is_some_and(|u| u.scheme() == "https" && u.host_str() == Some("devops.aliyun.com"))
-        {
-            Some(url)
-        } else {
-            None
-        };
+        s.url = crate::workitem_links::bug_url(Some(&url), s.identifier.as_deref());
         s.state = "submitted".into();
         s.error = None;
         self.save(s)?;

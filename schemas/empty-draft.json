@@ -2,6 +2,7 @@
   "id": "00000000-0000-4000-8000-000000000001",
   "sessionId": null,
   "title": "",
+  "bugPage": "",
   "kind": "功能",
   "business": "",
   "workitemTypeId": "",
@@ -15,10 +16,7 @@
     "packageName": "",
     "versionName": "",
     "versionCode": "",
-    "channel": "",
-    "environment": "",
-    "obfuscation": "",
-    "hardening": ""
+    "channel": ""
   },
   "device": {
     "model": "",
@@ -32,23 +30,13 @@
     "occurredAt": "",
     "originalAt": "",
     "source": "manual",
-    "sourceNote": "",
-    "lateCapture": false
+    "sourceNote": ""
   },
   "preconditions": "",
   "steps": "",
   "expected": "",
   "actual": "",
   "frequency": { "firstDiscovery": true, "attempts": "", "occurrences": "" },
-  "cloud": {
-    "applicability": "unset",
-    "reason": "",
-    "name": "",
-    "effectiveValue": "",
-    "source": "",
-    "observedAt": "",
-    "override": ""
-  },
   "network": {
     "operation": "",
     "type": "",

@@ -1,4 +1,5 @@
 use crate::model::*;
+use crate::submission_fields::{excluded_field, excluded_id, hidden_optional_field};
 use serde_json::Value;
 pub fn useful(s: &str) -> bool {
     !s.trim().is_empty()
@@ -82,9 +83,9 @@ pub fn native_target<'a>(f: &'a Field, p: &'a Profile) -> Option<&'a str> {
         }
     })
 }
-/// Selected derivatives and their source receipts form one indivisible evidence set.
+/// Derivatives and their source receipts form one indivisible evidence set.
 pub fn receipt_error(files: &[Attachment]) -> Option<String> {
-    for a in files.iter().filter(|a| a.confirmed) {
+    for a in files {
         let paired: Vec<_> = files
             .iter()
             .filter(|r| r.role == "report" && r.derived_from.as_deref() == Some(&a.id))
@@ -93,6 +94,7 @@ pub fn receipt_error(files: &[Attachment]) -> Option<String> {
         let redacted = a.source.starts_with("文本派生副本");
         if a.role == "log" && (window || redacted || !paired.is_empty()) {
             let range_required = window
+                || a.source.contains("来源为问题日志窗口")
                 || (redacted
                     && a.derived_from.as_ref().is_some_and(|id| {
                         files.iter().any(|parent| {
@@ -100,24 +102,21 @@ pub fn receipt_error(files: &[Attachment]) -> Option<String> {
                                 && parent.source.starts_with("ADB 问题日志窗口派生副本")
                         })
                     }));
-            if paired.iter().any(|r| !r.confirmed)
-                || (range_required && !paired.iter().any(|r| r.source == "日志窗口范围与缺口记录"))
+            if (range_required && !paired.iter().any(|r| r.source == "日志窗口范围与缺口记录"))
                 || (redacted
                     && !paired
                         .iter()
                         .any(|r| r.source == "文本替换记录（请核对副本）"))
             {
-                return Some("派生副本必须携带并确认全部来源回执".into());
+                return Some("派生副本必须携带全部来源回执".into());
             }
         }
         if a.role == "report"
-            && a.derived_from.as_ref().is_some_and(|owner| {
-                !files
-                    .iter()
-                    .any(|parent| &parent.id == owner && parent.confirmed)
-            })
+            && a.derived_from
+                .as_ref()
+                .is_some_and(|owner| !files.iter().any(|parent| &parent.id == owner))
         {
-            return Some("来源回执必须与关联副本一起确认".into());
+            return Some("来源回执必须保留关联副本".into());
         }
     }
     None
@@ -161,101 +160,11 @@ pub fn validate(
     {
         add!("project", "请重新读取当前项目和缺陷类型配置");
     }
-    if !p.business_profiles.contains(&string(d, "business")) {
-        add!("business", "请选择配置中的业务方向");
-    }
-    req!("title", "具体问题标题");
-    if string(d, "title").trim().chars().count() < 5 {
-        add!("title", "标题至少 5 个字符，并说明具体行为");
-    }
-    if fixed_build_url(&string(d, "buildUrl")).is_none() {
-        add!("buildUrl", "请填写 Jenkins 固定构建号 URL");
-    }
-    if string(d, "buildStatus") == "conflict" {
-        add!("buildStatus", "构建身份冲突，请重新选择实际构建");
-    }
-    if string(d, "buildStatus") == "unconfirmed" {
-        add!("buildStatus", "请确认构建与当前安装包的关系");
-    }
-    if !d["buildManifest"].is_null()
-        && ["packageName", "versionName", "versionCode"]
-            .iter()
-            .any(|k| d["buildManifest"][k] != d["app"][k])
-    {
-        add!("buildStatus", "构建清单与设备包名或版本不一致");
-    }
-    for key in [
-        "packageName",
-        "versionName",
-        "channel",
-        "environment",
-        "obfuscation",
-        "hardening",
-    ] {
-        req!(&format!("app.{key}"), key);
-    }
-    let pkg = regex::Regex::new(r"^[A-Za-z][\w]*(\.[A-Za-z][\w]*)+$").unwrap();
-    if !pkg.is_match(&string(d, "app.packageName")) {
-        add!("app.packageName", "包名格式不正确");
-    }
-    if string(d, "app.versionCode")
-        .parse::<u64>()
-        .ok()
-        .is_none_or(|n| n > 9_007_199_254_740_991)
-    {
-        add!("app.versionCode", "versionCode 必须为非负整数（允许 0）");
-    }
-    for key in [
-        "model",
-        "androidVersion",
-        "totalMemKb",
-        "availableMemKb",
-        "resolution",
-        "density",
-    ] {
-        let path = format!("device.{key}");
-        req!(&path, key);
-        if useful(&string(d, &path))
-            && d["sources"][&path]["status"] != "collected"
-            && !useful(&string(d, "manualNote"))
-        {
-            add!("manualNote", "请注明人工设备信息来源");
-        }
-    }
-    for key in ["totalMemKb", "availableMemKb", "density"] {
-        if string(d, &format!("device.{key}"))
-            .parse::<f64>()
-            .ok()
-            .is_none_or(|v| !v.is_finite() || v < 0.0 || (key != "availableMemKb" && v == 0.0))
-        {
-            add!(format!("device.{key}"), "请输入有效数值及指定单位");
-        }
-    }
-    if string(d, "device.availableMemKb")
-        .parse::<f64>()
-        .unwrap_or(0.)
-        > string(d, "device.totalMemKb").parse::<f64>().unwrap_or(0.)
-    {
-        add!("device.availableMemKb", "可用内存不能超过总内存");
-    }
-    if !regex::Regex::new(r"^[0-9]+[x×][0-9]+$")
-        .unwrap()
-        .is_match(&string(d, "device.resolution"))
-    {
-        add!("device.resolution", "分辨率格式为 1080x2400");
-    }
-    if !zoned_time(&string(d, "event.occurredAt")) {
-        add!("event.occurredAt", "问题时间必须包含时区");
-    }
-    if string(d, "event.source") == "manual"
-        || (useful(&string(d, "event.originalAt"))
-            && d["event.originalAt"] != d["event.occurredAt"])
-    {
-        req!("event.sourceNote", "事件时间来源或修改依据");
-    }
-    req!("preconditions", "前置条件");
-    req!("expected", "预期结果");
-    req!("actual", "实际结果");
+    req!("title", "问题标题");
+    req!("app.packageName", "当前项目的 Android 包名配置");
+    req!("preconditions", "复现条件");
+    req!("expected", "期望表现");
+    req!("actual", "问题表现");
     let steps = string(d, "steps");
     if !steps.lines().any(|s| !s.trim().is_empty())
         || steps.lines().filter(|s| !s.trim().is_empty()).any(|s| {
@@ -278,43 +187,30 @@ pub fn validate(
     if let Some(error) = receipt_error(&files) {
         add!("attachments", error);
     }
-    if !files.iter().any(|a| {
-        a.role == "log"
-            && a.confirmed
-            && a.size > 0
-            && useful(&a.source)
-            && zoned_time(&a.coverage_start)
-            && zoned_time(&a.coverage_end)
-            && chrono::DateTime::parse_from_rfc3339(&a.coverage_end).ok()
-                >= chrono::DateTime::parse_from_rfc3339(&a.coverage_start).ok()
-    }) {
-        add!("attachments", "请确认非空日志及真实覆盖起止时间");
-    }
-    if bool_at(d, "event.lateCapture")
-        && !files
-            .iter()
-            .any(|a| a.confirmed && a.size > 0 && a.source.starts_with("导入"))
-    {
-        add!("event.lateCapture", "事后补采需导入已有证据或重新复现");
+    for a in files.iter().filter(|a| a.role == "log") {
+        if a.size == 0 || !useful(&a.source) {
+            add!(
+                format!("attachment.{}.confirmed", a.id),
+                "所选日志为空或来源缺失，请重新导入"
+            );
+        }
+        if !zoned_time(&a.coverage_start) {
+            add!(
+                format!("attachment.{}.coverageStart", a.id),
+                "请填写日志的真实覆盖起点（含时区）"
+            );
+        }
+        if !zoned_time(&a.coverage_end)
+            || chrono::DateTime::parse_from_rfc3339(&a.coverage_end).ok()
+                < chrono::DateTime::parse_from_rfc3339(&a.coverage_start).ok()
+        {
+            add!(
+                format!("attachment.{}.coverageEnd", a.id),
+                "请填写日志的真实覆盖终点，且不得早于起点（含时区）"
+            );
+        }
     }
     let kind = string(d, "kind");
-    if ["UI", "多语言", "动态过程"].contains(&kind.as_str())
-        && !files
-            .iter()
-            .any(|a| ["image", "video"].contains(&a.role.as_str()) && a.confirmed && a.size > 0)
-    {
-        add!("attachments", "显示问题需要截图或视频");
-    }
-    if kind == "动态过程"
-        && !files.iter().any(|a| a.role == "video" && a.confirmed)
-        && files
-            .iter()
-            .filter(|a| a.role == "image" && a.confirmed)
-            .count()
-            < 2
-    {
-        add!("attachments", "动态过程需要视频或连续多张截图");
-    }
     if kind == "网络" {
         for k in ["operation", "type", "error", "collectionStatus"] {
             req!(
@@ -327,25 +223,6 @@ pub fn validate(
         for k in ["type", "count", "source"] {
             req!(&format!("data.{k}"), "数据类型、数量和来源");
         }
-    }
-    match string(d, "cloud.applicability").as_str() {
-        "no" => {
-            req!("cloud.reason", "该功能无云控的依据");
-        }
-        "yes" => {
-            for k in ["name", "effectiveValue", "source", "override"] {
-                req!(&format!("cloud.{k}"), "云控有效值、来源及覆盖声明");
-            }
-            if !["应用调试面板", "应用导出", "相关运行日志", "用户可观察行为"]
-                .contains(&string(d, "cloud.source").as_str())
-            {
-                add!("cloud.source", "请选择设备生效证据来源");
-            }
-            if !zoned_time(&string(d, "cloud.observedAt")) {
-                add!("cloud.observedAt", "云控观察时间必须包含时区");
-            }
-        }
-        _ => add!("cloud.applicability", "请声明云控适用性"),
     }
     if online {
         if let Some(m) = m {
@@ -367,6 +244,21 @@ pub fn validate(
                 add!("versions", "版本 ID 已失效");
             }
             for f in &m.fields {
+                if excluded_field(f, p) {
+                    if f.required || p.required_field_ids.contains(&f.id) {
+                        add!(
+                            format!("customFields.{}", f.id),
+                            format!(
+                                "云效项目将已移除字段「{}」设为必填，请调整项目配置后提交",
+                                f.name
+                            )
+                        );
+                    }
+                    continue;
+                }
+                if hidden_optional_field(f, p) {
+                    continue;
+                }
                 let target = native_target(f, p);
                 let v = match target {
                     Some("subject") => d["title"].clone(),
@@ -466,6 +358,13 @@ pub fn validate(
             for (id, v) in d["customFields"].as_object().unwrap() {
                 let present =
                     v.as_array().is_some_and(|a| !a.is_empty()) || v.as_str().is_some_and(useful);
+                if excluded_id(id)
+                    || p.field_mappings
+                        .get(id)
+                        .is_some_and(|target| excluded_id(target))
+                {
+                    continue;
+                }
                 if present && !m.fields.iter().any(|f| f.id == *id) {
                     add!(
                         format!("customFields.{id}"),
@@ -475,13 +374,23 @@ pub fn validate(
             }
             for id in &p.required_field_ids {
                 if !m.fields.iter().any(|f| f.id == *id) {
-                    add!("project", format!("项目必填字段 {id} 未出现在云效元数据中"));
+                    if excluded_id(id) {
+                        add!(
+                            "project",
+                            format!(
+                                "云效项目将已移除字段「{}」设为必填，请调整项目配置后提交",
+                                id
+                            )
+                        );
+                    } else {
+                        add!("project", format!("项目必填字段 {id} 未出现在云效元数据中"));
+                    }
                 }
             }
         }
     }
     if online && !bool_at(d, "previewConfirmed") {
-        add!("previewConfirmed", "请预览并确认项目、构建、描述及附件");
+        add!("previewConfirmed", "请预览并确认项目、描述及附件");
     }
     errors
 }

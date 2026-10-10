@@ -51,10 +51,11 @@ export const attachmentSchema = z.object({
   derivedFrom: z.string().nullable().default(null),
 });
 export type Attachment = z.infer<typeof attachmentSchema>;
-export const draftSchema = z.object({
+export const draftSchema = z.strictObject({
   id: z.uuid(),
   sessionId: z.uuid().nullable(),
   title: text,
+  bugPage: text.optional(),
   kind: z.enum([
     "功能",
     "UI",
@@ -87,14 +88,11 @@ export const draftSchema = z.object({
       artifactSha256: text.nullable(),
     })
     .nullable(),
-  app: z.object({
+  app: z.strictObject({
     packageName: text,
     versionName: text,
     versionCode: text,
     channel: text,
-    environment: text,
-    obfuscation: text,
-    hardening: text,
   }),
   device: z.object({
     model: text,
@@ -104,12 +102,11 @@ export const draftSchema = z.object({
     resolution: text,
     density: text,
   }),
-  event: z.object({
+  event: z.strictObject({
     occurredAt: text,
     originalAt: text,
     source: z.enum(["auto", "manual"]),
     sourceNote: text,
-    lateCapture: z.boolean(),
   }),
   preconditions: text,
   steps: text,
@@ -119,15 +116,6 @@ export const draftSchema = z.object({
     firstDiscovery: z.boolean(),
     attempts: text,
     occurrences: text,
-  }),
-  cloud: z.object({
-    applicability: z.enum(["yes", "no", "unset"]),
-    reason: text,
-    name: text,
-    effectiveValue: text,
-    source: text,
-    observedAt: text,
-    override: text,
   }),
   network: z.object({
     operation: text,
@@ -218,6 +206,7 @@ export interface Device {
   label: string;
 }
 export interface Snapshot {
+  bugPage?: string;
   device: Draft["device"];
   app: Partial<Draft["app"]>;
   sources: Record<string, Source>;
@@ -243,6 +232,7 @@ export function emptyDraft(id: string, now = new Date().toISOString()): Draft {
     id,
     sessionId: null,
     title: "",
+    bugPage: "",
     kind: "功能",
     business: "",
     workitemTypeId: "",
@@ -257,9 +247,6 @@ export function emptyDraft(id: string, now = new Date().toISOString()): Draft {
       versionName: "",
       versionCode: "",
       channel: "",
-      environment: "",
-      obfuscation: "",
-      hardening: "",
     },
     device: {
       model: "",
@@ -274,22 +261,12 @@ export function emptyDraft(id: string, now = new Date().toISOString()): Draft {
       originalAt: "",
       source: "manual",
       sourceNote: "",
-      lateCapture: false,
     },
     preconditions: "",
     steps: "",
     expected: "",
     actual: "",
     frequency: { firstDiscovery: true, attempts: "", occurrences: "" },
-    cloud: {
-      applicability: "unset",
-      reason: "",
-      name: "",
-      effectiveValue: "",
-      source: "",
-      observedAt: "",
-      override: "",
-    },
     network: { operation: "", type: "", error: "", collectionStatus: "" },
     data: { type: "", count: "", source: "" },
     customFields: {},

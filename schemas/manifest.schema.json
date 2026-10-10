@@ -16,7 +16,6 @@
     "ciArtifacts",
     "problem",
     "device",
-    "cloudConfig",
     "collection",
     "files",
     "gaps"
@@ -133,6 +132,12 @@
     },
     "problem": {
       "type": "object",
+      "properties": {
+        "bugPage": {
+          "type": "string",
+          "maxLength": 50000
+        }
+      },
       "required": [
         "kind",
         "title",
@@ -147,9 +152,6 @@
       ]
     },
     "device": {
-      "type": "object"
-    },
-    "cloudConfig": {
       "type": "object"
     },
     "collection": {

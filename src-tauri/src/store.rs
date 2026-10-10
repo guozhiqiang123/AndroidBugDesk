@@ -58,6 +58,18 @@ impl Store {
         raw.map(|r| serde_json::from_str(&r).map_err(|e| e.to_string()))
             .transpose()
     }
+    pub(crate) fn remove_many(&self, objects: &[(&str, &str)]) -> Result<()> {
+        let mut c = self.connect()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        for (kind, id) in objects {
+            tx.execute(
+                "DELETE FROM objects WHERE kind=?1 AND id=?2",
+                params![kind, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
     pub fn list(&self, kind: &str) -> Result<Vec<Value>> {
         let c = self.connect()?;
         let mut stmt = c
