@@ -144,22 +144,62 @@ pub fn parse_app(s: &str) -> Value {
     json!({"versionName":field(r"(?m)^\s*versionName=(\S+)"),"versionCode":field(r"\bversionCode=(\d+)"),"firstInstallTime":field(r"firstInstallTime=(.+)"),"lastUpdateTime":field(r"lastUpdateTime=(.+)")})
 }
 
+fn leading_u32(value: &str) -> Option<u32> {
+    let digits = value
+        .trim_start()
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn parse_package_list_uid(output: &str, package: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let mut fields = line
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .strip_prefix("package:")?
+            .split_whitespace();
+        if fields.next()? != package {
+            return None;
+        }
+        fields.find_map(|field| field.strip_prefix("uid:").and_then(leading_u32))
+    })
+}
+
 fn parse_package_app_id(output: &str, package: &str) -> Option<u32> {
     let mut target_section = false;
+    let mut package_header_seen = false;
+    // Some vendor builds omit `Package [name]` from the already package-scoped
+    // `dumpsys package <name>` response and expose only top-level appId/uid fields.
+    let mut scoped_candidate = None;
     for line in output.lines() {
-        let trimmed = line.trim();
+        let trimmed = line.trim().trim_start_matches('\u{feff}');
         if let Some(header) = trimmed.strip_prefix("Package [") {
             let (name, _) = header.split_once(']')?;
+            package_header_seen = true;
             target_section = name == package;
             continue;
         }
-        if target_section {
-            if let Some(value) = trimmed.strip_prefix("userId=") {
-                return value.split_whitespace().next()?.parse().ok();
+        for prefix in ["userId=", "appId=", "uid="] {
+            if let Some(value) = trimmed.strip_prefix(prefix) {
+                if target_section {
+                    return leading_u32(value);
+                }
+                if !package_header_seen {
+                    let priority = if prefix == "uid=" { 1 } else { 2 };
+                    if scoped_candidate.is_none_or(|(current, _)| priority > current) {
+                        scoped_candidate = leading_u32(value).map(|uid| (priority, uid));
+                    }
+                }
             }
         }
     }
-    None
+    if package_header_seen {
+        None
+    } else {
+        scoped_candidate.map(|(_, uid)| uid)
+    }
 }
 
 /// Resolve the Android UID for the configured package in the current Android user.
@@ -168,13 +208,30 @@ fn parse_package_app_id(output: &str, package: &str) -> Option<u32> {
 pub async fn package_uid(path: &Path, serial: &str, package: &str) -> Result<u32> {
     valid_serial(serial)?;
     valid_package(package)?;
-    let package_dump = text(path, serial, &["shell", "dumpsys", "package", package]).await?;
-    let app_id = parse_package_app_id(&package_dump, package)
-        .ok_or("无法读取目标应用 UID，已停止日志采集以避免保存整机日志")?;
     let android_user: u32 = text(path, serial, &["shell", "am", "get-current-user"])
         .await?
         .parse()
         .map_err(|_| "无法读取 Android 当前用户，已停止日志采集以避免保存整机日志")?;
+    let user = android_user.to_string();
+    let listed_uid = text(
+        path,
+        serial,
+        &[
+            "shell", "pm", "list", "packages", "-U", "--user", &user, package,
+        ],
+    )
+    .await
+    .ok()
+    .and_then(|output| parse_package_list_uid(&output, package));
+    let app_id = match listed_uid {
+        Some(uid) => uid,
+        None => {
+            let package_dump =
+                text(path, serial, &["shell", "dumpsys", "package", package]).await?;
+            parse_package_app_id(&package_dump, package)
+                .ok_or("无法读取目标应用 UID，已停止日志采集以避免保存整机日志")?
+        }
+    };
     if app_id >= 100_000 {
         return Ok(app_id);
     }
@@ -922,6 +979,51 @@ mod gap_tests {
         assert_eq!(parse_package_app_id(dump, "com.example.app"), Some(10123));
         assert_eq!(parse_package_app_id(dump, "com.missing"), None);
         assert_eq!(parse_package_app_id(dump, "com.example"), None);
+    }
+
+    #[test]
+    fn package_uid_listing_accepts_windows_line_endings_and_requires_exact_package() {
+        let listing = "\u{feff}package:com.example.app uid:10123\r\npackage:com.example.app.beta uid:10124\r\n";
+        assert_eq!(
+            parse_package_list_uid(listing, "com.example.app"),
+            Some(10123)
+        );
+        assert_eq!(
+            parse_package_list_uid(listing, "com.example.app.beta"),
+            Some(10124)
+        );
+        assert_eq!(parse_package_list_uid(listing, "com.example"), None);
+    }
+
+    #[test]
+    fn package_dump_accepts_app_id_and_full_uid_variants() {
+        for (field, expected) in [("appId=10123", 10123), ("uid=1010123 gids=[3003]", 1010123)] {
+            let dump =
+                format!("Packages:\r\n  Package [com.example.app] (2047da8):\r\n    {field}\r\n");
+            assert_eq!(
+                parse_package_app_id(&dump, "com.example.app"),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn windows_device_sample_resolves_uid_from_both_supported_commands() {
+        let package = "com.photo.recovery.global.tt";
+        assert_eq!(
+            parse_package_list_uid(
+                "package:com.photo.recovery.global.tt uid:11766\r\n",
+                package
+            ),
+            Some(11766)
+        );
+        assert_eq!(
+            parse_package_app_id(
+                "uid=11766 gids=[] type=0 prot=signature\r\n\r\n    appId=11766\r\n",
+                package
+            ),
+            Some(11766)
+        );
     }
 
     #[tokio::test]

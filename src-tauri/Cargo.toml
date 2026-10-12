@@ -1,6 +1,6 @@
 [package]
 name = "android-bug-desk"
-version = "0.2.0"
+version = "0.2.1"
 description = "Android QA evidence desktop client"
 authors = ["Android QA Team"]
 edition = "2021"

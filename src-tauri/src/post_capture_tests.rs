@@ -43,6 +43,9 @@ elif a[:3]==['shell','dumpsys','meminfo']:
  print('Permission Denial: no diagnostic permission' if mode=='partial' else '** MEMINFO in pid 123 [com.example.test] **')
 elif a[:4]==['shell','dumpsys','activity','exit-info']:
  print('ACTIVITY MANAGER PROCESS EXIT INFO\n' if mode=='empty' else 'ApplicationExitInfo #0:\n reason=CRASH')
+elif a[:4]==['shell','pm','list','packages']:
+ assert a[4:]==['-U','--user','0','com.example.test'],a
+ print('package:com.example.test uid:10123')
 elif a[:3]==['shell','dumpsys','package']:print('Packages:\nPackage [com.example.test]\n  userId=10123\nversionCode=42 versionName=2.1\n grantedPermissions: android.permission.INTERNET')
 elif a[:3]==['shell','am','get-current-user']:print('0')
 elif a[:2]==['shell','getprop']:print('Fake Android 13')
