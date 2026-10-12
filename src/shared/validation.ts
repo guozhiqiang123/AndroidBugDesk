@@ -108,20 +108,11 @@ export function validateDraft(
       metadata.typeId !== d.workitemTypeId)
   )
     add("project", "请重新读取当前项目和缺陷类型配置");
+  req("jenkinsPackageUrl", d.jenkinsPackageUrl, "Jenkins包地址");
   req("title", d.title, "问题标题");
   req("app.packageName", d.app.packageName, "当前项目的 Android 包名配置");
   req("preconditions", d.preconditions, "复现条件");
-  const steps = d.steps
-    .split("\n")
-    .map((s) => s.replace(/^\s*\d+[.、)]\s*/, "").trim())
-    .filter(Boolean);
-  if (
-    !steps.length ||
-    steps.some(
-      (s) => s.length < 6 || /^(打开看一下|打开看看|查看一下)$/.test(s),
-    )
-  )
-    add("steps", "请逐行填写可执行的复现步骤");
+  req("steps", d.steps, "复现步骤");
   req("expected", d.expected, "期望表现");
   req("actual", d.actual, "问题表现");
   if (!d.frequency.firstDiscovery) {

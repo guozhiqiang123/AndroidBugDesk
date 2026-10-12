@@ -56,8 +56,6 @@ fn app(root: &Path, adb: PathBuf) -> (tauri::App<tauri::test::MockRuntime>, Valu
         serde_json::from_str(include_str!("../../tests/fixtures/metadata.json")).unwrap();
     let mut draft: Value =
         serde_json::from_str(include_str!("../../tests/fixtures/valid-draft.json")).unwrap();
-    draft["app"]["channel"] = json!("manual-channel");
-    draft["sources"]["app.channel"] = json!({"status":"manual","at":now(),"detail":"人工渠道依据"});
     draft["collectionErrors"] = json!(["原有采集缺口"]);
     draft["previewConfirmed"] = json!(true);
     *state.profile.lock().unwrap() = metadata.profile;
@@ -131,14 +129,8 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
     assert_eq!(draft["bugPage"], snapshot["bugPage"]);
     assert_eq!(draft["sources"]["bugPage"]["status"], "collected");
     assert_eq!(draft["app"]["versionCode"], "0");
-    assert_eq!(draft["app"]["channel"], "manual-channel");
-    assert_eq!(
-        draft["sources"]["app.channel"],
-        initial["sources"]["app.channel"]
-    );
     assert_eq!(draft["attachments"], initial["attachments"]);
     assert_eq!(draft["title"], initial["title"]);
-    assert_eq!(draft["buildStatus"], "unconfirmed");
     assert_eq!(draft["previewConfirmed"], false);
     assert_eq!(
         store.get::<Value>("snapshot", &id).unwrap().unwrap(),
@@ -168,7 +160,6 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
     assert_eq!(partial["app"]["versionCode"], "0");
     assert_eq!(partial["sources"]["app.packageName"]["status"], "manual");
     assert_eq!(partial["title"], saved["title"]);
-    assert_eq!(partial["app"]["channel"], "manual-channel");
     assert!(partial["collectionErrors"]
         .as_array()
         .unwrap()

@@ -48,7 +48,6 @@ export function initialWorkspace() {
       edition: "central",
       organizationId: "unconfigured",
       projectId: "unconfigured",
-      businessProfiles: ["Android 测试"],
       requiredFieldIds: [],
       fieldMappings: {},
       enableVersions: true,

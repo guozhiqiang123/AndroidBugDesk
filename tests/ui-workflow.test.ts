@@ -110,7 +110,6 @@ describe("登录和工作区门禁", () => {
   it("新草稿应用记忆时保留无效选项和已有非选择字段", () => {
     const draft = {
       kind: "功能",
-      business: "旧业务",
       workitemTypeId: "old",
       assignedTo: "",
       sprint: "",
@@ -137,7 +136,6 @@ describe("登录和工作区门禁", () => {
       draft,
       {
         kind: "UI",
-        business: "新业务",
         workitemTypeId: "type-2",
         assignedTo: "u2",
         versions: ["deleted"],
@@ -146,7 +144,6 @@ describe("登录和工作区门禁", () => {
       metadata,
     );
     expect(next.kind).toBe("UI");
-    expect(next.business).toBe("旧业务");
     expect(next.assignedTo).toBe("u2");
     expect(next.versions).toEqual(["v2"]);
     expect(next.customFields.priority).toBe("P1");
@@ -226,7 +223,6 @@ describe("登录和工作区门禁", () => {
 
   it("新草稿把真实首选项写入数据，保存的失效值不被静默替换", () => {
     const draft = {
-      business: "",
       workitemTypeId: "",
       assignedTo: "",
       sprint: "",
@@ -260,10 +256,8 @@ describe("登录和工作区门禁", () => {
       ],
     } as unknown as Metadata;
     const next = initializeSelectionDefaults(draft, metadata, {
-      businessProfiles: ["Android 测试"],
       fieldMappings: { mappedLabel: "labels" },
     } as unknown as import("../src/shared/domain").Profile);
-    expect(next.business).toBe("");
     expect(next.workitemTypeId).toBe("type-1");
     expect(next.assignedTo).toBe("u1");
     expect(next.versions).toEqual(["v1"]);

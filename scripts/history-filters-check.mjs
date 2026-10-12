@@ -194,8 +194,16 @@ try {
           if (cmd === "load_project_settings")
             return {
               entries: [
-                { projectId: "test-project", enabled: true, packageName: "" },
-                { projectId: "other-project", enabled: true, packageName: "" },
+                {
+                  projectId: "test-project",
+                  enabled: true,
+                  packageName: "com.example.mock",
+                },
+                {
+                  projectId: "other-project",
+                  enabled: true,
+                  packageName: "com.example.other",
+                },
               ],
             };
           if (cmd === "load_metadata") return clone(q.metadata);
@@ -308,8 +316,33 @@ try {
   );
   assert.equal(tabs[0].y, tabs[1].y);
   assert.ok(tabs[1].x > tabs[0].x);
+  const stickyTabs = root.locator(".history-tabs");
+  const initialTabTop = await stickyTabs.evaluate(
+    (node) => node.getBoundingClientRect().top,
+  );
+  await page.evaluate(() => window.scrollTo(0, 600));
+  await page.waitForFunction(
+    () =>
+      Math.abs(
+        document.querySelector(".history-tabs").getBoundingClientRect().top,
+      ) < 1,
+  );
+  assert.equal(
+    await stickyTabs.evaluate((node) => getComputedStyle(node).position),
+    "sticky",
+  );
+  assert.ok(initialTabTop > 0);
+  await page.screenshot({
+    path: path.join(output, "sticky-tabs-scrolled.png"),
+  });
+  await page.evaluate(() => window.scrollTo(0, 0));
+  const firstLocalHeight = await root
+    .locator(".submission")
+    .first()
+    .evaluate((node) => node.getBoundingClientRect().height);
+  assert.ok(firstLocalHeight < 150, `local row height: ${firstLocalHeight}`);
   scenarios.push(
-    "horizontal tabs; one active panel; no cloud calls on local entry; custom controls only",
+    "horizontal tabs stay fixed while scrolling; local rows are compact; one active panel; no cloud calls on local entry",
   );
   await root.getByRole("button", { name: "下一页", exact: true }).click();
   assert.equal(await root.locator(".submission").count(), 10);
@@ -382,6 +415,11 @@ try {
   await root.getByRole("tab", { name: "云效历史 Bug", exact: true }).click();
   await root.getByText("云效记录 2", { exact: true }).waitFor();
   assert.equal(await root.locator(".submission").count(), 2);
+  const firstRemoteHeight = await root
+    .locator(".submission")
+    .first()
+    .evaluate((node) => node.getBoundingClientRect().height);
+  assert.ok(firstRemoteHeight < 90, `remote row height: ${firstRemoteHeight}`);
   await root.getByRole("button", { name: "加载更多", exact: true }).click();
   await root.getByText("云效记录 3", { exact: true }).waitFor();
   assert.equal(await root.locator(".submission").count(), 3);

@@ -43,8 +43,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - name: Verify candidate manifests with synthetic packages
-        run: node --test tests/build-manifest.node.mjs
+      - name: Verify package and release manifests with synthetic packages
+        run: npm run test:packages
       - name: Verify local packaging and browser workflow helpers
         run: npm run test:workflow
       - run: npm run build
@@ -66,3 +66,30 @@ jobs:
           retention-days: 30
           compression-level: 0
           path: ${{ steps.manifest.outputs.artifact_path }}/
+  release:
+    name: Publish official release
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: bundle
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: AndroidBugDesk-*
+          path: downloaded-artifacts
+      - name: Verify and stage official release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: node scripts/release-assets.mjs --input downloaded-artifacts --output release-assets --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "Android Bug Desk ${RELEASE_TAG#v}" --generate-notes

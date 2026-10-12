@@ -614,7 +614,13 @@ fn md(s: &str) -> String {
     s.replace('<', "&lt;").replace('>', "&gt;")
 }
 pub fn report(d: &Value, p: &Profile) -> String {
+    let app = json!({
+        "packageName": string(d, "app.packageName"),
+        "versionName": string(d, "app.versionName"),
+        "versionCode": string(d, "app.versionCode"),
+    });
     let rows = [
+        ("Jenkins包地址", "jenkinsPackageUrl"),
         ("问题概述", "title"),
         ("问题类型", "kind"),
         ("Bug所在页面", "bugPage"),
@@ -637,17 +643,43 @@ pub fn report(d: &Value, p: &Profile) -> String {
     {
         out.push_str(&format!("{}. {}\n", i + 1, md(s)));
     }
-    out.push_str(&format!("\n## 复现频率\n\n{}\n\n## 问题时间\n\n事件：{}\n原始标记：{}\n来源：{}\n依据：{}\n\n## 应用与设备\n\n应用：{}\n\n设备：{}\n\n## 采集缺口\n\n{}\n",if bool_at(d,"frequency.firstDiscovery"){ "首次发现、尚未重复".into() }else{format!("{} 次尝试，{} 次发生",string(d,"frequency.attempts"),string(d,"frequency.occurrences"))},md(&string(d,"event.occurredAt")),md(&string(d,"event.originalAt")),md(&string(d,"event.source")),md(&string(d,"event.sourceNote")),md(&d["app"].to_string()),md(&d["device"].to_string()),md(&d["collectionErrors"].to_string())));
+    out.push_str(&format!("\n## 复现频率\n\n{}\n\n## 问题时间\n\n事件：{}\n原始标记：{}\n来源：{}\n依据：{}\n\n## 应用与设备\n\n应用：{}\n\n设备：{}\n",if bool_at(d,"frequency.firstDiscovery"){ "首次发现、尚未重复".into() }else{format!("{} 次尝试，{} 次发生",string(d,"frequency.attempts"),string(d,"frequency.occurrences"))},md(&string(d,"event.occurredAt")),md(&string(d,"event.originalAt")),md(&string(d,"event.source")),md(&string(d,"event.sourceNote")),md(&app.to_string()),md(&d["device"].to_string())));
+    let gaps = d["collectionErrors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|gap| !gap.is_empty())
+        .collect::<Vec<_>>();
+    if !gaps.is_empty() {
+        out.push_str("\n## 采集缺口\n\n");
+        for gap in gaps {
+            out.push_str(&format!("- {}\n", md(gap)));
+        }
+    }
     out
 }
 pub fn marker(id: &str) -> String {
+    format!("evidenceId: {id}")
+}
+fn managed_start_marker(id: &str) -> String {
+    format!("[android-bug-desk-{id}-start]: # \"Android Bug Desk evidence block start\"")
+}
+fn managed_end_marker(id: &str) -> String {
+    format!("[android-bug-desk-{id}-end]: # \"Android Bug Desk evidence block end\"")
+}
+fn legacy_start_marker(id: &str) -> String {
     format!("<!-- android-bug-desk:{id}:start -->")
+}
+fn legacy_end_marker(id: &str) -> String {
+    format!("<!-- android-bug-desk:{id}:end -->")
 }
 pub fn managed(e: &Evidence, uploads: &[Upload], complete: bool) -> String {
     let mut text = format!(
-        "{}\n## 客户端证据\n\nevidenceId: {}\nschemaVersion: 1.0\n证据包 SHA256: {}\n状态: {}\n",
+        "{}\n## 客户端证据\n\n{}\nschemaVersion: 1.0\n证据包 SHA256: {}\n状态: {}\n",
+        managed_start_marker(&e.id),
         marker(&e.id),
-        e.id,
         e.sha256,
         if complete {
             "complete"
@@ -664,7 +696,7 @@ pub fn managed(e: &Evidence, uploads: &[Upload], complete: bool) -> String {
             a.state
         ));
     }
-    text.push_str(&format!("\n<!-- android-bug-desk:{}:end -->", e.id));
+    text.push_str(&format!("\n{}", managed_end_marker(&e.id)));
     text
 }
 pub fn merge_managed(
@@ -673,17 +705,23 @@ pub fn merge_managed(
     uploads: &[Upload],
     complete: bool,
 ) -> Result<String> {
-    let start = marker(&e.id);
-    let end = format!("<!-- android-bug-desk:{}:end -->", e.id);
+    let new_markers = (managed_start_marker(&e.id), managed_end_marker(&e.id));
+    let legacy_markers = (legacy_start_marker(&e.id), legacy_end_marker(&e.id));
+    let (start, end) =
+        if description.contains(&new_markers.0) || description.contains(&new_markers.1) {
+            (&new_markers.0, &new_markers.1)
+        } else {
+            (&legacy_markers.0, &legacy_markers.1)
+        };
     let a = description
-        .find(&start)
+        .find(start)
         .ok_or("远端证据段落被修改，停止覆盖，请人工处理")?;
     let b = description[a..]
-        .find(&end)
+        .find(end)
         .ok_or("远端证据段落不完整，停止覆盖")?
         + a
         + end.len();
-    if description.matches(&start).count() != 1 || description.matches(&end).count() != 1 {
+    if description.matches(start).count() != 1 || description.matches(end).count() != 1 {
         return Err("远端证据段落重复，停止覆盖".into());
     }
     Ok(format!(
@@ -694,6 +732,7 @@ pub fn merge_managed(
     ))
 }
 pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Result<Evidence> {
+    crate::validation::check_shape(d)?;
     if let Some(error) = crate::validation::receipt_error(&attachments(d)?) {
         return Err(error);
     }
@@ -717,10 +756,9 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
     }
     let snapshot:Value=store.get("snapshot",&string(d,"id"))?.unwrap_or_else(||json!({"device":d["device"],"app":d["app"],"details":null,"deviceTime":null,"capturedAt":null}));
     let manifest = json!({"schemaVersion":"1.0","evidenceId":id,"sessionId":d["sessionId"],"clientVersion":env!("CARGO_PKG_VERSION"),"createdAt":now(),
-        "scope":{"organizationId":p.organization_id,"projectId":p.project_id,"businessProfile":d["business"],"versions":d["versions"],"sprint":d["sprint"],"multicaParentTaskId":null},
-        "build":{"url":d["buildUrl"],"parsed":crate::validation::fixed_build_url(&string(d,"buildUrl")),"identityStatus":d["buildStatus"],"manifest":d["buildManifest"],"mappingStatus":"not_collected","parameters":null},
-        "installedArtifact":{"identity":d["app"],"fingerprints":null,"status":"not_collected"},"ciArtifacts":{"items":null,"status":"not_collected"},
-        "problem":{"kind":d["kind"],"title":d["title"],"bugPage":string(d,"bugPage"),"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"collection":d["sources"],"gaps":d["collectionErrors"],
+        "scope":{"organizationId":p.organization_id,"projectId":p.project_id,"versions":d["versions"],"sprint":d["sprint"],"multicaParentTaskId":null},
+        "installedArtifact":{"identity":d["app"]},
+        "problem":{"jenkinsPackageUrl":d["jenkinsPackageUrl"],"kind":d["kind"],"title":d["title"],"bugPage":string(d,"bugPage"),"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"collection":d["sources"],"gaps":d["collectionErrors"],
         "files":files.iter().map(|a|json!({"id":a.id,"relativePath":Path::new(&a.path).strip_prefix(&dir).unwrap().to_string_lossy(),"mime":a.mime,"size":a.size,"sha256":a.sha256,"role":a.role,"source":a.source,"derivedFrom":a.derived_from,"includedInZip":include_media || !["image","video"].contains(&a.role.as_str()),"coverage":{"start":a.coverage_start,"end":a.coverage_end}})).collect::<Vec<_>>()});
     for (name, value) in [
         ("manifest.json", manifest),

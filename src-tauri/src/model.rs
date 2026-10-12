@@ -28,7 +28,6 @@ pub struct Profile {
     pub edition: String,
     pub organization_id: String,
     pub project_id: String,
-    pub business_profiles: Vec<String>,
     pub required_field_ids: Vec<String>,
     pub field_mappings: HashMap<String, String>,
     pub enable_versions: bool,
@@ -41,8 +40,6 @@ impl Profile {
         if self.edition != "central"
             || !id.is_match(&self.organization_id)
             || !id.is_match(&self.project_id)
-            || self.business_profiles.is_empty()
-            || self.business_profiles.iter().any(|s| s.is_empty())
         {
             return Err("项目配置不正确；首版仅支持云效中心版".into());
         }

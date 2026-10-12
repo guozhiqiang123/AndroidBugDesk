@@ -4,7 +4,6 @@
     "edition": "central",
     "organizationId": "test-org",
     "projectId": "test-project",
-    "businessProfiles": ["测试方向"],
     "requiredFieldIds": [],
     "fieldMappings": {},
     "enableVersions": true,

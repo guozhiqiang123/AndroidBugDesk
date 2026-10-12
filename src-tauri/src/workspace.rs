@@ -46,7 +46,6 @@ pub fn empty_profile() -> Profile {
         edition: "central".into(),
         organization_id: "unconfigured".into(),
         project_id: "unconfigured".into(),
-        business_profiles: vec!["Android 测试".into()],
         required_field_ids: vec![],
         field_mappings: Default::default(),
         enable_versions: true,
@@ -312,13 +311,6 @@ pub fn sanitize_selections(selection: &Value, metadata: &Metadata) -> Value {
     ];
     if kinds.contains(&string(selection, "kind").as_str()) {
         result["kind"] = selection["kind"].clone();
-    }
-    if metadata
-        .profile
-        .business_profiles
-        .contains(&string(selection, "business"))
-    {
-        result["business"] = selection["business"].clone();
     }
     for field in &metadata.fields {
         if !field.show_when_create && !field.required {
@@ -620,6 +612,7 @@ mod tests {
         );
         assert!(clean["title"].is_null());
         assert!(clean["token"].is_null());
+        assert!(clean["business"].is_null());
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::new(root.path()).unwrap();
         store

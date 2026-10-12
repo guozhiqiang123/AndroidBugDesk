@@ -7,7 +7,6 @@ export const profileSchema = z.object({
   edition: z.literal("central"),
   organizationId: idSchema,
   projectId: idSchema,
-  businessProfiles: z.array(z.string().min(1).max(100)).min(1),
   requiredFieldIds: z.array(idSchema).default([]),
   fieldMappings: z
     .record(
@@ -54,6 +53,7 @@ export type Attachment = z.infer<typeof attachmentSchema>;
 export const draftSchema = z.strictObject({
   id: z.uuid(),
   sessionId: z.uuid().nullable(),
+  jenkinsPackageUrl: text,
   title: text,
   bugPage: text.optional(),
   kind: z.enum([
@@ -67,32 +67,14 @@ export const draftSchema = z.strictObject({
     "网络",
     "数据",
   ]),
-  business: text,
   workitemTypeId: text,
   assignedTo: text,
   sprint: text,
   versions: z.array(text),
-  buildUrl: text,
-  buildStatus: z.enum([
-    "unconfirmed",
-    "manual_confirmed",
-    "verified",
-    "conflict",
-  ]),
-  buildManifest: z
-    .object({
-      packageName: text,
-      versionName: text,
-      versionCode: text,
-      commit: text.nullable(),
-      artifactSha256: text.nullable(),
-    })
-    .nullable(),
   app: z.strictObject({
     packageName: text,
     versionName: text,
     versionCode: text,
-    channel: text,
   }),
   device: z.object({
     model: text,
@@ -126,7 +108,6 @@ export const draftSchema = z.strictObject({
   data: z.object({ type: text, count: text, source: text }),
   customFields: z.record(idSchema, z.union([text, z.array(text)])),
   sources: z.record(z.string(), sourceSchema),
-  manualNote: text,
   collectionErrors: z.array(text),
   attachments: z.array(attachmentSchema),
   previewConfirmed: z.boolean(),
@@ -219,8 +200,6 @@ export interface Session {
   id: string;
   serial: string;
   packageName: string;
-  buildUrl: string;
-  business: string;
   startedAt: string;
   stoppedAt: string | null;
   snapshot: Snapshot;
@@ -231,22 +210,18 @@ export function emptyDraft(id: string, now = new Date().toISOString()): Draft {
   return {
     id,
     sessionId: null,
+    jenkinsPackageUrl: "",
     title: "",
     bugPage: "",
     kind: "功能",
-    business: "",
     workitemTypeId: "",
     assignedTo: "",
     sprint: "",
     versions: [],
-    buildUrl: "",
-    buildStatus: "unconfirmed",
-    buildManifest: null,
     app: {
       packageName: "",
       versionName: "",
       versionCode: "",
-      channel: "",
     },
     device: {
       model: "",
@@ -271,7 +246,6 @@ export function emptyDraft(id: string, now = new Date().toISOString()): Draft {
     data: { type: "", count: "", source: "" },
     customFields: {},
     sources: {},
-    manualNote: "",
     collectionErrors: [],
     attachments: [],
     previewConfirmed: false,

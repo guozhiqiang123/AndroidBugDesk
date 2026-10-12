@@ -1,7 +1,12 @@
 use crate::{model::*, store::Store};
+use image::{
+    codecs::png::{CompressionType, FilterType, PngEncoder},
+    ImageEncoder,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -458,14 +463,66 @@ async fn snapshot_impl(
         json!({"device":device,"app":app,"sources":sources,"errors":errors,"details":details,"deviceTime":device_time,"capturedAt":at}),
     )
 }
-pub async fn screenshot(path: &Path, serial: &str, dest: &Path) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenshotCapture {
+    pub original_bytes: u64,
+    pub stored_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub optimized: bool,
+}
+
+struct OptimizedPng {
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    optimized: bool,
+}
+
+fn optimize_screenshot_png(original: Vec<u8>) -> Result<OptimizedPng> {
+    let original_len = original.len();
+    let mut reader =
+        image::ImageReader::with_format(Cursor::new(original.as_slice()), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
+        .decode()
+        .map_err(|_| "设备截图损坏或解码体积过大".to_string())?;
+    let width = image.width();
+    let height = image.height();
+    let mut encoded = Vec::new();
+    PngEncoder::new_with_quality(&mut encoded, CompressionType::Best, FilterType::Adaptive)
+        .write_image(image.as_bytes(), width, height, image.color().into())
+        .map_err(|_| "设备截图无损压缩失败".to_string())?;
+    let optimized = encoded.len() < original_len;
+    Ok(OptimizedPng {
+        bytes: if optimized { encoded } else { original },
+        width,
+        height,
+        optimized,
+    })
+}
+
+pub async fn screenshot(path: &Path, serial: &str, dest: &Path) -> Result<ScreenshotCapture> {
     let data = output(path, Some(serial), &["exec-out", "screencap", "-p"], 20).await?;
     if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("设备截图失败或屏幕限制，需导入已有图片".into());
     }
-    tokio::fs::write(dest, data)
+    let original_bytes = data.len() as u64;
+    let optimized = tokio::task::spawn_blocking(move || optimize_screenshot_png(data))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|_| "设备截图压缩任务异常结束".to_string())??;
+    tokio::fs::write(dest, &optimized.bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(ScreenshotCapture {
+        original_bytes,
+        stored_bytes: optimized.bytes.len() as u64,
+        width: optimized.width,
+        height: optimized.height,
+        optimized: optimized.optimized,
+    })
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -827,6 +884,37 @@ pub async fn stop_logs(c: Collector) {
 #[cfg(test)]
 mod gap_tests {
     use super::*;
+
+    #[test]
+    fn screenshot_png_optimization_preserves_resolution_and_pixels() {
+        let source = image::RgbaImage::from_fn(720, 1280, |x, y| {
+            let band = ((y / 80) % 4) as u8;
+            image::Rgba([
+                28 + band * 32,
+                ((x / 12) % 16) as u8 * 12,
+                220 - band * 24,
+                255,
+            ])
+        });
+        let mut original = Vec::new();
+        PngEncoder::new_with_quality(&mut original, CompressionType::Fast, FilterType::NoFilter)
+            .write_image(
+                source.as_raw(),
+                source.width(),
+                source.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        let optimized = optimize_screenshot_png(original.clone()).unwrap();
+        let decoded =
+            image::load_from_memory_with_format(&optimized.bytes, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8();
+        assert_eq!((optimized.width, optimized.height), source.dimensions());
+        assert_eq!(decoded, source);
+        assert!(optimized.optimized);
+        assert!(optimized.bytes.len() < original.len());
+    }
 
     #[test]
     fn package_app_id_requires_the_exact_package_section() {

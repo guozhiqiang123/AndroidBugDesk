@@ -6,11 +6,6 @@
     "edition": { "type": "string", "const": "central" },
     "organizationId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
     "projectId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$" },
-    "businessProfiles": {
-      "minItems": 1,
-      "type": "array",
-      "items": { "type": "string", "minLength": 1, "maxLength": 100 }
-    },
     "requiredFieldIds": {
       "default": [],
       "type": "array",
@@ -51,7 +46,6 @@
     "edition",
     "organizationId",
     "projectId",
-    "businessProfiles",
     "requiredFieldIds",
     "fieldMappings",
     "enableVersions",

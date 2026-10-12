@@ -268,6 +268,7 @@ export function HistoryView({
         </span>
       </div>
       <div
+        className="history-results"
         role="tabpanel"
         id={tab === "local" ? "history-local-panel" : "history-remote-panel"}
         aria-labelledby={

@@ -14,7 +14,8 @@ impl Store {
             root: root.into(),
             writes: Default::default(),
         };
-        store.connect()?.execute_batch("CREATE TABLE IF NOT EXISTS objects(kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id)); PRAGMA user_version=1;").map_err(|e| e.to_string())?;
+        store.connect()?.execute_batch("CREATE TABLE IF NOT EXISTS objects(kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id));").map_err(|e| e.to_string())?;
+        store.migrate_removed_fields()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -22,6 +23,110 @@ impl Store {
                 .map_err(|e| e.to_string())?;
         }
         Ok(store)
+    }
+    fn migrate_removed_fields(&self) -> Result<()> {
+        let mut c = self.connect()?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let rows = {
+            let mut stmt = tx
+                .prepare("SELECT kind,id,data FROM objects")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for (kind, id, raw) in rows {
+            let mut value: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let mut changed = false;
+            let remove = |object: &mut serde_json::Map<String, Value>, key: &str| {
+                object.remove(key).is_some()
+            };
+            if kind == "draft" {
+                if let Some(object) = value.as_object_mut() {
+                    for key in [
+                        "business",
+                        "buildUrl",
+                        "buildStatus",
+                        "buildManifest",
+                        "manualNote",
+                        "cloud",
+                    ] {
+                        changed |= remove(object, key);
+                    }
+                    if !object.contains_key("jenkinsPackageUrl") {
+                        object.insert("jenkinsPackageUrl".into(), Value::String(String::new()));
+                        changed = true;
+                    }
+                    if let Some(app) = object.get_mut("app").and_then(Value::as_object_mut) {
+                        for key in ["channel", "environment", "obfuscation", "hardening"] {
+                            changed |= remove(app, key);
+                        }
+                    }
+                    if let Some(event) = object.get_mut("event").and_then(Value::as_object_mut) {
+                        changed |= remove(event, "lateCapture");
+                    }
+                    if let Some(sources) = object.get_mut("sources").and_then(Value::as_object_mut)
+                    {
+                        let old = sources.len();
+                        sources.retain(|key, _| {
+                            !matches!(
+                                key.as_str(),
+                                "business"
+                                    | "buildUrl"
+                                    | "buildStatus"
+                                    | "buildManifest"
+                                    | "manualNote"
+                                    | "app.channel"
+                                    | "app.environment"
+                                    | "app.obfuscation"
+                                    | "app.hardening"
+                                    | "event.lateCapture"
+                            ) && !key.starts_with("cloud.")
+                        });
+                        changed |= sources.len() != old;
+                    }
+                }
+            } else if kind == "session" {
+                if let Some(object) = value.as_object_mut() {
+                    changed |= remove(object, "business");
+                    changed |= remove(object, "buildUrl");
+                }
+            } else if kind == "selection" {
+                if let Some(object) = value.as_object_mut() {
+                    changed |= remove(object, "business");
+                }
+            } else if kind == "settings" && id.starts_with("profile:") {
+                if let Some(object) = value.as_object_mut() {
+                    changed |= remove(object, "businessProfiles");
+                }
+            } else if matches!(kind.as_str(), "submission" | "metadata") {
+                if let Some(profile) = value.get_mut("profile").and_then(Value::as_object_mut) {
+                    changed |= remove(profile, "businessProfiles");
+                }
+            }
+            if changed {
+                tx.execute(
+                    "UPDATE objects SET data=?3 WHERE kind=?1 AND id=?2",
+                    params![
+                        kind,
+                        id,
+                        serde_json::to_string(&value).map_err(|e| e.to_string())?
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.execute_batch("PRAGMA user_version=2;")
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
     }
     fn connect(&self) -> Result<Connection> {
         let c = Connection::open(self.root.join("state.sqlite")).map_err(|e| e.to_string())?;
@@ -109,5 +214,99 @@ impl Store {
             self.put("submission", &s.draft_id, &s)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn removed_fields_are_migrated_before_strict_deserialization() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path()).unwrap();
+        let legacy_profile = json!({
+            "name":"旧项目","edition":"central","organizationId":"org-a",
+            "projectId":"project-a","businessProfiles":["Android 测试"],
+            "requiredFieldIds":[],"fieldMappings":{},"enableVersions":true,
+            "enableSprints":true,"attachmentWarningMb":50.0
+        });
+        store
+            .put("settings", "profile:user-a", &legacy_profile)
+            .unwrap();
+        store
+            .put(
+                "submission",
+                "draft-a",
+                &json!({
+                    "draftId":"draft-a","profile":legacy_profile,"state":"submitted",
+                    "evidence":{"id":"evidence-a","directory":"/tmp/evidence-a",
+                        "zipPath":"/tmp/evidence-a.zip","sha256":"a".repeat(64),"files":[]},
+                    "workitemId":"1","identifier":"BUG-1","url":null,"uploads":[],
+                    "error":null,"intendedAt":"2026-10-12T00:00:00Z",
+                    "updatedAt":"2026-10-12T00:00:00Z"
+                }),
+            )
+            .unwrap();
+        store
+            .put(
+                "draft",
+                "draft-a",
+                &json!({
+                    "business":"旧方向","buildUrl":"旧链接","buildStatus":"verified",
+                    "buildManifest":{},"manualNote":"旧备注","cloud":{},
+                    "app":{"packageName":"com.example","versionName":"1","versionCode":"1",
+                        "channel":"旧渠道","environment":"旧环境","obfuscation":"旧混淆","hardening":"旧加固"},
+                    "event":{"occurredAt":"","originalAt":"","source":"manual","sourceNote":"",
+                        "lateCapture":true},
+                    "sources":{"business":{},"cloud.value":{},"app.channel":{}}
+                }),
+            )
+            .unwrap();
+        store
+            .put(
+                "session",
+                "session-a",
+                &json!({"business":"旧方向","buildUrl":"旧链接","id":"session-a"}),
+            )
+            .unwrap();
+        store
+            .put(
+                "selection",
+                "selection-a",
+                &json!({"business":"旧方向","kind":"UI"}),
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = Store::new(root.path()).unwrap();
+        let profile: Profile = migrated.get("settings", "profile:user-a").unwrap().unwrap();
+        assert_eq!(profile.project_id, "project-a");
+        let submission: Submission = migrated.get("submission", "draft-a").unwrap().unwrap();
+        assert_eq!(submission.profile.project_id, "project-a");
+        let draft: Value = migrated.get("draft", "draft-a").unwrap().unwrap();
+        assert_eq!(draft["jenkinsPackageUrl"], "");
+        for key in [
+            "business",
+            "buildUrl",
+            "buildStatus",
+            "buildManifest",
+            "manualNote",
+            "cloud",
+        ] {
+            assert!(draft.get(key).is_none(), "{key}");
+        }
+        for key in ["channel", "environment", "obfuscation", "hardening"] {
+            assert!(draft["app"].get(key).is_none(), "{key}");
+        }
+        assert!(draft["event"].get("lateCapture").is_none());
+        assert!(draft["sources"].as_object().unwrap().is_empty());
+        let session: Value = migrated.get("session", "session-a").unwrap().unwrap();
+        assert!(session.get("business").is_none());
+        assert!(session.get("buildUrl").is_none());
+        let selection: Value = migrated.get("selection", "selection-a").unwrap().unwrap();
+        assert!(selection.get("business").is_none());
+        migrated.recover().unwrap();
     }
 }

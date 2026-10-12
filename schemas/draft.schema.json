@@ -17,6 +17,7 @@
         { "type": "null" }
       ]
     },
+    "jenkinsPackageUrl": { "type": "string", "maxLength": 50000 },
     "title": { "type": "string", "maxLength": 50000 },
     "bugPage": { "type": "string", "maxLength": 50000 },
     "kind": {
@@ -33,7 +34,6 @@
         "数据"
       ]
     },
-    "business": { "type": "string", "maxLength": 50000 },
     "workitemTypeId": { "type": "string", "maxLength": 50000 },
     "assignedTo": { "type": "string", "maxLength": 50000 },
     "sprint": { "type": "string", "maxLength": 50000 },
@@ -41,53 +41,14 @@
       "type": "array",
       "items": { "type": "string", "maxLength": 50000 }
     },
-    "buildUrl": { "type": "string", "maxLength": 50000 },
-    "buildStatus": {
-      "type": "string",
-      "enum": ["unconfirmed", "manual_confirmed", "verified", "conflict"]
-    },
-    "buildManifest": {
-      "anyOf": [
-        {
-          "type": "object",
-          "properties": {
-            "packageName": { "type": "string", "maxLength": 50000 },
-            "versionName": { "type": "string", "maxLength": 50000 },
-            "versionCode": { "type": "string", "maxLength": 50000 },
-            "commit": {
-              "anyOf": [
-                { "type": "string", "maxLength": 50000 },
-                { "type": "null" }
-              ]
-            },
-            "artifactSha256": {
-              "anyOf": [
-                { "type": "string", "maxLength": 50000 },
-                { "type": "null" }
-              ]
-            }
-          },
-          "required": [
-            "packageName",
-            "versionName",
-            "versionCode",
-            "commit",
-            "artifactSha256"
-          ],
-          "additionalProperties": false
-        },
-        { "type": "null" }
-      ]
-    },
     "app": {
       "type": "object",
       "properties": {
         "packageName": { "type": "string", "maxLength": 50000 },
         "versionName": { "type": "string", "maxLength": 50000 },
-        "versionCode": { "type": "string", "maxLength": 50000 },
-        "channel": { "type": "string", "maxLength": 50000 }
+        "versionCode": { "type": "string", "maxLength": 50000 }
       },
-      "required": ["packageName", "versionName", "versionCode", "channel"],
+      "required": ["packageName", "versionName", "versionCode"],
       "additionalProperties": false
     },
     "device": {
@@ -186,7 +147,6 @@
         "additionalProperties": false
       }
     },
-    "manualNote": { "type": "string", "maxLength": 50000 },
     "collectionErrors": {
       "type": "array",
       "items": { "type": "string", "maxLength": 50000 }
@@ -248,16 +208,13 @@
   "required": [
     "id",
     "sessionId",
+    "jenkinsPackageUrl",
     "title",
     "kind",
-    "business",
     "workitemTypeId",
     "assignedTo",
     "sprint",
     "versions",
-    "buildUrl",
-    "buildStatus",
-    "buildManifest",
     "app",
     "device",
     "event",
@@ -270,7 +227,6 @@
     "data",
     "customFields",
     "sources",
-    "manualNote",
     "collectionErrors",
     "attachments",
     "previewConfirmed",

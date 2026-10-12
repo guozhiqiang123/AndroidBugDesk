@@ -6,7 +6,6 @@ const p: Profile = {
   edition: "central",
   organizationId: "test-org",
   projectId: "test-project",
-  businessProfiles: ["测试方向"],
   requiredFieldIds: [],
   fieldMappings: {},
   enableVersions: true,
@@ -18,15 +17,13 @@ const d = emptyDraft(
   "2026-10-09T00:00:00Z",
 );
 Object.assign(d, {
+  jenkinsPackageUrl:
+    "https://jenkins.example.test/job/android/128/artifact/app.apk",
   title: "点击恢复按钮后页面闪退",
   bugPage: "com.example.test.RecoveryActivity",
-  business: "测试方向",
   workitemTypeId: "bug-type",
   assignedTo: "member-1",
   versions: ["version-2"],
-  buildUrl: "https://jenkins.example/job/App/42/",
-  buildStatus: "manual_confirmed",
-  manualNote: "设备设置页面，测试人员核对",
   preconditions: "新安装；允许照片权限；Wi-Fi 正常",
   steps: "进入照片恢复首页\n点击开始扫描按钮\n选择一张图片并点击恢复",
   expected: "图片恢复并显示完成提示",
@@ -37,7 +34,6 @@ d.app = {
   packageName: "com.example.test",
   versionName: "1.0",
   versionCode: "0",
-  channel: "internal",
 };
 d.device = {
   model: "模拟设备",

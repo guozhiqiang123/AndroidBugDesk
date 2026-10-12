@@ -55,6 +55,7 @@ describe("提交门槛", () => {
     expect(draftSchema.safeParse(v).success).toBe(false);
   });
   it.each([
+    "jenkinsPackageUrl",
     "title",
     "workitemTypeId",
     "assignedTo",
@@ -72,6 +73,7 @@ describe("提交门槛", () => {
     expect(check(v).length).toBeGreaterThan(0);
   });
   it.each([
+    ["jenkinsPackageUrl", "Jenkins包地址"],
     ["title", "问题标题"],
     ["actual", "问题表现"],
     ["preconditions", "复现条件"],
@@ -107,6 +109,12 @@ describe("提交门槛", () => {
     v.title = "闪退";
     expect(check(v)).toEqual([]);
   });
+  it("复现步骤只要求非空，不用每行满足主观字数门槛", () => {
+    const v = d();
+    v.steps = "3331111\n444\n555\n666";
+    expect(check(v)).toEqual([]);
+    expect(validateDraft(v, m().profile, null, false, false)).toEqual([]);
+  });
   it.each(["", " ", "\n\t"])("项目包名为空 %j 时阻止核对", (blank) => {
     const v = d();
     v.app.packageName = blank;
@@ -121,7 +129,6 @@ describe("提交门槛", () => {
     delete v.bugPage;
     v.app.versionName = "";
     v.app.versionCode = "";
-    v.app.channel = "";
     for (const key of Object.keys(v.device))
       v.device[key as keyof Draft["device"]] = "";
     expect(check(v)).toEqual([]);
@@ -234,20 +241,21 @@ describe("提交门槛", () => {
     v.customFields.priority = "stale";
     expect(check(v).length).toBeGreaterThanOrEqual(3);
   });
-  it("已移除的业务、人工来源与构建信息不阻止提交", () => {
-    const v = d();
-    v.business = "";
-    v.manualNote = "";
-    v.buildUrl = "";
-    v.buildStatus = "unconfirmed";
-    v.buildManifest = {
-      packageName: "com.other.app",
-      versionName: "1.0",
-      versionCode: "0",
-      commit: null,
-      artifactSha256: null,
-    };
-    expect(check(v)).toEqual([]);
+  it.each([
+    ["business", "旧业务方向"],
+    ["manualNote", "旧人工补充来源"],
+    ["buildUrl", "https://jenkins.example/job/App/42/"],
+    ["buildStatus", "manual_confirmed"],
+    ["buildManifest", {}],
+  ])("已移除字段 %s 被草稿格式拒绝", (key, value) => {
+    const v = d() as Draft & Record<string, unknown>;
+    v[key] = value;
+    expect(draftSchema.safeParse(v).success).toBe(false);
+  });
+  it("已移除的渠道字段被草稿格式拒绝", () => {
+    const v = d() as Draft & { app: Draft["app"] & { channel?: string } };
+    v.app.channel = "internal";
+    expect(draftSchema.safeParse(v).success).toBe(false);
   });
   it("设备有效云控硬切移除，在线和离线校验均无需云控，旧属性被拒绝", () => {
     const v = d();

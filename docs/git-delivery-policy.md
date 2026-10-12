@@ -63,7 +63,7 @@ GitHub 对合并 PR 引发的 Multica 状态变更只视为外部事件。即使
 
 本约定允许在本仓库内按门槛正常推送任务分支、更新候选分支、创建 PR、执行候选 Actions 构建和合并已验收 PR。它不包括强推、删除远程成果、改变可见性、绕过保护或改写已有公开历史。
 
-`v*` tag、GitHub Release、签名、公证和正式分发需要单独的发布指令。当前 bundle workflow 的 `v*` tag 会触发打包，因此不能为了得到测试包而随意创建发布 tag。候选安装包使用 Actions artifacts。
+`v*` tag、GitHub Release、签名、公证和正式分发需要单独的发布指令。bundle workflow 的 `v*` tag 会触发四平台打包，并在全部成功及完整性校验通过后创建 GitHub Release，因此不能为了得到测试包而随意创建发布 tag。候选安装包使用手工触发的 Actions artifacts。
 
 禁止 `git push --all`、`--mirror` 或一次性推送所有 tags。每次只推送已核对的明确分支，上传前检查整个新增提交范围。PAT、钥匙串数据、日志、截图、视频、数据库和证据 ZIP 不进入源码仓库；GitHub 构建也不使用测试人员的云效 PAT。
 

@@ -5,10 +5,10 @@
 ## 检查、候选构建与公开发布
 
 - `Validate`（`.github/workflows/check.yml`）：PR 和 main/master push 运行 TypeScript、前端测试、合成安装包清单测试、Schema/夹具一致性、前端构建、Rust 测试、rustfmt 和严格 Clippy。
-- `Desktop bundles`（`.github/workflows/bundle.yml`）：只在手工 dispatch 或 `v*` tag push 时构建候选包。每个目标独立执行；一个目标失败不会取消其他目标，但该次矩阵不能作为四目标通过证据。
-- 公开 Release：当前没有发布 workflow，也没有 Release 写权限或自动发布步骤。普通分支 push 只检查。候选 artifact 上传不构成用户批准分发。
+- `Desktop bundles`（`.github/workflows/bundle.yml`）：只在手工 dispatch 或 `v*` tag push 时构建安装包。每个目标独立执行；一个目标失败不会取消其他目标，但该次矩阵不能作为四目标通过证据。
+- 手工 dispatch 只保留 Actions artifacts，不创建公开 Release。`v*` tag 必须与应用版本一致；四目标全部成功后，发布任务重新校验每个安装包的提交、版本、大小和 SHA-256，统一命名并创建 GitHub Release。缺少平台、格式、来源不一致或文件被改动时发布失败。
 
-所有 workflow 使用 `contents: read`，前端依赖用 `npm ci`，Rust 测试、Clippy 和 Tauri 打包使用 `--locked`。现有 `package-lock.json` 和 `src-tauri/Cargo.lock` 由集成者维护，本任务未更改。Rust stable 和 runner 标签沿用基线；锁文件不锁编译器或 runner 镜像版本，实际 Actions 验收仍需保留对应 run 的工具链日志。
+检查与平台构建任务使用 `contents: read`；只有 Tag 构建全部通过后的发布任务使用 `contents: write`。前端依赖用 `npm ci`，Rust 测试、Clippy 和 Tauri 打包使用 `--locked`。现有 `package-lock.json` 和 `src-tauri/Cargo.lock` 由集成者维护，本任务未更改。Rust stable 和 runner 标签沿用基线；锁文件不锁编译器或 runner 镜像版本，实际 Actions 验收仍需保留对应 run 的工具链日志。
 
 ## 原生矩阵与预期文件
 
@@ -39,7 +39,7 @@ node scripts/build-manifest.mjs --target aarch64-apple-darwin
 AndroidBugDesk-<package版本>-<完整40位commit>-<Rust target>-run<run ID>-attempt<attempt>
 ```
 
-本地执行没有 GitHub run 信息时省略 run/attempt 后缀。安装文件保留 Tauri 原始名称与相对目录，避免改变安装格式。一个目录中保存：
+本地执行没有 GitHub run 信息时省略 run/attempt 后缀。候选目录保留 Tauri 原始名称与相对目录，避免改变安装格式。一个目录中保存：
 
 - `build-manifest.json`：schemaVersion 1、package 名称与版本、Git HEAD 实际 commit、是否存在已跟踪修改、OS/arch/target、实际 Node hostPlatform、生成时间、artifact 名称及可取得的 CI run/attempt。
 - 每个安装文件：相对 artifact 根目录的 `/` 分隔路径、格式、真实字节数与小写 SHA256。

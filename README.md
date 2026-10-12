@@ -37,7 +37,7 @@ Linux 编译需要 WebKitGTK 4.1、GTK 3、DBus、librsvg、patchelf 和 OpenSSL
 
 ## GitHub Actions
 
-推送到 `main/master` 或创建 PR 执行检查。手动运行 **Desktop bundles** 或推送 `v*` tag 构建安装包，并保存为 Actions artifacts；不自动创建或发布 GitHub Release。
+推送到 `main/master` 或创建 PR 执行检查。手动运行 **Desktop bundles** 只生成 Actions artifacts；推送与 `package.json` 版本一致的 `v*` tag 会构建四个平台，逐包校验提交来源与 SHA-256，并在全部成功后创建 GitHub Release。
 
 macOS 构建使用 ad-hoc 签名；企业证书、Apple 公证及 Windows 签名后续接入。Linux x64 输出 `.deb` 与 `.AppImage`，Windows x64 输出 NSIS `.exe`，macOS 两架构分别输出 `.dmg` 与 `.app.zip`。其他架构可继续扩展矩阵。
 

@@ -11,9 +11,7 @@
     "clientVersion",
     "createdAt",
     "scope",
-    "build",
     "installedArtifact",
-    "ciArtifacts",
     "problem",
     "device",
     "collection",
@@ -40,10 +38,10 @@
     },
     "scope": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "organizationId",
         "projectId",
-        "businessProfile",
         "versions",
         "sprint",
         "multicaParentTaskId"
@@ -53,9 +51,6 @@
           "type": "string"
         },
         "projectId": {
-          "type": "string"
-        },
-        "businessProfile": {
           "type": "string"
         },
         "versions": {
@@ -72,73 +67,37 @@
         }
       }
     },
-    "build": {
-      "type": "object",
-      "required": [
-        "url",
-        "parsed",
-        "identityStatus",
-        "manifest",
-        "mappingStatus",
-        "parameters"
-      ],
-      "properties": {
-        "url": {
-          "type": "string"
-        },
-        "parsed": {
-          "type": ["array", "null"]
-        },
-        "identityStatus": {
-          "enum": ["unconfirmed", "manual_confirmed", "verified", "conflict"]
-        },
-        "manifest": {
-          "type": ["object", "null"]
-        },
-        "mappingStatus": {
-          "type": "string"
-        },
-        "parameters": {
-          "type": ["object", "null"]
-        }
-      }
-    },
     "installedArtifact": {
       "type": "object",
-      "required": ["identity", "fingerprints", "status"],
+      "additionalProperties": false,
+      "required": ["identity"],
       "properties": {
         "identity": {
-          "type": "object"
-        },
-        "fingerprints": {
-          "type": ["array", "null"]
-        },
-        "status": {
-          "type": "string"
-        }
-      }
-    },
-    "ciArtifacts": {
-      "type": "object",
-      "required": ["items", "status"],
-      "properties": {
-        "items": {
-          "type": ["array", "null"]
-        },
-        "status": {
-          "type": "string"
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["packageName", "versionName", "versionCode"],
+          "properties": {
+            "packageName": { "type": "string" },
+            "versionName": { "type": "string" },
+            "versionCode": { "type": "string" }
+          }
         }
       }
     },
     "problem": {
       "type": "object",
       "properties": {
+        "jenkinsPackageUrl": {
+          "type": "string",
+          "maxLength": 50000
+        },
         "bugPage": {
           "type": "string",
           "maxLength": 50000
         }
       },
       "required": [
+        "jenkinsPackageUrl",
         "kind",
         "title",
         "preconditions",

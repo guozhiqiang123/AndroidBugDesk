@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { Draft } from "../shared/domain";
 import {
@@ -13,7 +12,7 @@ import {
   type PostCaptureJob,
   type PostCaptureSnapshot,
 } from "../shared/post-capture";
-import { lockPageScroll } from "./custom-select";
+import { AppDialog } from "./app-dialog";
 import "./post-capture.css";
 
 export function PostCaptureEntry({
@@ -171,123 +170,124 @@ export function PostCaptureEntry({
           {error}
         </small>
       )}
-      {open &&
-        createPortal(
-          <CaptureDialog onClose={() => setOpen(false)}>
-            <p className="post-capture-context">
-              问题类型：{draft.kind} · 目标应用：
-              {draft.app.packageName || "未填写"}
-              <br />
-              目标设备：{serial || "未选择"}
-            </p>
-            <p className="post-capture-context">
-              读取设备仍保留的证据。当前状态是补采时状态，不会修改原 Bug
-              时间；录屏和复现附件请使用“导入附件”。
-            </p>
-            <div className="post-capture-options">
-              {captureItems
-                .filter((item) => item.id !== "environment")
-                .map((item) => (
-                  <label className="check" key={item.id}>
-                    <input
-                      type="checkbox"
-                      checked={selected.includes(item.id)}
-                      disabled={starting || running || disabled}
-                      onChange={(event) =>
-                        setSelected((current) =>
-                          event.target.checked
-                            ? [...current, item.id]
-                            : current.filter((id) => id !== item.id),
-                        )
-                      }
-                    />
-                    <span>
-                      {item.name}
-                      {completedItems.has(item.id) ? "（已采集）" : ""}
-                    </span>
-                  </label>
-                ))}
-            </div>
-            <p className="post-capture-context">
-              已采集项默认不重复勾选；如需更新，重新勾选后会用本次结果替换该项旧附件。
-            </p>
-            <div className="actions">
-              <button
-                className="primary"
-                disabled={
-                  disabled || starting || running || !serial || !selected.length
-                }
-                onClick={() => void begin(selected)}
-              >
-                {starting ? "准备采集…" : running ? "正在采集…" : "开始补采"}
-              </button>
-            </div>
-            {error && (
-              <small className="error-text" role="alert">
-                {error}
+      {open && (
+        <AppDialog
+          title="补采证据"
+          closeLabel="关闭补采"
+          className="post-capture-dialog"
+          onClose={() => setOpen(false)}
+        >
+          <p className="post-capture-context">
+            问题类型：{draft.kind} · 目标应用：
+            {draft.app.packageName || "未填写"}
+            <br />
+            目标设备：{serial || "未选择"}
+          </p>
+          <p className="post-capture-context">
+            读取设备仍保留的证据。当前状态是补采时状态，不会修改原 Bug
+            时间；录屏和复现附件请使用“导入附件”。
+          </p>
+          <div className="post-capture-options">
+            {captureItems
+              .filter((item) => item.id !== "environment")
+              .map((item) => (
+                <label className="check" key={item.id}>
+                  <input
+                    type="checkbox"
+                    checked={selected.includes(item.id)}
+                    disabled={starting || running || disabled}
+                    onChange={(event) =>
+                      setSelected((current) =>
+                        event.target.checked
+                          ? [...current, item.id]
+                          : current.filter((id) => id !== item.id),
+                      )
+                    }
+                  />
+                  <span>
+                    {item.name}
+                    {completedItems.has(item.id) ? "（已采集）" : ""}
+                  </span>
+                </label>
+              ))}
+          </div>
+          <p className="post-capture-context">
+            已采集项默认不重复勾选；如需更新，重新勾选后会用本次结果替换该项旧附件。
+          </p>
+          <div className="actions">
+            <button
+              className="primary"
+              disabled={
+                disabled || starting || running || !serial || !selected.length
+              }
+              onClick={() => void begin(selected)}
+            >
+              {starting ? "准备采集…" : running ? "正在采集…" : "开始补采"}
+            </button>
+          </div>
+          {error && (
+            <small className="error-text" role="alert">
+              {error}
+            </small>
+          )}
+          {latest && latestResults.length > 0 && (
+            <section className="post-capture-result" aria-label="补采结果">
+              <div className="card-title">
+                <strong>
+                  {running ? "正在补采" : "最近补采结果（每项仅显示最新一次）"}
+                </strong>
+                <small>{new Date(latest.startedAt).toLocaleString()}</small>
+              </div>
+              <small>
+                目标应用：{latest.targetPackage || "未填写"} · 设备：
+                {latest.serial}
               </small>
-            )}
-            {latest && latestResults.length > 0 && (
-              <section className="post-capture-result" aria-label="补采结果">
-                <div className="card-title">
-                  <strong>
-                    {running
-                      ? "正在补采"
-                      : "最近补采结果（每项仅显示最新一次）"}
-                  </strong>
-                  <small>{new Date(latest.startedAt).toLocaleString()}</small>
-                </div>
-                <small>
-                  目标应用：{latest.targetPackage || "未填写"} · 设备：
-                  {latest.serial}
-                </small>
-                {latest.error && (
-                  <small className="error-text">{latest.error}</small>
-                )}
-                {latestResults.map(({ itemId, result, job }) => {
-                  const item = captureItems.find(
-                    (candidate) => candidate.id === itemId,
-                  )!;
-                  const detail =
-                    result.status === "running"
-                      ? progressText(itemId, result.startedAt)
-                      : "";
-                  return (
-                    <div className="post-capture-result-item" key={itemId}>
-                      <div>
-                        <span>{item.name}</span>
-                        <small>
-                          {detail ||
-                            captureStatusLabels[result.status] ||
-                            result.status}
-                        </small>
-                      </div>
-                      {result.error && (
-                        <small className="error-text">{result.error}</small>
-                      )}
-                      {result.commands
-                        ?.filter((command) => command.error)
-                        .map((command, index) => (
-                          <small className="error-text" key={index}>
-                            {command.error}
-                          </small>
-                        ))}
-                      {retryableItems(job).includes(itemId) && (
-                        <button
-                          disabled={disabled || running || starting || !serial}
-                          onClick={() => void begin([itemId], job.id)}
-                        >
-                          重试{item.name}
-                        </button>
-                      )}
+              {latest.error && (
+                <small className="error-text">{latest.error}</small>
+              )}
+              {latestResults.map(({ itemId, result, job }) => {
+                const item = captureItems.find(
+                  (candidate) => candidate.id === itemId,
+                )!;
+                const detail =
+                  result.status === "running"
+                    ? progressText(itemId, result.startedAt)
+                    : "";
+                return (
+                  <div className="post-capture-result-item" key={itemId}>
+                    <div>
+                      <span>{item.name}</span>
+                      <small>
+                        {detail ||
+                          captureStatusLabels[result.status] ||
+                          result.status}
+                      </small>
                     </div>
-                  );
-                })}
-              </section>
-            )}
-          </CaptureDialog>,
-          document.body,
-        )}
+                    {result.error && (
+                      <small className="error-text">{result.error}</small>
+                    )}
+                    {result.commands
+                      ?.filter((command) => command.error)
+                      .map((command, index) => (
+                        <small className="error-text" key={index}>
+                          {command.error}
+                        </small>
+                      ))}
+                    {retryableItems(job).includes(itemId) && (
+                      <button
+                        disabled={disabled || running || starting || !serial}
+                        onClick={() => void begin([itemId], job.id)}
+                      >
+                        重试{item.name}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </section>
+          )}
+        </AppDialog>
+      )}
     </div>
   );
 }
@@ -401,73 +401,5 @@ export function EnvironmentSnapshotEntry({
         </small>
       )}
     </div>
-  );
-}
-function CaptureDialog({
-  children,
-  onClose,
-}: {
-  children: React.ReactNode;
-  onClose: () => void;
-}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    const dialog = ref.current!;
-    const opener = document.activeElement as HTMLElement | null;
-    const unlock = lockPageScroll();
-    dialog.showModal();
-    return () => {
-      dialog.close();
-      unlock();
-      if (opener?.isConnected) opener.focus({ preventScroll: true });
-    };
-  }, []);
-  return (
-    <dialog
-      ref={ref}
-      className="post-capture-dialog"
-      aria-labelledby="post-capture-title"
-      onCancel={(event) => {
-        event.preventDefault();
-        onClose();
-      }}
-      onKeyDown={(event) => {
-        if (event.key !== "Tab") return;
-        const controls = Array.from(
-          event.currentTarget.querySelectorAll<HTMLElement>(
-            "button,input,[tabindex]",
-          ),
-        ).filter(
-          (element) =>
-            !element.matches(":disabled") &&
-            element.tabIndex >= 0 &&
-            element.getClientRects().length,
-        );
-        const first = controls[0],
-          last = controls.at(-1);
-        if (
-          (event.shiftKey && document.activeElement === first) ||
-          (!event.shiftKey && document.activeElement === last)
-        ) {
-          event.preventDefault();
-          (event.shiftKey ? last : first)?.focus();
-        }
-      }}
-    >
-      <div className="post-capture-titlebar">
-        <h2 id="post-capture-title">补采证据</h2>
-        <button
-          type="button"
-          className="post-capture-close"
-          aria-label="关闭补采"
-          onClick={onClose}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M6 6l12 12M18 6L6 18" />
-          </svg>
-        </button>
-      </div>
-      <div className="post-capture-scroll">{children}</div>
-    </dialog>
   );
 }

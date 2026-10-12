@@ -21,31 +21,6 @@ pub fn useful(s: &str) -> bool {
 pub fn zoned_time(s: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(s).is_ok()
 }
-pub fn fixed_build_url(s: &str) -> Option<(String, String)> {
-    let u = reqwest::Url::parse(s).ok()?;
-    if !["http", "https"].contains(&u.scheme())
-        || !u.username().is_empty()
-        || u.password().is_some()
-        || u.query().is_some()
-        || u.fragment().is_some()
-    {
-        return None;
-    }
-    let re = regex::Regex::new(r"^(.*(?:/job/[^/]+)+)/([1-9][0-9]*)/?$").unwrap();
-    let caps = re.captures(u.path())?;
-    if [
-        "lastBuild",
-        "lastSuccessfulBuild",
-        "lastStableBuild",
-        "lastCompletedBuild",
-    ]
-    .iter()
-    .any(|v| u.path().split('/').any(|x| x == *v))
-    {
-        return None;
-    }
-    Some((caps[1].into(), caps[2].into()))
-}
 pub fn check_shape(d: &Value) -> Result<()> {
     if serde_json::to_vec(d).map_err(|e| e.to_string())?.len() > 2_000_000 {
         return Err("草稿超过体积限制".into());
@@ -160,20 +135,13 @@ pub fn validate(
     {
         add!("project", "请重新读取当前项目和缺陷类型配置");
     }
+    req!("jenkinsPackageUrl", "Jenkins包地址");
     req!("title", "问题标题");
     req!("app.packageName", "当前项目的 Android 包名配置");
     req!("preconditions", "复现条件");
+    req!("steps", "复现步骤");
     req!("expected", "期望表现");
     req!("actual", "问题表现");
-    let steps = string(d, "steps");
-    if !steps.lines().any(|s| !s.trim().is_empty())
-        || steps.lines().filter(|s| !s.trim().is_empty()).any(|s| {
-            s.trim().chars().count() < 6
-                || ["打开看一下", "打开看看", "查看一下"].contains(&s.trim())
-        })
-    {
-        add!("steps", "请逐行填写可执行的复现步骤");
-    }
     if !bool_at(d, "frequency.firstDiscovery") {
         let a = string(d, "frequency.attempts").parse::<u64>().unwrap_or(0);
         let b = string(d, "frequency.occurrences")

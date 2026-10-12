@@ -32,7 +32,6 @@ export type SelectionMemory = Pick<
   | "sprint"
   | "versions"
   | "kind"
-  | "business"
   | "customFields"
 >;
 export interface ProjectSetting {

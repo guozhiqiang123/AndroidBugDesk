@@ -89,10 +89,6 @@ checks: try {
       options: [],
     },
   );
-  fixture.business = "";
-  fixture.manualNote = "";
-  fixture.buildUrl = "";
-  fixture.buildStatus = "unconfirmed";
   fixture.customFields.labels = ["stale-label"];
   fixture.customFields.plannedStartDate = "invalid-old-date";
   fixture.customFields.notFixReason = "stale-reason";
@@ -337,8 +333,6 @@ checks: try {
               id: "00000000-0000-4000-8000-000000000010",
               serial: args.serial,
               packageName: args.packageName,
-              buildUrl: args.buildUrl,
-              business: args.business,
               startedAt: "2026-10-09T00:00:00Z",
               stoppedAt: null,
               snapshot: {},
@@ -361,7 +355,6 @@ checks: try {
               workitemTypeId: fixture.workitemTypeId,
               assignedTo: fixture.assignedTo,
               versions: fixture.versions,
-              business: fixture.business,
               customFields: {
                 ...fixture.customFields,
                 participants: [metadata.members[0].id],
@@ -914,9 +907,9 @@ checks: try {
     assert.equal(await closeCapture.locator("svg").count(), 1);
     const dialogChrome = await captureDialog.evaluate((node) => {
       const style = getComputedStyle(node);
-      const scroll = node.querySelector(".post-capture-scroll");
-      const title = node.querySelector(".post-capture-titlebar");
-      const close = node.querySelector(".post-capture-close");
+      const scroll = node.querySelector(".app-dialog-scroll");
+      const title = node.querySelector(".app-dialog-titlebar");
+      const close = node.querySelector(".app-dialog-close");
       return {
         overflow: style.overflow,
         topRightRadius: style.borderTopRightRadius,
@@ -941,15 +934,14 @@ checks: try {
       },
     );
     await captureDialog
-      .locator(".post-capture-scroll")
+      .locator(".app-dialog-scroll")
       .evaluate((node) => (node.scrollTop = node.scrollHeight));
     const fixedChrome = await captureDialog.evaluate((node) => ({
       titleTop: node
-        .querySelector(".post-capture-titlebar")
+        .querySelector(".app-dialog-titlebar")
         .getBoundingClientRect().top,
-      closeTop: node
-        .querySelector(".post-capture-close")
-        .getBoundingClientRect().top,
+      closeTop: node.querySelector(".app-dialog-close").getBoundingClientRect()
+        .top,
     }));
     assert.ok(
       Math.abs(fixedChrome.titleTop - dialogChrome.titleTop) < 1 &&
@@ -1156,8 +1148,8 @@ checks: try {
       .locator("#field-actual")
       .screenshot({ path: path.join(output, "empty-actual.png") });
     await input("actual").fill(saved.actual);
-    await input("steps").fill("打开看看");
-    assert.match(await messages("steps").innerText(), /可执行的复现步骤/);
+    await input("steps").fill("3331111\n444\n555\n666");
+    assert.equal(await messages("steps").count(), 0);
     await input("steps").fill(saved.steps);
     assert.equal(await messages("steps").count(), 0);
     for (const [id, hint] of [
@@ -1215,77 +1207,6 @@ checks: try {
     }
     await kind.click();
     await page.getByRole("option", { name: "功能", exact: true }).click();
-    await page.evaluate(() => {
-      window.__qa.devices = [];
-    });
-    const dialog = page.getByRole("dialog", {
-      name: "应用与设备",
-      exact: true,
-    });
-    const openDialog = () =>
-      page.getByRole("button", { name: "应用与设备", exact: true }).click();
-    const closeDialog = () =>
-      dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    await openDialog();
-    for (const field of await dialog
-      .locator(".app-device-inline-fields > .field")
-      .all()) {
-      const control = field.locator("input");
-      await control.fill("");
-      assert.ok(await control.getAttribute("placeholder"));
-      assert.equal(await field.locator(":scope > small").count(), 0);
-    }
-    assert.equal(
-      await dialog.locator(".app-device-inline-fields input").count(),
-      11,
-    );
-    for (const size of [
-      { width: 980, height: 700 },
-      { width: 1280, height: 900 },
-      { width: 1440, height: 1000 },
-    ]) {
-      await page.setViewportSize(size);
-      assert.equal(
-        await page.evaluate(
-          () => document.documentElement.scrollWidth <= innerWidth,
-        ),
-        true,
-      );
-      await dialog.screenshot({
-        path: path.join(output, `dialog-hints-${size.width}.png`),
-      });
-    }
-    await input("app.packageName").fill("com.example.different");
-    assert.match(await messages("app.packageName").innerText(), /不一致/);
-    await input("app.packageName").fill("com.example.mock");
-    assert.equal(await messages("app.packageName").count(), 0);
-    await closeDialog();
-    await page.getByRole("button", { name: "保存草稿", exact: true }).click();
-    await page.evaluate(() => {
-      window.__qa.missingPage = true;
-      window.__qa.drafts[0].sources.bugPage = {
-        status: "collected",
-        at: "2026-10-09T00:00:00Z",
-        detail: "previous automatic capture",
-      };
-      window.__qa.devices = [
-        {
-          serial: "PixelMock",
-          label: "Pixel Mock · PixelMock",
-          state: "device",
-        },
-      ];
-    });
-    await openDialog();
-    await messages("bugPage").waitFor();
-    assert.equal(await messages("bugPage").innerText(), "未能自动读取当前页面");
-    assert.equal(
-      await input("bugPage").getAttribute("placeholder"),
-      "自动读取当前 Activity，也可手动填写页面名称",
-    );
-    await input("bugPage").fill("手动页面");
-    assert.equal(await messages("bugPage").count(), 0);
-    await closeDialog();
     const logCard = page
       .locator(".attachment")
       .filter({ hasText: "logcat.log" });
@@ -1346,7 +1267,7 @@ checks: try {
       await page
         .getByRole("textbox", { name: "模拟项目 Android 包名" })
         .getAttribute("placeholder"),
-      "可选，留空不校验",
+      "主页面功能依赖此包名，如 com.example.app",
     );
     assert.deepEqual(errors, []);
     assert.equal(
@@ -1363,16 +1284,13 @@ checks: try {
           passed: true,
           mode: "Actual React input hints with mocked IPC; no real cloud/USB",
           scenarios: [
-            "five required problem inputs use hints without duplicate empty prompts and keep preview blocked",
+            "six required problem inputs use hints without duplicate empty prompts and keep preview blocked",
             "dynamic required text uses an input hint",
-            "invalid steps show a local error and clear after correction",
+            "nonblank reproduction steps do not use a subjective per-line length gate",
             "dynamic int/float/dateTime retain local format errors",
             "empty frequency uses hints, invalid nonempty frequency shows an error",
             "network inputs use hints and keep required validation",
             "data inputs use hints and keep required validation",
-            "all eleven dialog inputs have hints and no duplicates at 980/1280/1440 pixels",
-            "project/package mismatch remains local and clears after correction",
-            "failed page capture shows only the failure and clears on manual input",
             "empty log coverage uses hints and still blocks preview",
             "invalid log coverage remains local and clears after correction",
             "backend problem error is local and prevents preview",
@@ -1383,7 +1301,7 @@ checks: try {
         2,
       ) + "\n",
     );
-    console.log("14 input-hint scenarios passed; no real cloud/USB.");
+    console.log("11 input-hint scenarios passed; no real cloud/USB.");
     break checks;
   }
   if (process.env.QA_SCOPE === "frequency-row") {
@@ -1503,339 +1421,6 @@ checks: try {
       ) + "\n",
     );
     console.log("6 frequency-row scenarios passed; no real cloud/USB.");
-    break checks;
-  }
-  if (process.env.QA_SCOPE === "device-dialog") {
-    const dialog = page.getByRole("dialog", {
-      name: "应用与设备",
-      exact: true,
-    });
-    const countCalls = (command) =>
-      page.evaluate(
-        (cmd) => window.__qa.calls.filter((call) => call.cmd === cmd).length,
-        command,
-      );
-    const openDialog = async () => {
-      await page
-        .getByRole("button", { name: "应用与设备", exact: true })
-        .click();
-      await dialog.waitFor();
-      await page.waitForFunction(
-        () => document.querySelector(".app-device-fields")?.disabled === false,
-      );
-    };
-    const closeDialog = () =>
-      dialog.getByRole("button", { name: "关闭", exact: true }).click();
-    assert.equal(await countCalls("list_devices"), 0);
-    await openDialog();
-    assert.equal(await countCalls("list_devices"), 1);
-    assert.equal(await countCalls("inspect_device"), 1);
-    const pageField = dialog.locator('[id="field-bugPage"] input');
-    assert.equal(await pageField.inputValue(), "com.example.mock.MainActivity");
-    await pageField.fill("手动填写的问题页面");
-    const device = page.locator("#field-attachments").getByRole("combobox", {
-      name: "目标设备",
-      exact: true,
-    });
-    assert.equal(
-      await dialog
-        .getByRole("combobox", { name: "目标设备", exact: true })
-        .count(),
-      0,
-    );
-    assert.equal(
-      await countCalls("list_devices"),
-      1,
-      "rerenders do not refresh again",
-    );
-    await closeDialog();
-    await page.evaluate(() => {
-      window.__qa.devices = [
-        { serial: "other-device", state: "device", label: "Another phone" },
-        {
-          serial: "mock-device",
-          state: "device",
-          label: "Pixel Mock (mock-device)",
-        },
-      ];
-    });
-    await openDialog();
-    assert.equal(await countCalls("list_devices"), 2);
-    assert.equal(await countCalls("inspect_device"), 1);
-    assert.match(await device.innerText(), /Pixel Mock/);
-    assert.equal(await pageField.inputValue(), "手动填写的问题页面");
-    await closeDialog();
-    await page.evaluate(() => (window.__qa.failDeviceList = true));
-    await openDialog();
-    assert.equal(await countCalls("list_devices"), 3);
-    const deviceField = page.locator('[id="field-device.serial"]');
-    assert.match(await deviceField.innerText(), /模拟设备刷新失败/);
-    assert.equal(await page.locator("main > .banner.error").count(), 0);
-    await closeDialog();
-    await deviceField.screenshot({
-      path: path.join(output, "refresh-failure-local.png"),
-    });
-    await page.evaluate(() => (window.__qa.failDeviceList = false));
-    await openDialog();
-    assert.equal(await countCalls("list_devices"), 4);
-    assert.doesNotMatch(await deviceField.innerText(), /模拟设备刷新失败/);
-    await closeDialog();
-    await page.evaluate(() => (window.__qa.devices = []));
-    await openDialog();
-    assert.equal(await countCalls("list_devices"), 5);
-    assert.equal(await countCalls("inspect_device"), 1);
-    assert.equal(await pageField.inputValue(), "手动填写的问题页面");
-    await closeDialog();
-    await page.evaluate(() => (window.__qa.holdDeviceList = true));
-    await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-    await page.waitForFunction(
-      () => typeof window.__releaseDeviceList === "function",
-    );
-    assert.equal(await countCalls("list_devices"), 6);
-    await closeDialog();
-    await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-    assert.equal(
-      await countCalls("list_devices"),
-      6,
-      "reopening waits for the active action",
-    );
-    await page.evaluate(() => {
-      window.__qa.holdDeviceList = false;
-      window.__releaseDeviceList();
-      delete window.__releaseDeviceList;
-    });
-    await page.waitForFunction(
-      () =>
-        window.__qa.calls.filter((call) => call.cmd === "list_devices")
-          .length === 7 &&
-        document.querySelector(".app-device-fields")?.disabled === false,
-    );
-    assert.equal(await countCalls("list_devices"), 7);
-    for (const input of await dialog
-      .locator(".app-device-inline-fields input")
-      .all())
-      await input.fill("");
-    await closeDialog();
-    await page
-      .locator(".missing-list button")
-      .filter({ hasText: "应用与设备" })
-      .click();
-    await dialog.waitFor();
-    await page.waitForFunction(
-      () => document.querySelector(".app-device-fields")?.disabled === false,
-    );
-    assert.equal(
-      await countCalls("list_devices"),
-      8,
-      "validation navigation also refreshes once",
-    );
-    assert.equal(await countCalls("inspect_device"), 1);
-    await dialog.screenshot({
-      path: path.join(output, "auto-refresh-dialog.png"),
-    });
-    assert.equal(
-      await dialog.locator(".app-device-inline-fields input").count(),
-      11,
-    );
-    for (const name of ["选择 ADB 路径", "刷新设备"])
-      assert.equal(
-        await dialog.getByRole("button", { name, exact: true }).count(),
-        0,
-      );
-    assert.equal(
-      await page
-        .getByRole("button", {
-          name: "重新读取当前前台界面",
-          exact: true,
-        })
-        .count(),
-      0,
-    );
-    await closeDialog();
-    const connection = page.locator(
-      "#field-attachments .evidence-device-connection",
-    );
-    assert.equal(await connection.count(), 1);
-    const button = (name) =>
-      connection.getByRole("button", { name, exact: true });
-    await page.evaluate(() => {
-      window.__qa.devices = [
-        {
-          serial: "mock-device",
-          state: "device",
-          label: "Pixel Mock (mock-device)",
-        },
-        { serial: "second-device", state: "device", label: "Second Phone" },
-      ];
-    });
-    const beforeRefresh = await countCalls("list_devices");
-    const beforeRead = await countCalls("inspect_device");
-    await button("刷新设备").click();
-    await page.waitForFunction(
-      () =>
-        document.querySelector(".evidence-device-connection")?.disabled ===
-        false,
-    );
-    assert.equal(await countCalls("list_devices"), beforeRefresh + 1);
-    assert.equal(await countCalls("inspect_device"), beforeRead + 1);
-    await device.click();
-    await page
-      .getByRole("option", { name: "Second Phone", exact: true })
-      .click();
-    await page.waitForFunction(
-      () =>
-        document.querySelector(".evidence-device-connection")?.disabled ===
-        false,
-    );
-    assert.equal(await page.getByRole("listbox").count(), 0);
-    assert.equal(
-      await page.evaluate(
-        () =>
-          window.__qa.calls.filter((c) => c.cmd === "inspect_device").at(-1)
-            .args.serial,
-      ),
-      "second-device",
-    );
-    await openDialog();
-    assert.equal(await pageField.inputValue(), "com.example.mock.MainActivity");
-    await closeDialog();
-    await page.evaluate(() => (window.__qa.failDevice = true));
-    await button("刷新设备").click();
-    await deviceField.getByText(/模拟设备读取失败/).waitFor();
-    await page.evaluate(() => (window.__qa.failDevice = false));
-    await button("刷新设备").click();
-    await page.waitForFunction(
-      () =>
-        !document
-          .getElementById("field-device.serial")
-          .textContent.includes("模拟设备读取失败"),
-    );
-    await page.evaluate(() => (window.__qa.failAdb = true));
-    await button("选择 ADB 路径").click();
-    const adbField = connection.locator("#field-adbPath");
-    await adbField
-      .getByText("模拟 ADB 路径选择失败", { exact: true })
-      .waitFor();
-    assert.equal(await deviceField.getByText(/ADB 路径选择失败/).count(), 0);
-    await page.evaluate(() => (window.__qa.failAdb = false));
-    await button("选择 ADB 路径").click();
-    await page.waitForFunction(
-      () =>
-        !document
-          .getElementById("field-adbPath")
-          .textContent.includes("模拟 ADB 路径选择失败"),
-    );
-    assert.equal(await countCalls("choose_adb"), 2);
-    for (const [state, message] of [
-      ["unauthorized", "请在手机上允许 USB 调试授权"],
-      ["offline", "设备离线，请重新连接 USB"],
-    ]) {
-      await page.evaluate(
-        (state) =>
-          (window.__qa.devices = [
-            { serial: "second-device", label: "Second Phone", state },
-          ]),
-        state,
-      );
-      await button("刷新设备").click();
-      await deviceField.getByText(message, { exact: true }).waitFor();
-      assert.equal(await page.locator("main > .banner.error").count(), 0);
-    }
-    await page.evaluate(
-      () =>
-        (window.__qa.devices = [
-          { serial: "second-device", label: "Second Phone", state: "device" },
-        ]),
-    );
-    await button("刷新设备").click();
-    await page.waitForFunction(
-      () =>
-        document.querySelector(".evidence-device-connection")?.disabled ===
-        false,
-    );
-    for (const size of [
-      { width: 980, height: 700 },
-      { width: 1280, height: 900 },
-      { width: 1440, height: 1000 },
-    ]) {
-      await page.setViewportSize(size);
-      const layout = await connection.evaluate((node) => {
-        const select = node
-          .querySelector(".custom-select-trigger")
-          .getBoundingClientRect();
-        const controls = [
-          ...node.querySelectorAll(
-            ".device-connection-row > .connection-button-field > button",
-          ),
-        ].map((e) => e.getBoundingClientRect());
-        return {
-          overflow: document.documentElement.scrollWidth > innerWidth,
-          controlCount: controls.length,
-          aligned: controls.every(
-            (control) => Math.abs(select.top - control.top) < 2,
-          ),
-        };
-      });
-      assert.deepEqual(layout, {
-        overflow: false,
-        controlCount: 2,
-        aligned: true,
-      });
-      await connection.screenshot({
-        path: path.join(output, `evidence-device-${size.width}.png`),
-      });
-      await openDialog();
-      assert.equal(await dialog.getByRole("combobox").count(), 0);
-      assert.equal(
-        await dialog.locator(".app-device-inline-fields input").count(),
-        11,
-      );
-      await dialog.screenshot({
-        path: path.join(output, `device-fields-${size.width}.png`),
-      });
-      await page.keyboard.press("Escape");
-      assert.equal(await dialog.count(), 0);
-      assert.equal(
-        await page.evaluate(
-          () => document.activeElement?.closest("#field-appDevice") !== null,
-        ),
-        true,
-      );
-    }
-    assert.deepEqual(errors, []);
-    assert.equal(await countCalls("submit_bug"), 0);
-    await server.verifySource();
-    fs.writeFileSync(
-      path.join(output, "result.json"),
-      JSON.stringify(
-        {
-          passed: true,
-          mode: "Actual React evidence device connection and fields dialog with mocked IPC; no real USB/cloud",
-          scenarios: [
-            "first open refreshes once and reads the first device",
-            "rerenders do not repeat the automatic refresh",
-            "reopening retains the selected device and manual fields",
-            "refresh failure is local and reopening retries and clears it",
-            "empty device list does not inspect a stale device or overwrite fields",
-            "reopening during an active action waits then refreshes once",
-            "validation navigation opening also refreshes once",
-            "connection controls are in evidence; modal retains eleven fields only",
-            "standalone refresh/select invokes the shared device flow and closes single select",
-            "device and ADB errors stay at their controls and clear after retry",
-            "unauthorized and offline states remain below the device selector",
-            "980/1280/1440 layouts align buttons and preserve modal focus and Escape",
-          ],
-          calls: await page.evaluate(() =>
-            window.__qa.calls.map((call) => call.cmd),
-          ),
-        },
-        null,
-        2,
-      ) + "\n",
-    );
-    console.log(
-      "12 evidence device connection/dialog scenarios passed; no real USB/cloud.",
-    );
     break checks;
   }
   for (const [id, name] of [
@@ -1965,7 +1550,7 @@ checks: try {
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.locator("nav button").filter({ hasText: "历史提交" }).click();
   await page
-    .getByRole("heading", { name: "云效历史 Bug", exact: true })
+    .getByRole("heading", { name: "本机提交记录", exact: true })
     .waitFor();
   assert.equal(await page.locator(".page-header").count(), 0);
   assert.equal(
@@ -2028,6 +1613,7 @@ checks: try {
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.evaluate(() => window.scrollTo(0, 0));
   const problemFields = [
+    ["jenkinsPackageUrl", "Jenkins包地址（必填）"],
     ["title", "问题标题（必填）"],
     ["actual", "问题表现（必填）"],
     ["preconditions", "复现条件（必填）"],
@@ -2051,6 +1637,10 @@ checks: try {
     null,
   );
   assert.equal(
+    await problemInput("jenkinsPackageUrl").getAttribute("placeholder"),
+    "请填写 Jenkins 包地址",
+  );
+  assert.equal(
     await problemInput("preconditions").getAttribute("placeholder"),
     "补充安装方式、账号（如有）、网络情况、涉及的云控（如有）",
   );
@@ -2070,23 +1660,29 @@ checks: try {
         const grid = node.getBoundingClientRect();
         const field = (id) =>
           document.getElementById(`field-${id}`).getBoundingClientRect();
-        const title = field("title"),
+        const jenkins = field("jenkinsPackageUrl"),
+          title = field("title"),
           actual = field("actual"),
           conditions = field("preconditions"),
           steps = field("steps"),
           expected = field("expected");
         return {
+          jenkinsWidth: jenkins.width,
           titleWidth: title.width,
           gridWidth: grid.width,
-          titleFirst:
-            actual.top >= title.bottom && conditions.top >= title.bottom,
+          orderedFullRows:
+            title.top >= jenkins.bottom &&
+            actual.top >= title.bottom &&
+            conditions.top >= title.bottom,
           rowsAligned:
-            actual.top === conditions.top && steps.top === expected.top,
+            Math.abs(actual.top - expected.top) <= 1 &&
+            Math.abs(steps.top - conditions.top) <= 1,
           noOverflow: document.documentElement.scrollWidth <= innerWidth,
         };
       });
+    assert.ok(Math.abs(layout.jenkinsWidth - layout.gridWidth) <= 1);
     assert.ok(Math.abs(layout.titleWidth - layout.gridWidth) <= 1);
-    assert.equal(layout.titleFirst, true);
+    assert.equal(layout.orderedFullRows, true);
     assert.equal(layout.rowsAligned, true);
     assert.equal(layout.noOverflow, true);
     await page.locator(".issue-details-card").screenshot({
@@ -2102,6 +1698,37 @@ checks: try {
     .filter({ hasText: "问题标题" })
     .click();
   await page.waitForTimeout(500);
+  assert.equal(
+    await page
+      .locator("#field-title")
+      .evaluate((node) => node.classList.contains("validation-target-error")),
+    true,
+  );
+  assert.equal(
+    await page
+      .locator(".missing-list button")
+      .filter({ hasText: "问题标题" })
+      .evaluate((node) => node.classList.contains("active")),
+    true,
+  );
+  const validationColors = await page.evaluate(() => {
+    const field = document.querySelector("#field-title input");
+    const chip = [...document.querySelectorAll(".missing-list button")].find(
+      (node) => node.textContent?.includes("问题标题"),
+    );
+    return {
+      fieldBorder: getComputedStyle(field).borderColor,
+      fieldBackground: getComputedStyle(field).backgroundColor,
+      chipBackground: getComputedStyle(chip).backgroundColor,
+    };
+  });
+  assert.equal(validationColors.fieldBorder, "rgb(212, 106, 85)");
+  assert.equal(validationColors.fieldBackground, "rgb(255, 246, 243)");
+  assert.equal(validationColors.chipBackground, "rgb(180, 73, 54)");
+  await page.screenshot({
+    path: path.join(output, "validation-target-highlight.png"),
+    fullPage: false,
+  });
   const targetGeometry = await page.locator("#field-title").evaluate((node) => {
     const target = node.getBoundingClientRect();
     const header = document
@@ -2117,6 +1744,12 @@ checks: try {
     targetGeometry.visible && targetGeometry.top >= targetGeometry.bottom,
   );
   await page.locator("#field-title input").fill(originalTitle);
+  assert.equal(
+    await page
+      .locator("#field-title")
+      .evaluate((node) => node.classList.contains("validation-target-error")),
+    false,
+  );
   const previewCard = page.locator(".attachment").first();
   await previewCard.getByRole("button", { name: "预览", exact: true }).click();
   await page.waitForFunction(() =>
@@ -2277,6 +1910,9 @@ checks: try {
         await page.locator("#field-attachment-import .error-text").count(),
         0,
       );
+      await page
+        .getByRole("button", { name: "关闭提交预览", exact: true })
+        .click();
     }
     await page.locator("#field-attachments").screenshot({
       path: path.join(output, "optional-empty-attachments.png"),
@@ -2471,26 +2107,10 @@ checks: try {
   await titleField.locator("input").fill(savedTitle);
   assert.equal(
     await titleField.locator(".error-text, .warning-text").count(),
-    1,
+    0,
   );
   assert.equal(await page.locator("main > .banner.error").count(), 0);
   assert.equal(await page.locator(".preview").count(), 0);
-  await page
-    .locator(".missing-list button")
-    .filter({ hasText: "服务端标题" })
-    .click();
-  await page.waitForFunction(() => {
-    const r = document.getElementById("field-title").getBoundingClientRect(),
-      h = document.querySelector(".page-header").getBoundingClientRect();
-    return r.top >= h.bottom && r.top < innerHeight;
-  });
-  assert.ok(
-    await titleField.evaluate(
-      (node) =>
-        node.getBoundingClientRect().top >=
-        document.querySelector(".page-header").getBoundingClientRect().bottom,
-    ),
-  );
   await page.evaluate(() => (window.__qa.backendIssues = []));
   await titleField.locator("input").fill(savedTitle + "。");
   await titleField.locator("input").fill(savedTitle);
@@ -2507,150 +2127,40 @@ checks: try {
     0,
     "the device card is absent from the main page",
   );
-  const deviceAction = page.locator("#field-appDevice");
   assert.equal(
-    await deviceAction
-      .locator("xpath=ancestor::*[@id='field-attachments']")
-      .count(),
-    1,
+    await page.getByRole("button", { name: "应用与设备", exact: true }).count(),
+    0,
+    "removed app/device dialog entry stays absent",
   );
-  const openDevice = () =>
-    page.getByRole("button", { name: "应用与设备", exact: true }).click();
-  const deviceDialog = page.getByRole("dialog", {
-    name: "应用与设备",
-    exact: true,
-  });
-  const closeDevice = () =>
-    deviceDialog.getByRole("button", { name: "关闭", exact: true }).click();
-  for (const size of [
-    { width: 1440, height: 900 },
-    { width: 1280, height: 900 },
-    { width: 980, height: 700 },
-  ]) {
-    await page.setViewportSize(size);
-    await openDevice();
-    assert.equal(
-      await deviceDialog.evaluate((node) => node.matches(":modal")),
-      true,
-    );
-    assert.equal(
-      await deviceDialog.locator(".app-device-inline-fields input").count(),
-      11,
-    );
-    assert.doesNotMatch(await deviceDialog.innerText(), /选填|必填/);
-    const layout = await deviceDialog.evaluate((node) => {
-      const rect = node.getBoundingClientRect();
-      const fields = [
-        ...node.querySelectorAll(".app-device-inline-fields > .field"),
-      ].map((f) => f.getBoundingClientRect());
-      return {
-        left: rect.left,
-        right: rect.right,
-        top: rect.top,
-        bottom: rect.bottom,
-        columns: getComputedStyle(
-          node.querySelector(".app-device-inline-fields"),
-        ).gridTemplateColumns.split(" ").length,
-        rowsAligned:
-          fields[0].top === fields[1].top && fields[1].top === fields[2].top,
-        viewportWidth: innerWidth,
-        viewportHeight: innerHeight,
-      };
-    });
-    assert.equal(layout.columns, 3);
-    assert.equal(layout.rowsAligned, true);
-    await deviceDialog
-      .getByRole("button", { name: "关闭", exact: true })
-      .focus();
-    for (let i = 0; i < 18; i++) {
-      await page.keyboard.press("Tab");
-      assert.equal(
-        await deviceDialog.evaluate((node) =>
-          node.contains(document.activeElement),
-        ),
-        true,
-        "Tab focus stays inside the dialog",
-      );
-    }
-    assert.ok(
-      layout.left >= 0 &&
-        layout.right <= layout.viewportWidth &&
-        layout.top >= 0 &&
-        layout.bottom <= layout.viewportHeight,
-    );
-    const previousScroll = await page.evaluate(() => window.scrollY);
-    await page.mouse.move(2, 2);
-    await page.mouse.wheel(0, 1200);
-    assert.equal(
-      await page.evaluate(() => window.scrollY),
-      previousScroll,
-      "modal prevents underlying page scrolling",
-    );
-    await deviceDialog.screenshot({
-      path: path.join(output, `app-device-dialog-${size.width}.png`),
-    });
-    await page.keyboard.press("Escape");
-    assert.equal(await deviceDialog.count(), 0);
-    assert.equal(
-      await page.evaluate(
-        () => document.activeElement?.closest("#field-appDevice") !== null,
-      ),
-      true,
-      "closing restores focus to the attachment action",
-    );
-    assert.equal(await page.evaluate(() => document.body.style.overflow), "");
-  }
-  await page.setViewportSize({ width: 1280, height: 900 });
-  await openDevice();
-  const deviceInputs = deviceDialog.locator(".app-device-inline-fields input");
-  const originalDeviceValues = await deviceInputs.evaluateAll((inputs) =>
-    inputs.map((input) => input.value),
-  );
-  for (const input of await deviceInputs.all()) await input.fill(" ");
-  await closeDevice();
-  assert.equal(
-    await deviceAction.locator(".error-text").innerText(),
-    "应用与设备至少填写一项",
-  );
-  assert.equal(await previewButton.isDisabled(), true);
-  await page
-    .locator(".missing-list button")
-    .filter({ hasText: "应用与设备" })
-    .click();
-  await deviceDialog.waitFor();
-  await deviceDialog
-    .locator('[id="field-bugPage"] input')
-    .fill("仅填写问题页面");
-  await closeDevice();
-  assert.equal(await deviceAction.locator(".error-text").count(), 0);
-  assert.equal(await previewButton.isDisabled(), false);
-  await previewButton.click();
-  await page.getByRole("heading", { name: "提交预览", exact: true }).waitFor();
-  assert.equal(
-    await page.evaluate(() => window.__qa.drafts[0].bugPage),
-    "仅填写问题页面",
-  );
-  await openDevice();
-  await deviceDialog.locator('[id="field-bugPage"] input').fill("");
-  await deviceDialog.locator('[id="field-app.versionCode"] input').fill("0");
-  await closeDevice();
-  assert.equal(
-    await previewButton.isDisabled(),
-    false,
-    "a single zero version code passes the group gate",
-  );
-  await openDevice();
-  for (const [index, value] of originalDeviceValues.entries())
-    await deviceInputs.nth(index).fill(value);
-  await closeDevice();
-  assert.equal(await previewButton.isDisabled(), false);
+  assert.equal(await page.locator("#field-appDevice").count(), 0);
   await previewButton.click();
   await page.getByRole("heading", { name: "提交预览", exact: true }).waitFor();
   assert.equal(
     await page.getByRole("heading", { name: "提交预览", exact: true }).count(),
     1,
   );
-  const previewText = await page.locator(".preview").innerText();
+  const previewDialog = page.getByRole("dialog", {
+    name: "提交预览",
+    exact: true,
+  });
+  assert.equal(await page.locator("main .preview").count(), 0);
+  assert.equal(
+    await previewDialog
+      .getByRole("checkbox", { name: /我已核对项目、描述与附件内容/ })
+      .count(),
+    1,
+  );
+  assert.equal(
+    await previewDialog.getByRole("button", { name: "提交 Bug" }).count(),
+    1,
+  );
+  assert.equal(await previewDialog.locator(".app-dialog-close").count(), 1);
+  const previewText = await previewDialog.locator(".preview").innerText();
+  assert.match(previewText, /Jenkins包地址/);
+  assert.match(
+    previewText,
+    /https:\/\/jenkins\.example\.test\/job\/android\/128\/artifact\/app\.apk/,
+  );
   assert.match(previewText, /范围/);
   assert.doesNotMatch(previewText, /业务与范围/);
   assert.doesNotMatch(
@@ -2662,8 +2172,21 @@ checks: try {
     0,
   );
   assert.doesNotMatch(
-    await page.locator(".preview .check").innerText(),
+    await previewDialog.locator(".preview .check").innerText(),
     /构建/,
+  );
+  await previewDialog.screenshot({
+    path: path.join(output, "submit-preview-dialog.png"),
+  });
+  await page.keyboard.press("Escape");
+  await previewDialog.waitFor({ state: "detached" });
+  await page.waitForFunction(
+    () => document.activeElement?.textContent?.trim() === "进入提交预览",
+  );
+  await previewButton.click();
+  await page.getByRole("button", { name: "关闭提交预览", exact: true }).click();
+  await page.waitForFunction(
+    () => document.activeElement?.textContent?.trim() === "进入提交预览",
   );
   await page.evaluate(() => {
     const field = window.__qa.metadata.fields.find(
@@ -2732,66 +2255,10 @@ checks: try {
     await page.getByRole("button", { name: "退出登录", exact: true }).count(),
     0,
   );
-  await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-  await page.getByRole("dialog", { name: "应用与设备", exact: true }).waitFor();
-  const bugPage = page.locator('[id="field-bugPage"] input');
-  await page.waitForFunction(
-    () =>
-      document.querySelector('[id="field-bugPage"] input').value ===
-      "com.example.mock.MainActivity",
-  );
-  assert.equal(await page.getByText(/当前前台界面：/).count(), 0);
   assert.equal(
-    await page
-      .locator('[id="field-bugPage"]')
-      .getByText("自动采集", { exact: true })
-      .count(),
-    1,
-  );
-  await bugPage.fill("照片恢复结果页");
-  await page
-    .getByRole("dialog", { name: "应用与设备", exact: true })
-    .getByRole("button", { name: "关闭", exact: true })
-    .click();
-  await page.getByRole("button", { name: "保存草稿", exact: true }).click();
-  assert.equal(
-    await page.evaluate(() => window.__qa.drafts[0].bugPage),
-    "照片恢复结果页",
-  );
-  await page.locator("nav button").filter({ hasText: "设置" }).click();
-  await page.locator("nav button").filter({ hasText: "新建提交" }).click();
-  await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-  assert.equal(await bugPage.inputValue(), "照片恢复结果页");
-  await closeDevice();
-  await page.evaluate(() => (window.__qa.missingPage = true));
-  await page.getByRole("button", { name: "刷新设备", exact: true }).click();
-  await openDevice();
-  assert.equal(await bugPage.inputValue(), "照片恢复结果页");
-  await closeDevice();
-  await page.evaluate(() => (window.__qa.missingPage = false));
-  await page.getByRole("button", { name: "刷新设备", exact: true }).click();
-  await openDevice();
-  await page.waitForFunction(
-    () =>
-      document.querySelector('[id="field-bugPage"] input').value ===
-      "com.example.mock.MainActivity",
-  );
-  await bugPage.fill("");
-  await page
-    .getByRole("dialog", { name: "应用与设备", exact: true })
-    .getByRole("button", { name: "关闭", exact: true })
-    .click();
-  await page.getByRole("button", { name: "保存草稿", exact: true }).click();
-  await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-  assert.equal(
-    await page.locator('[id="field-bugPage"] .error-text').count(),
+    await page.getByRole("button", { name: "应用与设备", exact: true }).count(),
     0,
   );
-  assert.equal(
-    await page.locator('[id="field-app.packageName"] input').inputValue(),
-    "com.example.mock",
-  );
-  await closeDevice();
   await page.evaluate(() => (window.__qa.failDevice = true));
   await page.getByRole("button", { name: "刷新设备", exact: true }).click();
   const deviceField = page.locator('[id="field-device.serial"]');
@@ -2815,13 +2282,6 @@ checks: try {
   await page.locator(".evidence-device-connection").screenshot({
     path: path.join(output, "device-card-custom-select.png"),
   });
-  await openDevice();
-  await page.keyboard.press("Escape");
-  assert.equal(
-    await page.getByRole("dialog", { name: "应用与设备", exact: true }).count(),
-    0,
-    "Escape from a collapsed dropdown closes the dialog",
-  );
   await page.locator("nav button").filter({ hasText: "设置" }).click();
   await page.getByRole("heading", { name: "项目配置", exact: true }).waitFor();
   assert.equal(
@@ -2952,45 +2412,16 @@ checks: try {
     fullPage: true,
   });
   await page.locator("nav button").filter({ hasText: "新建提交" }).click();
-  await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-  await page.getByText(/配置包名 com\.other\.package/).waitFor();
-  const packageField = page.locator("#field-app\\.packageName");
-  const packageInput = packageField.locator("input");
-  const packageWarning = packageField.locator(".warning-text");
-  assert.equal(await packageWarning.count(), 1);
-  const packageGeometry = await packageWarning.evaluate((node) => {
-    const warning = node.getBoundingClientRect();
-    const input = node.parentElement
-      ?.querySelector("input")
-      ?.getBoundingClientRect();
-    return { warningTop: warning.top, inputBottom: input?.bottom ?? 0 };
-  });
-  assert.ok(packageGeometry.warningTop >= packageGeometry.inputBottom);
-  await page.setViewportSize({ width: 980, height: 700 });
-  assert.ok(
-    await packageWarning.evaluate((node) => {
-      const r = node.getBoundingClientRect(),
-        p = node.parentElement.getBoundingClientRect();
-      return (
-        r.left >= p.left && r.right <= p.right + 1 && r.bottom <= p.bottom + 1
-      );
-    }),
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.settingsByOrg["test-org"].entries.find(
+          (item) => item.projectId === "test-project",
+        )?.packageName,
+    ),
+    "com.other.package",
   );
-  await page.setViewportSize({ width: 1280, height: 900 });
-  await packageInput.fill("com.other.package");
-  await page.waitForFunction(
-    () => !document.querySelector("#field-app\\.packageName .warning-text"),
-  );
-  await packageInput.fill("com.example.mock");
-  await page.getByText(/配置包名 com\.other\.package/).waitFor();
-  await page.screenshot({
-    path: path.join(output, "package-mismatch-warning.png"),
-    fullPage: true,
-  });
-  await page
-    .getByRole("dialog", { name: "应用与设备", exact: true })
-    .getByRole("button", { name: "关闭", exact: true })
-    .click();
+  assert.equal(await page.locator('[id="field-app.packageName"]').count(), 0);
   await page.locator("nav button").filter({ hasText: "设置" }).click();
   const projectEnabled = page
     .locator(".project-settings-list")
@@ -3033,7 +2464,12 @@ checks: try {
     await page.getByRole("searchbox", { name: "搜索项目" }).inputValue(),
     "",
   );
+  await page
+    .getByRole("textbox", { name: "第二项目 Android 包名" })
+    .fill("com.second.project");
+  await page.getByRole("button", { name: "保存设置", exact: true }).click();
   await page.locator("nav button").filter({ hasText: "新建提交" }).click();
+  await page.getByRole("button", { name: "新建问题草稿", exact: true }).click();
   assert.equal(await page.locator('[id="field-versions"]').count(), 0);
   assert.equal(
     await page.getByRole("combobox", { name: "版本（可多选）" }).count(),
@@ -3089,27 +2525,18 @@ checks: try {
   await status.getByText("查看时间依据与缺口").click();
   assert.match(await status.innerText(), /初始缓冲区连续性不确定/);
   assert.match(await status.innerText(), /模拟断线缺口/);
-  await page.getByRole("button", { name: "应用与设备", exact: true }).click();
-  const trimmedDialog = page.getByRole("dialog", { name: "应用与设备" });
   assert.equal(
-    await trimmedDialog
+    await page
       .getByRole("button", { name: "恢复中断窗口记录", exact: true })
       .count(),
     0,
   );
   assert.equal(
-    await trimmedDialog
+    await page
       .getByRole("button", { name: "采集系统报告", exact: true })
       .count(),
     0,
   );
-  const closeIcon = trimmedDialog.getByRole("button", {
-    name: "关闭",
-    exact: true,
-  });
-  assert.equal(await closeIcon.innerText(), "");
-  assert.equal(await closeIcon.locator("svg").count(), 1);
-  await closeIcon.click();
   const windowCard = page
     .locator(".attachment")
     .filter({ hasText: "window.log" });
@@ -3126,21 +2553,7 @@ checks: try {
     await windowCard.locator("input[type=password]").inputValue(),
     "",
   );
-  await redacted.locator("input[type=checkbox]").check();
-  await page.waitForFunction(() => {
-    const d = window.__qa.drafts[0],
-      a = d.attachments.find((a) => a.name === "redacted.log");
-    return (
-      a?.confirmed &&
-      d.attachments
-        .filter((r) => r.derivedFrom === a.id)
-        .every((r) => r.confirmed)
-    );
-  });
-  assert.equal(
-    await windowCard.locator("input[type=checkbox]").isChecked(),
-    false,
-  );
+  assert.equal(await redacted.locator("input[type=checkbox]").count(), 0);
   const textReceipt = page
     .locator(".attachment")
     .filter({ hasText: "text-receipt.zip" });
@@ -3150,17 +2563,7 @@ checks: try {
     .filter({ hasText: "来源回执须与关联副本一起保留" })
     .waitFor();
   assert.equal(await textReceipt.count(), 1);
-  await textReceipt.locator("input[type=checkbox]").uncheck();
-  await page.waitForFunction(
-    () =>
-      !window.__qa.drafts[0].attachments.find((a) => a.name === "redacted.log")
-        .confirmed,
-  );
-  assert.equal(
-    await redacted.locator("input[type=checkbox]").isChecked(),
-    false,
-  );
-  await redacted.locator("input[type=checkbox]").check();
+  assert.equal(await textReceipt.locator("input[type=checkbox]").count(), 0);
   await page.screenshot({
     path: path.join(output, "evidence-mock.png"),
     fullPage: true,
@@ -3187,6 +2590,7 @@ checks: try {
     };
   });
   await page.evaluate(() => (window.__qa.failLogin = true));
+  await page.getByRole("tab", { name: "填写 PAT", exact: true }).click();
   await page.locator("input[type=password]").fill("mock-invalid");
   await page.getByRole("button", { name: "确定", exact: true }).click();
   const tokenError = page.locator(".login-form .field .error-text");
@@ -3241,6 +2645,7 @@ checks: try {
     window.__qa.authFailure = true;
   });
   await page.locator("nav button").filter({ hasText: "历史提交" }).click();
+  await page.getByRole("tab", { name: "云效历史 Bug", exact: true }).click();
   await page.getByRole("heading", { name: "登录云效", exact: true }).waitFor();
   assert.equal(await page.locator(".user-profile").count(), 0);
   assert.deepEqual(errors, []);
@@ -3258,18 +2663,11 @@ checks: try {
           "unconfigured login selects first real project and creates draft",
           "participants and cc ignore prior selection memory and start empty",
           "participants and cc preserve explicit saved selections and remain empty after clearing and metadata refresh",
-          "app/device dialog opens from evidence attachments and replaces the main-page card",
-          "dialog fits three viewport sizes, traps focus and blocks background scrolling",
-          "empty group blocks preview with one local message and navigation opens the dialog",
-          "single page or zero version code clears the group gate and actual preview succeeds",
-          "device-dropdown Escape leaves the dialog open",
-          "bug page auto-fills the full Activity and removes transient device text",
-          "manual bug page survives save, tab switch, and unavailable page read",
-          "explicit page reread refreshes the value and blank page has no required-field error",
+          "removed application/device dialog and manual field entry stay absent",
           "homepage removes device collection, business, manual source, and build controls",
           "cloud card and preview data are removed with no cloud input required",
           "excluded dynamic aliases, estimated time, and hidden optional fields stay absent",
-          "empty business and build fields reach actual preview with range retained",
+          "removed legacy fields are absent while actual preview retains range data",
           "removed required field shows configuration error and blocks preview",
           "homepage header stays fixed while wide and narrow pages scroll",
           "history and settings hide homepage header and new-draft action",
@@ -3277,19 +2675,20 @@ checks: try {
           "all attachment previews request the system application using only draft and attachment ids",
           "one import entry accepts mixed formats and shows import and system preview errors at their controls",
           "evidence buttons align with different error heights at three viewport widths; explanatory paragraph is removed",
-          "application/device dialog removes manual capture actions and uses an accessible close icon",
+          "removed recovery and system-report dialog actions stay absent",
           "new projects default unchecked while saved enabled state and package persist",
           "settings search filters project names and package mappings without dropping hidden rows",
           "empty settings search result can be cleared",
           "compact project settings rows fit narrow viewport",
           "fresh empty settings keep project selection and draft creation gated until one project is enabled",
-          "field warnings render below package input and disappear after correction",
-          "five required problem fields use new labels and exact textarea hints; manual time inputs are absent",
-          "title spans a full row across three viewport sizes with no hint or inline orange copy",
+          "settings package mapping synchronizes the hidden collected package identity",
+          "Jenkins package address and five problem fields are required with exact hints; manual time inputs are absent",
+          "Jenkins package address and title each span a full row across three viewport sizes",
           "blank problem fields block preview and navigate to the corresponding field",
           "field errors use Chinese navigation labels without summary duplication",
           "frequency errors navigate locally and late capture does not require attachments",
           "native title alias backend errors block preview and navigate to title without inline orange copy",
+          "submission preview, confirmation and submit action share a closable modal with focus return",
           "image and dynamic types do not require media; selected log coverage errors stay local",
           "device read failure stays below device selector and clears after retry",
           "login errors render below the PAT input",
@@ -3299,15 +2698,13 @@ checks: try {
           "homepage removes versions selector and retains sprint selector",
           "settings page owns organization and logout controls",
           "project settings save filters homepage projects",
-          "package mapping mismatch warning after ADB read",
           "all projects disabled shows recovery banner",
           "failed settings save preserves edited values and applied state",
           "organization switch reloads scoped project settings",
           "pending capture blocks preview",
           "local refresh preserves unsaved title",
           "range/time/uncertainty/gap display",
-          "redaction clears input and deselects original",
-          "paired confirmation and deselection",
+          "redaction clears the replacement input and creates its receipt",
           "standalone receipt removal blocked",
           "owner removal includes all paired receipts",
           "401 clears profile",

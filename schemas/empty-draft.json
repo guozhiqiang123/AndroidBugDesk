@@ -1,23 +1,15 @@
 {
   "id": "00000000-0000-4000-8000-000000000001",
   "sessionId": null,
+  "jenkinsPackageUrl": "",
   "title": "",
   "bugPage": "",
   "kind": "功能",
-  "business": "",
   "workitemTypeId": "",
   "assignedTo": "",
   "sprint": "",
   "versions": [],
-  "buildUrl": "",
-  "buildStatus": "unconfirmed",
-  "buildManifest": null,
-  "app": {
-    "packageName": "",
-    "versionName": "",
-    "versionCode": "",
-    "channel": ""
-  },
+  "app": { "packageName": "", "versionName": "", "versionCode": "" },
   "device": {
     "model": "",
     "androidVersion": "",
@@ -46,7 +38,6 @@
   "data": { "type": "", "count": "", "source": "" },
   "customFields": {},
   "sources": {},
-  "manualNote": "",
   "collectionErrors": [],
   "attachments": [],
   "previewConfirmed": false,

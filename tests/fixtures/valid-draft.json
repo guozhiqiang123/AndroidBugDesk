@@ -1,22 +1,18 @@
 {
   "id": "00000000-0000-4000-8000-000000000001",
   "sessionId": null,
+  "jenkinsPackageUrl": "https://jenkins.example.test/job/android/128/artifact/app.apk",
   "title": "点击恢复按钮后页面闪退",
   "bugPage": "com.example.test.RecoveryActivity",
   "kind": "功能",
-  "business": "测试方向",
   "workitemTypeId": "bug-type",
   "assignedTo": "member-1",
   "sprint": "",
   "versions": ["version-2"],
-  "buildUrl": "https://jenkins.example/job/App/42/",
-  "buildStatus": "manual_confirmed",
-  "buildManifest": null,
   "app": {
     "packageName": "com.example.test",
     "versionName": "1.0",
-    "versionCode": "0",
-    "channel": "internal"
+    "versionCode": "0"
   },
   "device": {
     "model": "模拟设备",
@@ -46,7 +42,6 @@
   "data": { "type": "", "count": "", "source": "" },
   "customFields": { "priority": "p2" },
   "sources": {},
-  "manualNote": "设备设置页面，测试人员核对",
   "collectionErrors": [],
   "attachments": [
     {

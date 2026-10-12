@@ -387,10 +387,6 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     }
     draft["event"]["originalAt"] = old["event"]["originalAt"].clone();
     draft["event"]["source"] = old["event"]["source"].clone();
-    draft["buildManifest"] = old["buildManifest"].clone();
-    if string(&draft, "buildStatus") == "verified" && string(&old, "buildStatus") != "verified" {
-        return Err("首版不能通过人工编辑宣称构建身份已精确验证".into());
-    }
     for group in ["app", "device"] {
         for (key, v) in draft[group].as_object().unwrap().clone() {
             // The project mapping owns packageName. A renderer echo or a changed
@@ -406,7 +402,6 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
                     && ["packageName", "versionName", "versionCode"].contains(&key.as_str())
                     && prior["status"] == "collected"
                 {
-                    draft["buildStatus"] = json!("conflict");
                     draft["collectionErrors"]
                         .as_array_mut()
                         .unwrap()
@@ -416,18 +411,6 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
                         )));
                 }
             }
-        }
-    }
-    if let Some(snapshot) = state.store.get::<Value>("snapshot", &id)? {
-        if ["packageName", "versionName", "versionCode"]
-            .iter()
-            .any(|k| {
-                snapshot["app"][k]
-                    .as_str()
-                    .is_some_and(|v| !v.is_empty() && snapshot["app"][k] != draft["app"][k])
-            })
-        {
-            draft["buildStatus"] = json!("conflict");
         }
     }
     // Protected sources were restored from storage above, so stamp the
@@ -531,8 +514,6 @@ pub async fn inspect_device(
                     );
                 }
             }
-            let unbound_app_changed = session_id.is_empty()
-                && string(&draft, "app.versionName") != string(&snapshot, "app.versionName");
             draft["device"] = snapshot["device"].clone();
             for (key, value) in snapshot["app"].as_object().unwrap() {
                 draft["app"][key] = value.clone();
@@ -567,9 +548,6 @@ pub async fn inspect_device(
             }
             draft["collectionErrors"] = json!(errors);
             draft["previewConfirmed"] = json!(false);
-            if unbound_app_changed {
-                draft["buildStatus"] = json!("unconfirmed");
-            }
             draft["updatedAt"] = json!(now());
             state
                 .store
@@ -583,13 +561,7 @@ pub async fn inspect_device(
     }
 }
 #[tauri::command]
-pub async fn start_session(
-    serial: String,
-    _package_name: String,
-    build_url: String,
-    business: String,
-    state: State<'_, AppState>,
-) -> Result<Value> {
+pub async fn start_session(serial: String, state: State<'_, AppState>) -> Result<Value> {
     crate::workspace::current_scope(&state, "")?;
     adb::valid_serial(&serial)?;
     let package_name = crate::project_settings::current_package_for_state(&state)?;
@@ -608,7 +580,7 @@ pub async fn start_session(
         return Err("所选设备未授权、离线或断开，请检查 USB 调试".into());
     }
     let snapshot = adb::snapshot(&path, &serial, &package_name).await?;
-    let session = json!({"id":uuid(),"serial":serial,"packageName":package_name,"buildUrl":build_url,"business":business,"startedAt":now(),"stoppedAt":null,"snapshot":snapshot,"logFiles":[],"gaps":[]});
+    let session = json!({"id":uuid(),"serial":serial,"packageName":package_name,"startedAt":now(),"stoppedAt":null,"snapshot":snapshot,"logFiles":[],"gaps":[]});
     let collector = adb::start_logs(path, serial, state.store.clone(), session.clone()).await?;
     *state.collector.lock().unwrap() = Some(collector);
     Ok(session)
@@ -665,7 +637,12 @@ pub async fn mark_problem(id: String, state: State<'_, AppState>) -> Result<Valu
     };
     let temp = state.store.root.join(format!("capture-{}.png", uuid()));
     let screenshot = match adb::screenshot(&path, &serial, &temp).await {
-        Ok(()) => evidence::inspect(&temp, "image", "ADB 问题时截图", &state.store.root),
+        Ok(_) => evidence::inspect(
+            &temp,
+            "image",
+            "ADB 问题时截图；保持原始分辨率并使用 PNG 无损压缩",
+            &state.store.root,
+        ),
         Err(e) => Err(e),
     };
     let _ = std::fs::remove_file(temp);
@@ -680,8 +657,6 @@ pub async fn mark_problem(id: String, state: State<'_, AppState>) -> Result<Valu
         return Err("草稿不属于当前账号或项目".into());
     }
     d["sessionId"] = json!(sid);
-    d["business"] = session["business"].clone();
-    d["buildUrl"] = session["buildUrl"].clone();
     d["device"] = snapshot["device"].clone();
     for (k, v) in snapshot["app"].as_object().ok_or("采集应用信息无效")? {
         d["app"][k] = v.clone();

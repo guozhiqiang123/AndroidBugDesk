@@ -482,12 +482,12 @@ async fn collect(
             .store
             .root
             .join(format!(".post-capture-screen-{}.png", uuid()));
-        adb::screenshot(path, &serial, &destination).await?;
+        let compression = adb::screenshot(path, &serial, &destination).await?;
         let inspected = evidence::inspect(
             &destination,
             "image",
             &format!(
-                "事后补采当前截图；采集项：{}；采集于 {}；不代表问题发生时画面",
+                "事后补采当前截图；保持原始分辨率并使用 PNG 无损压缩；采集项：{}；采集于 {}；不代表问题发生时画面",
                 item_name(item),
                 string(&receipt, "startedAt")
             ),
@@ -505,6 +505,16 @@ async fn collect(
         attachment.confirmed = false;
         receipt["status"] = json!("complete");
         receipt["finishedAt"] = json!(now());
+        receipt["compression"] = json!({
+            "format":"PNG",
+            "mode":"lossless",
+            "resolutionChanged":false,
+            "width":compression.width,
+            "height":compression.height,
+            "originalBytes":compression.original_bytes,
+            "storedBytes":compression.stored_bytes,
+            "smallerEncodingUsed":compression.optimized
+        });
         receipt["commands"] = json!([{"argv":["-s",serial,"exec-out","screencap","-p"],"startedAt":receipt["startedAt"],"finishedAt":receipt["finishedAt"]}]);
         return Ok((receipt, Some(attachment)));
     }

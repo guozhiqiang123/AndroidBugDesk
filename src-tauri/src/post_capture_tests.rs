@@ -69,7 +69,6 @@ fn app(root: &Path, adb: PathBuf) -> (tauri::App<tauri::test::MockRuntime>, Valu
     std::fs::write(&original, "original manual attachment").unwrap();
     draft["attachments"] =
         json!([evidence::inspect(&original, "sample", "原有附件", root).unwrap()]);
-    draft["sources"]["app.channel"] = json!({"status":"manual","at":now(),"detail":"人工渠道依据"});
     draft["collectionErrors"] = json!(["原有缺口"]);
     *state.profile.lock().unwrap() = metadata.profile;
     *state.user.lock().unwrap() = Some(crate::workspace::UserIdentity {
@@ -134,6 +133,20 @@ async fn all_items_keep_original_identity_time_and_manual_inputs_with_complete_r
     execute(&state, &string(&job, "id")).await.unwrap();
     let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
     assert_eq!(snapshot["jobs"][0]["status"], "complete");
+    let screenshot_result = &snapshot["jobs"][0]["items"]["screenshot"];
+    assert_eq!(screenshot_result["compression"]["format"], "PNG");
+    assert_eq!(screenshot_result["compression"]["mode"], "lossless");
+    assert_eq!(screenshot_result["compression"]["resolutionChanged"], false);
+    assert_eq!(screenshot_result["compression"]["width"], 1);
+    assert_eq!(screenshot_result["compression"]["height"], 1);
+    assert!(
+        screenshot_result["compression"]["storedBytes"]
+            .as_u64()
+            .unwrap()
+            <= screenshot_result["compression"]["originalBytes"]
+                .as_u64()
+                .unwrap()
+    );
     let draft = state.store.draft(&id).unwrap();
     for key in [
         "event",
@@ -197,6 +210,10 @@ async fn all_items_keep_original_identity_time_and_manual_inputs_with_complete_r
             "{} should identify its capture item in the attachment source",
             attachment.name
         );
+        if item == "screenshot" {
+            assert!(attachment.source.contains("原始分辨率"));
+            assert!(attachment.source.contains("PNG 无损压缩"));
+        }
     }
     let summary = files
         .iter()

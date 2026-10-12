@@ -561,33 +561,51 @@ fn removed_ids_are_ignored_when_metadata_no_longer_contains_them() {
 }
 
 #[test]
-fn removed_submission_inputs_do_not_block_online_or_offline_validation() {
-    let m = metadata();
-    let mut d = fixture();
-    d["business"] = json!("");
-    d["manualNote"] = json!("");
-    d["buildUrl"] = json!("");
-    d["buildStatus"] = json!("unconfirmed");
-    for online in [true, false] {
-        let issues = validation::validate(&d, &m.profile, Some(&m), true, online);
-        assert!(issues.iter().all(|issue| {
-            !["business", "manualNote", "buildUrl", "buildStatus"].contains(&issue.field.as_str())
-        }));
+fn removed_submission_inputs_are_rejected_by_the_draft_contract() {
+    for (field, value) in [
+        ("business", json!("旧业务方向")),
+        ("manualNote", json!("旧人工补充来源")),
+        ("buildUrl", json!("https://ci.example/job/App/42/")),
+        ("buildStatus", json!("manual_confirmed")),
+        ("buildManifest", json!({})),
+    ] {
+        let mut d = fixture();
+        d[field] = value;
+        assert!(validation::check_shape(&d).is_err(), "{field}");
     }
+    let mut d = fixture();
+    d["app"]["channel"] = json!("internal");
+    assert!(validation::check_shape(&d).is_err());
 }
 
 #[test]
-fn report_omits_removed_business_and_build_sections() {
-    let d = fixture();
+fn report_omits_all_removed_submission_fields() {
+    let mut d = fixture();
+    d["business"] = json!("旧业务方向");
+    d["manualNote"] = json!("旧人工补充来源");
+    d["buildUrl"] = json!("https://ci.example/job/App/42/");
+    d["buildStatus"] = json!("manual_confirmed");
+    d["buildManifest"] = json!({"legacy":true});
+    d["app"]["channel"] = json!("internal");
     let report = evidence::report(&d, &metadata().profile);
-    assert!(!report.contains("方向："));
-    assert!(!report.contains("Jenkins 固定构建"));
-    assert!(!report.contains("人工补充来源"));
+    for removed in [
+        "方向：",
+        "Jenkins 固定构建",
+        "人工补充来源",
+        "channel",
+        "buildUrl",
+        "buildStatus",
+        "buildManifest",
+        "manualNote",
+    ] {
+        assert!(!report.contains(removed), "{removed}");
+    }
 }
 #[test]
 fn every_base_missing_field_is_blocked() {
     let m = metadata();
     for path in [
+        "jenkinsPackageUrl",
         "title",
         "workitemTypeId",
         "assignedTo",
@@ -610,9 +628,18 @@ fn every_base_missing_field_is_blocked() {
     }
 }
 #[test]
+fn reproduction_steps_only_require_non_blank_content() {
+    let m = metadata();
+    let mut d = fixture();
+    d["steps"] = json!("3331111\n444\n555\n666");
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
+    assert!(validation::validate(&d, &m.profile, None, false, false).is_empty());
+}
+#[test]
 fn problem_fields_are_required_and_manual_time_is_not_a_submission_gate() {
     let m = metadata();
     for (path, label) in [
+        ("jenkinsPackageUrl", "Jenkins包地址"),
         ("title", "问题标题"),
         ("actual", "问题表现"),
         ("preconditions", "复现条件"),
@@ -646,12 +673,19 @@ fn problem_fields_are_required_and_manual_time_is_not_a_submission_gate() {
 #[test]
 fn evidence_report_uses_the_problem_form_labels() {
     let report = evidence::report(&fixture(), &metadata().profile);
-    for label in ["复现条件", "期望表现", "问题表现"] {
+    for label in ["Jenkins包地址", "复现条件", "期望表现", "问题表现"] {
         assert!(report.contains(&format!("## {label}\n")));
     }
+    assert!(report.contains("https://jenkins.example.test/job/android/128/artifact/app.apk"));
     for label in ["前置条件", "预期结果", "实际结果"] {
         assert!(!report.contains(&format!("## {label}\n")));
     }
+    assert!(!report.contains("## 采集缺口"));
+    assert!(!report.contains("[]"));
+    let mut with_gaps = fixture();
+    with_gaps["collectionErrors"] = json!(["USB 断开 3 秒", "日志未覆盖问题发生前"]);
+    let report = evidence::report(&with_gaps, &metadata().profile);
+    assert!(report.contains("## 采集缺口\n\n- USB 断开 3 秒\n- 日志未覆盖问题发生前\n"));
 }
 #[test]
 fn project_package_is_required_while_device_fields_and_page_are_optional() {
@@ -673,7 +707,6 @@ fn project_package_is_required_while_device_fields_and_page_are_optional() {
     }
     d["app"]["versionName"] = json!("");
     d["app"]["versionCode"] = json!("");
-    d["app"]["channel"] = json!("");
     assert!(validation::check_shape(&d).is_ok());
     assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
 }
@@ -687,9 +720,7 @@ fn schema_rejects_injected_keys_and_invalid_hash() {
     assert!(validation::check_shape(&d).is_err());
 }
 #[test]
-fn build_links_and_memory_are_honest() {
-    assert!(validation::fixed_build_url("http://ci/job/App/lastBuild/").is_none());
-    assert!(validation::fixed_build_url("http://ci/job/Folder/job/App/42/").is_some());
+fn device_parsers_and_identity_validation_are_honest() {
     assert_eq!(
         adb::parse_memory("MemTotal: 100 kB\nMemFree: 20 kB\n"),
         ("100".into(), "".into())
@@ -719,6 +750,17 @@ fn evidence_hashes_and_managed_merge_are_stable() {
     assert!(merged.starts_with("人工补充：不要覆盖"));
     assert!(merged.ends_with("尾部编辑保留"));
     assert!(merged.contains("complete"));
+    assert!(!merged.contains("<!-- android-bug-desk:"));
+    assert!(merged.contains(&format!("[android-bug-desk-{}-start]:", e.id)));
+    let legacy = format!(
+        "人工补充\n<!-- android-bug-desk:{}:start -->\n旧证据段\n<!-- android-bug-desk:{}:end -->\n尾部保留",
+        e.id, e.id
+    );
+    let upgraded = evidence::merge_managed(&legacy, &e, &[], true).unwrap();
+    assert!(upgraded.starts_with("人工补充"));
+    assert!(upgraded.ends_with("尾部保留"));
+    assert!(!upgraded.contains("<!-- android-bug-desk:"));
+    assert!(upgraded.contains(&evidence::marker(&e.id)));
     assert_eq!(
         before,
         evidence::hash_file(Path::new(&e.zip_path)).unwrap().1
@@ -734,6 +776,10 @@ fn evidence_hashes_and_managed_merge_are_stable() {
     let schema: Value =
         serde_json::from_str(include_str!("../../schemas/manifest.schema.json")).unwrap();
     assert!(jsonschema::is_valid(&schema, &manifest));
+    assert_eq!(
+        manifest["problem"]["jenkinsPackageUrl"],
+        d["jenkinsPackageUrl"]
+    );
     assert_eq!(manifest["problem"]["bugPage"], d["bugPage"]);
     let mut report = String::new();
     zip.by_name(&format!("{}/report.md", e.id))
@@ -742,9 +788,16 @@ fn evidence_hashes_and_managed_merge_are_stable() {
         .unwrap();
     assert!(report.contains(&string(&d, "bugPage")));
     assert!(manifest.get("cloudConfig").is_none());
+    assert!(manifest.get("build").is_none());
+    assert!(manifest.get("ciArtifacts").is_none());
+    assert!(manifest["scope"].get("businessProfile").is_none());
+    assert!(manifest["installedArtifact"].get("fingerprints").is_none());
+    assert!(manifest["installedArtifact"].get("status").is_none());
+    assert!(manifest["installedArtifact"]["identity"]
+        .get("channel")
+        .is_none());
     assert!(zip.by_name(&format!("{}/cloud-config.json", e.id)).is_err());
     assert!(!Path::new(&e.directory).join("cloud-config.json").exists());
-    assert_eq!(manifest["installedArtifact"]["fingerprints"], Value::Null);
     assert_eq!(
         manifest["files"][0]["sha256"],
         d["attachments"][0]["sha256"]
@@ -988,6 +1041,8 @@ async fn mock_complete_upload_reads_all_pages_and_hashes() {
     assert!(string(&r.body, "description").contains("测试人员在云效追加的说明"));
     assert!(string(&r.body, "description")
         .contains(&format!("## Bug所在页面\n\n{}", string(&d, "bugPage"))));
+    assert!(!string(&r.body, "description").contains("## 采集缺口"));
+    assert!(!string(&r.body, "description").contains("<!-- android-bug-desk:"));
 }
 #[tokio::test]
 async fn missing_fields_and_new_unsupported_field_make_zero_create_calls() {
@@ -1708,19 +1763,21 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
         .manage(state)
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    crate::commands::start_session(
-        "integration-device".into(),
-        "com.example.app".into(),
-        string(&d, "buildUrl"),
-        string(&d, "business"),
-        app.state(),
-    )
-    .await
-    .unwrap();
+    crate::commands::start_session("integration-device".into(), app.state())
+        .await
+        .unwrap();
     let marked = crate::commands::mark_problem(id.clone(), app.state())
         .await
         .unwrap();
     assert!(marked["event"].get("lateCapture").is_none());
+    let problem_screenshot = marked["attachments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|attachment| string(attachment, "mime") == "image/png")
+        .unwrap();
+    assert!(string(problem_screenshot, "source").contains("原始分辨率"));
+    assert!(string(problem_screenshot, "source").contains("PNG 无损压缩"));
     validation::check_shape(&marked).unwrap();
     assert!(crate::capture::pending(&store, &id).unwrap());
     assert!(crate::commands::submit_bug(id.clone(), app.state())
@@ -1880,7 +1937,6 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
             row["confirmed"] = json!(true);
         }
     }
-    final_d["app"]["channel"] = d["app"]["channel"].clone();
     final_d["previewConfirmed"] = json!(true);
     // Every listed attachment uploads without a per-file confirmation gate.
     for row in final_d["attachments"].as_array_mut().unwrap() {
@@ -1966,15 +2022,9 @@ async fn integrated_early_stop_interrupts_window_and_never_pads_time() {
         .manage(state)
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    crate::commands::start_session(
-        "integration-device".into(),
-        "com.example.app".into(),
-        string(&d, "buildUrl"),
-        string(&d, "business"),
-        app.state(),
-    )
-    .await
-    .unwrap();
+    crate::commands::start_session("integration-device".into(), app.state())
+        .await
+        .unwrap();
     crate::commands::mark_problem(id.clone(), app.state())
         .await
         .unwrap();

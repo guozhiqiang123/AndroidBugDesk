@@ -44,6 +44,7 @@ import {
 import { LoginCard, LoginRestoring } from "./login-card";
 import { CustomSelect } from "./custom-select";
 import { NotificationToast, useTransientNotice } from "./notification-toast";
+import { AppDialog } from "./app-dialog";
 import {
   attachmentIssueKey,
   groupIssuesByNavigationTarget,
@@ -108,8 +109,6 @@ function App() {
   const [token, setToken] = useState(""),
     [devices, setDevices] = useState<Device[]>([]),
     [serial, setSerial] = useState("");
-  const [buildUrl, setBuildUrl] = useState(""),
-    [business, setBusiness] = useState("");
   const [session, setSession] = useState<Session | null>(null),
     [preview, setPreview] = useState(false),
     [dirty, setDirty] = useState(false);
@@ -130,6 +129,7 @@ function App() {
   const [settingsEnabledOnly, setSettingsEnabledOnly] = useState(false);
   const [settingsPackageOnly, setSettingsPackageOnly] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const [activeIssueTarget, setActiveIssueTarget] = useState("");
   const [backendIssues, setBackendIssues] = useState<
     { field: string; message: string }[]
   >([]);
@@ -138,6 +138,7 @@ function App() {
   const deviceReadEpoch = useRef(0);
   const selectedSerialRef = useRef("");
   const homeDeviceRefreshKey = useRef("");
+  const previewTriggerRef = useRef<HTMLButtonElement>(null);
   const activeDraftRef = useRef<Draft | null>(null);
   const memoryWrite = useRef<Promise<unknown>>(Promise.resolve());
   const busyGate = useRef(false);
@@ -187,8 +188,6 @@ function App() {
     setDevices([]);
     selectedSerialRef.current = "";
     setSerial("");
-    setBuildUrl("");
-    setBusiness("");
     setAuth({ status: "invalid", user: null, message });
     setRememberLogin(false);
     setOrganizations([]);
@@ -587,11 +586,13 @@ function App() {
   useEffect(() => {
     setFieldErrors({});
     setBackendIssues([]);
+    setActiveIssueTarget("");
     setDraftsToDelete(null);
   }, [draft?.id, organizationId]);
   const update = (path: string, value: unknown) => {
     if (!draft) return;
     setBackendIssues([]);
+    setActiveIssueTarget("");
     const next = structuredClone(draft);
     const parts = path.split(".");
     let obj: Record<string, unknown> = next as unknown as Record<
@@ -640,7 +641,6 @@ function App() {
       sprint: next.sprint,
       versions: next.versions,
       kind: next.kind,
-      business: next.business,
       customFields: next.customFields,
     };
     memoryWrite.current = enqueueSelectionWrite(
@@ -708,7 +708,6 @@ function App() {
           ...(observed?.sources ?? snapshot.sources),
         };
         merged.collectionErrors = observed?.collectionErrors ?? snapshot.errors;
-        if (observed?.buildStatus) merged.buildStatus = observed.buildStatus;
         merged.previewConfirmed = false;
         return merged;
       });
@@ -897,8 +896,6 @@ function App() {
     selectedSerialRef.current = "";
     setSerial("");
     setDevices([]);
-    setBuildUrl("");
-    setBusiness("");
     setDraft(null);
     setDirty(false);
     setProjectSettings({ entries: [] });
@@ -1144,12 +1141,12 @@ function App() {
   })();
   const issueLabel = (path: string) =>
     ({
+      jenkinsPackageUrl: "Jenkins包地址",
       title: "问题标题",
       actual: "问题表现",
       "app.packageName": "项目包名配置",
       "app.versionName": "versionName",
       "app.versionCode": "versionCode",
-      "app.channel": "渠道",
       "device.model": "设备型号",
       "device.androidVersion": "Android 版本",
       "device.totalMemKb": "总内存（kB）",
@@ -1211,6 +1208,20 @@ function App() {
     issues.filter((item) => item.field !== "previewConfirmed"),
     issueNavigationTarget,
   );
+  const activeIssueStillPresent = issueNavigationGroups.some(
+    (group) => group.target === activeIssueTarget,
+  );
+  useEffect(() => {
+    if (!activeIssueTarget || !activeIssueStillPresent) {
+      if (activeIssueTarget) setActiveIssueTarget("");
+      return;
+    }
+    const target = document.getElementById(activeIssueTarget);
+    target?.classList.add("validation-target-error");
+    return () => {
+      target?.classList.remove("validation-target-error");
+    };
+  }, [activeIssueTarget, activeIssueStillPresent, tab]);
   const field = (
     path: string,
     label: string,
@@ -1343,6 +1354,7 @@ function App() {
   const fallbackIssues = issues.filter(
     (item) =>
       !new Set([
+        "jenkinsPackageUrl",
         "title",
         "actual",
         "kind",
@@ -1363,7 +1375,6 @@ function App() {
         "app.packageName",
         "app.versionName",
         "app.versionCode",
-        "app.channel",
         "device.model",
         "device.androidVersion",
         "device.totalMemKb",
@@ -1950,6 +1961,11 @@ function App() {
                     </button>
                   </div>
                   <div className="grid problem-fields-grid">
+                    {field("jenkinsPackageUrl", "Jenkins包地址（必填）", {
+                      required: true,
+                      fullWidth: true,
+                      hint: "请填写 Jenkins 包地址",
+                    })}
                     {field("title", "问题标题（必填）", {
                       aliases: ["customFields.subject"],
                       required: true,
@@ -1966,15 +1982,15 @@ function App() {
                       required: true,
                       hint: "需要描述清楚应该是什么表现，越清楚越好",
                     })}
-                    {field("steps", "复现步骤（必填）", {
-                      multi: true,
-                      required: true,
-                      hint: "每行填写一步，描述可执行的操作",
-                    })}
                     {field("preconditions", "复现条件（必填）", {
                       multi: true,
                       required: true,
                       hint: "补充安装方式、账号（如有）、网络情况、涉及的云控（如有）",
+                    })}
+                    {field("steps", "复现步骤（必填）", {
+                      multi: true,
+                      required: true,
+                      hint: "每行填写一步，描述可执行的操作",
                     })}
                   </div>
                   <div className="grid">{dynamicFields(false)}</div>
@@ -2334,7 +2350,16 @@ function App() {
                     {issueNavigationGroups.map((group) => (
                       <button
                         key={group.target}
+                        className={
+                          activeIssueTarget === group.target ? "active" : ""
+                        }
+                        aria-current={
+                          activeIssueTarget === group.target
+                            ? "true"
+                            : undefined
+                        }
                         onClick={() => {
+                          setActiveIssueTarget(group.target);
                           if (group.field === "app.packageName") {
                             setPreview(false);
                             setTab("settings");
@@ -2395,6 +2420,7 @@ function App() {
                     导出本地证据
                   </button>
                   <button
+                    ref={previewTriggerRef}
                     className="primary"
                     disabled={
                       frozen ||
@@ -2426,86 +2452,97 @@ function App() {
                 </div>
               </section>
               {preview && (
-                <section className="card preview">
-                  <h2>提交预览</h2>
-                  <dl>
-                    <dt>云效项目</dt>
-                    <dd>{boot.profile.name}</dd>
-                    <dt>负责人</dt>
-                    <dd>
-                      {boot.metadata?.members.find(
-                        (m) => m.id === draft.assignedTo,
-                      )?.name ?? "未选择"}
-                    </dd>
-                    <dt>范围</dt>
-                    <dd>
-                      版本 {draft.versions.join(", ")} · 迭代 {draft.sprint}
-                    </dd>
-                    <dt>问题标题</dt>
-                    <dd>{draft.title}</dd>
-                    <dt>复现条件</dt>
-                    <dd>{draft.preconditions}</dd>
-                    <dt>复现步骤</dt>
-                    <dd className="preserve">{draft.steps}</dd>
-                    <dt>期望表现 / 问题表现</dt>
-                    <dd>
-                      {draft.expected}
-                      <hr />
-                      {draft.actual}
-                    </dd>
-                    <dt>设备 / 应用 / 时间</dt>
-                    <dd className="preserve">
-                      {JSON.stringify(
-                        {
-                          device: draft.device,
-                          app: draft.app,
-                          event: draft.event,
-                        },
-                        null,
-                        2,
-                      )}
-                    </dd>
-                    <dt>将上传</dt>
-                    <dd>
-                      {draft.attachments.map((a) => a.name).join("、")}
-                      ，以及不可变证据 ZIP
-                    </dd>
-                  </dl>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={draft.previewConfirmed}
-                      onChange={(e) => {
-                        const next = {
-                          ...draft,
-                          previewConfirmed: e.target.checked,
-                        };
-                        setDraft(next);
-                        setDirty(true);
-                      }}
-                    />
-                    我已核对项目、描述与附件内容，并确认上传
-                  </label>
-                  <button
-                    className="primary"
-                    disabled={
-                      !draft.previewConfirmed || !!busy || capturePending
-                    }
-                    onClick={() =>
-                      void run("提交 Bug 并核对附件", async () => {
-                        const d = await save();
-                        const s = await invoke<Submission>("submit_bug", {
-                          id: d.id,
-                        });
-                        await refresh();
-                        setTab("history");
-                        setNotice(stateLabels[s.state] ?? s.state);
-                      })
-                    }
-                  >
-                    提交 Bug
-                  </button>
-                </section>
+                <AppDialog
+                  title="提交预览"
+                  className="preview-dialog"
+                  onClose={() => setPreview(false)}
+                  returnFocusRef={previewTriggerRef}
+                >
+                  <section className="preview">
+                    <dl>
+                      <dt>云效项目</dt>
+                      <dd>{boot.profile.name}</dd>
+                      <dt>负责人</dt>
+                      <dd>
+                        {boot.metadata?.members.find(
+                          (m) => m.id === draft.assignedTo,
+                        )?.name ?? "未选择"}
+                      </dd>
+                      <dt>范围</dt>
+                      <dd>
+                        版本 {draft.versions.join(", ")} · 迭代 {draft.sprint}
+                      </dd>
+                      <dt>Jenkins包地址</dt>
+                      <dd className="preserve">{draft.jenkinsPackageUrl}</dd>
+                      <dt>问题标题</dt>
+                      <dd>{draft.title}</dd>
+                      <dt>复现条件</dt>
+                      <dd>{draft.preconditions}</dd>
+                      <dt>复现步骤</dt>
+                      <dd className="preserve">{draft.steps}</dd>
+                      <dt>期望表现 / 问题表现</dt>
+                      <dd>
+                        {draft.expected}
+                        <hr />
+                        {draft.actual}
+                      </dd>
+                      <dt>设备 / 应用 / 时间</dt>
+                      <dd className="preserve">
+                        {JSON.stringify(
+                          {
+                            device: draft.device,
+                            app: draft.app,
+                            event: draft.event,
+                          },
+                          null,
+                          2,
+                        )}
+                      </dd>
+                      <dt>将上传</dt>
+                      <dd>
+                        {draft.attachments.map((a) => a.name).join("、")}
+                        ，以及不可变证据 ZIP
+                      </dd>
+                    </dl>
+                    <div className="preview-confirm-actions">
+                      <label className="check">
+                        <input
+                          type="checkbox"
+                          checked={draft.previewConfirmed}
+                          onChange={(e) => {
+                            const next = {
+                              ...draft,
+                              previewConfirmed: e.target.checked,
+                            };
+                            setDraft(next);
+                            setDirty(true);
+                          }}
+                        />
+                        我已核对项目、描述与附件内容，并确认上传
+                      </label>
+                      <button
+                        className="primary"
+                        disabled={
+                          !draft.previewConfirmed || !!busy || capturePending
+                        }
+                        onClick={() =>
+                          void run("提交 Bug 并核对附件", async () => {
+                            const d = await save();
+                            const s = await invoke<Submission>("submit_bug", {
+                              id: d.id,
+                            });
+                            await refresh();
+                            setPreview(false);
+                            setTab("history");
+                            setNotice(stateLabels[s.state] ?? s.state);
+                          })
+                        }
+                      >
+                        提交 Bug
+                      </button>
+                    </div>
+                  </section>
+                </AppDialog>
               )}
             </>
           ))}
