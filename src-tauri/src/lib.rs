@@ -16,6 +16,7 @@ pub mod submission;
 pub mod submission_fields;
 #[cfg(test)]
 mod tests;
+pub mod updates;
 pub mod validation;
 pub mod workitem_links;
 pub mod workspace;
@@ -72,7 +73,12 @@ pub fn run() {
             commands::submit_bug,
             commands::reconcile_submission,
             commands::copy_receipt,
-            commands::open_receipt
+            commands::copy_history_link,
+            commands::open_history_item,
+            commands::open_receipt,
+            updates::check_for_updates,
+            updates::install_update,
+            updates::open_release_page
         ])
         .build(tauri::generate_context!())
         .expect("desktop initialization failed")

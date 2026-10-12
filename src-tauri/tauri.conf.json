@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Android Bug Desk", "version": "0.1.0", "identifier": "com.qa.androidbugdesk",
+  "productName": "Android Bug Desk", "version": "0.2.0", "identifier": "com.qa.androidbugdesk",
   "build": { "beforeDevCommand": "npm run dev:web", "devUrl": "http://127.0.0.1:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
   "app": {
     "windows": [{ "label": "main", "title": "Android Bug Desk · Android 缺陷采集", "width": 1280, "height": 900, "minWidth": 980, "minHeight": 700 }],

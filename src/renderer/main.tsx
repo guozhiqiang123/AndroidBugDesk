@@ -19,7 +19,10 @@ import type {
   UserIdentity,
   ProjectSettings,
   DraftProjectScope,
+  UpdateCheckResult,
+  UpdateInstallResult,
 } from "../shared/workspace";
+import appPackage from "../../package.json";
 import {
   nativeTarget,
   validateDraft,
@@ -87,6 +90,18 @@ interface Bootstrap {
   captures?: CaptureStatus[];
   draftScopes?: Record<string, DraftProjectScope>;
 }
+type UpdateCheckStatus =
+  "idle" | "checking" | "current" | "available" | "error";
+interface UpdateCheckState {
+  status: UpdateCheckStatus;
+  result: UpdateCheckResult | null;
+  message: string;
+}
+type UpdateDialogState = {
+  mode: "confirm" | "installing" | "error";
+  result: UpdateCheckResult;
+  message: string;
+} | null;
 const stateLabels: Record<string, string> = {
   ready: "证据已固定",
   creating: "正在创建",
@@ -97,6 +112,27 @@ const stateLabels: Record<string, string> = {
   partial: "已创建，证据未齐",
   submitted: "提交完成",
 };
+function displayVersion(version?: string | null) {
+  return version ? `v${version.replace(/^v/i, "")}` : "—";
+}
+function updateStatusLabel(status: UpdateCheckStatus) {
+  if (status === "checking") return "正在检查";
+  if (status === "available") return "发现新版本";
+  if (status === "current") return "已是最新";
+  if (status === "error") return "检查失败";
+  return "尚未检查";
+}
+function displayBytes(size?: number | null) {
+  if (!size) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = size;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
 function App() {
   const [boot, setBoot] = useState<Bootstrap | null>(initialWorkspace),
     [draft, setDraft] = useState<Draft | null>(null);
@@ -128,6 +164,13 @@ function App() {
   const [settingsQuery, setSettingsQuery] = useState("");
   const [settingsEnabledOnly, setSettingsEnabledOnly] = useState(false);
   const [settingsPackageOnly, setSettingsPackageOnly] = useState(false);
+  const [settingsExpanded, setSettingsExpanded] = useState(false);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({
+    status: "idle",
+    result: null,
+    message: "点击检查 GitHub Release 列表。",
+  });
+  const [updateDialog, setUpdateDialog] = useState<UpdateDialogState>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [activeIssueTarget, setActiveIssueTarget] = useState("");
   const [backendIssues, setBackendIssues] = useState<
@@ -143,6 +186,7 @@ function App() {
   const memoryWrite = useRef<Promise<unknown>>(Promise.resolve());
   const busyGate = useRef(false);
   const workspaceEpoch = useRef(0);
+  const startupUpdateChecked = useRef(false);
   const refresh = async () => {
     const b = await invoke<Bootstrap>("bootstrap");
     setBoot(b);
@@ -178,6 +222,79 @@ function App() {
       setBusy("");
     }
   };
+  const checkForUpdates = async (showStartupPrompt = false) => {
+    if (updateCheck.status === "checking") return;
+    setUpdateCheck((current) => ({
+      ...current,
+      status: "checking",
+      message: "正在读取 GitHub Release 列表…",
+    }));
+    try {
+      const result = await invoke<UpdateCheckResult>("check_for_updates");
+      setUpdateCheck({
+        status: !result.ok
+          ? "error"
+          : result.hasUpdate
+            ? "available"
+            : "current",
+        result,
+        message: result.error || result.message,
+      });
+      if (showStartupPrompt && result.hasUpdate && result.canAutoUpdate) {
+        setUpdateDialog({
+          mode: "confirm",
+          result,
+          message: result.message,
+        });
+      }
+    } catch (cause) {
+      setUpdateCheck({
+        status: "error",
+        result: null,
+        message: typeof cause === "string" ? cause : String(cause),
+      });
+    }
+  };
+  const startUpdate = async (result = updateCheck.result) => {
+    if (!result?.canAutoUpdate) return;
+    setUpdateDialog({
+      mode: "installing",
+      result,
+      message: "正在下载安装包并校验完整性，请保持网络连接。",
+    });
+    try {
+      const installed = await invoke<UpdateInstallResult>("install_update");
+      if (!installed.ok) throw installed.error || installed.message;
+      setUpdateDialog({
+        mode: "installing",
+        result,
+        message: installed.message,
+      });
+    } catch (cause) {
+      setUpdateDialog({
+        mode: "error",
+        result,
+        message: typeof cause === "string" ? cause : String(cause),
+      });
+    }
+  };
+  const openReleasePage = async () => {
+    try {
+      await invoke("open_release_page");
+      setNotice("已在系统浏览器中打开 GitHub Release 页面。");
+    } catch (cause) {
+      setUpdateCheck((current) => ({
+        ...current,
+        status: "error",
+        message: typeof cause === "string" ? cause : String(cause),
+      }));
+    }
+  };
+  useEffect(() => {
+    if (!isTauri() || startupUpdateChecked.current) return;
+    startupUpdateChecked.current = true;
+    void checkForUpdates(true);
+  }, []);
   const invalidateAuth = async (message: string) => {
     workspaceEpoch.current += 1;
     await invoke("clear_auth").catch(() => undefined);
@@ -201,6 +318,7 @@ function App() {
     setSettingsQuery("");
     setSettingsEnabledOnly(false);
     setSettingsPackageOnly(false);
+    setSettingsExpanded(false);
     setOrganizationId("");
     setProjectId("");
     setBoot((b) =>
@@ -262,6 +380,7 @@ function App() {
       setSettingsQuery("");
       setSettingsEnabledOnly(false);
       setSettingsPackageOnly(false);
+      setSettingsExpanded(false);
       setProjectId("");
       return { valid: false, packageReady: false, profile };
     }
@@ -1106,6 +1225,9 @@ function App() {
       .toLocaleLowerCase()
       .includes(normalizedSettingsQuery);
   });
+  const displayedSettingsProjects = settingsExpanded
+    ? visibleSettingsProjects
+    : visibleSettingsProjects.slice(0, 3);
   const value = (path: string) =>
     path
       .split(".")
@@ -1572,7 +1694,15 @@ function App() {
           </div>
         </aside>
       )}
-      <main className={tab === "new" ? "home-main" : undefined}>
+      <main
+        className={
+          tab === "new"
+            ? "home-main"
+            : tab === "history"
+              ? "history-main"
+              : undefined
+        }
+      >
         {boot.authorized && tab === "new" && (
           <header className="page-header">
             <h1>新建提交</h1>
@@ -1837,7 +1967,7 @@ function App() {
                 </div>
               ) : (
                 <div className="project-settings-list">
-                  {visibleSettingsProjects.map((project) => {
+                  {displayedSettingsProjects.map((project) => {
                     const setting = projectSettings.entries.find(
                       (item) => item.projectId === project.id,
                     ) ?? {
@@ -1899,8 +2029,94 @@ function App() {
                       </div>
                     );
                   })}
+                  {visibleSettingsProjects.length > 3 && (
+                    <div className="project-settings-expand">
+                      <button
+                        type="button"
+                        aria-expanded={settingsExpanded}
+                        onClick={() =>
+                          setSettingsExpanded((current) => !current)
+                        }
+                      >
+                        {settingsExpanded
+                          ? "收起（仅显示 3 项）"
+                          : `展开全部（${visibleSettingsProjects.length} 项）`}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
+            </section>
+            <section
+              className={`card settings-card update-card update-${updateCheck.status}`}
+              data-testid="update-card"
+            >
+              <div className="card-title">
+                <h2>检查更新</h2>
+                <span className="update-status-badge">
+                  {updateStatusLabel(updateCheck.status)}
+                </span>
+              </div>
+              <div className="update-summary" aria-live="polite">
+                <span className="update-indicator" aria-hidden="true" />
+                <div>
+                  <strong>{updateStatusLabel(updateCheck.status)}</strong>
+                  <p>{updateCheck.message}</p>
+                </div>
+              </div>
+              <div className="update-version-grid">
+                <div>
+                  <span>当前版本</span>
+                  <strong>
+                    {displayVersion(
+                      updateCheck.result?.currentVersion ?? appPackage.version,
+                    )}
+                  </strong>
+                </div>
+                <div>
+                  <span>最新正式版本</span>
+                  <strong>
+                    {displayVersion(updateCheck.result?.latestVersion)}
+                  </strong>
+                </div>
+              </div>
+              <p className="muted-text update-check-note">
+                从 GitHub Release 列表检查，草稿和预发布版本不会参与比较。
+                {updateCheck.result?.assetName
+                  ? ` 当前系统安装包：${updateCheck.result.assetName}${
+                      updateCheck.result.assetSizeBytes
+                        ? `（${displayBytes(updateCheck.result.assetSizeBytes)}）`
+                        : ""
+                    }。`
+                  : ""}
+                {updateCheck.result?.checkedAtEpochMs
+                  ? ` 最近检查：${new Date(
+                      updateCheck.result.checkedAtEpochMs,
+                    ).toLocaleString("zh-CN", { hour12: false })}`
+                  : ""}
+              </p>
+              <div className="actions update-actions">
+                <button
+                  className="primary"
+                  disabled={updateCheck.status === "checking"}
+                  onClick={() =>
+                    updateCheck.status === "available" &&
+                    updateCheck.result?.canAutoUpdate
+                      ? void startUpdate()
+                      : void checkForUpdates()
+                  }
+                >
+                  {updateCheck.status === "checking"
+                    ? "检查中…"
+                    : updateCheck.status === "available" &&
+                        updateCheck.result?.canAutoUpdate
+                      ? "立马更新"
+                      : "检查更新"}
+                </button>
+                <button onClick={() => void openReleasePage()}>
+                  打开 Release 页面
+                </button>
+              </div>
             </section>
           </>
         )}
@@ -2701,6 +2917,74 @@ function App() {
           </div>
         )}
       </main>
+      {updateDialog && (
+        <AppDialog
+          title={
+            updateDialog.mode === "error"
+              ? "更新失败"
+              : updateDialog.mode === "installing"
+                ? "正在更新"
+                : "发现新版本"
+          }
+          className="update-dialog"
+          onClose={() => setUpdateDialog(null)}
+        >
+          <div className="update-dialog-body" aria-live="polite">
+            {updateDialog.mode === "installing" && (
+              <span className="update-spinner" aria-hidden="true" />
+            )}
+            <div>
+              <p>{updateDialog.message}</p>
+              <dl className="update-dialog-details">
+                <div>
+                  <dt>版本</dt>
+                  <dd>
+                    {displayVersion(updateDialog.result.currentVersion)} →{" "}
+                    {displayVersion(updateDialog.result.latestVersion)}
+                  </dd>
+                </div>
+                {updateDialog.result.assetName && (
+                  <div>
+                    <dt>安装包</dt>
+                    <dd>
+                      {updateDialog.result.assetName}
+                      {updateDialog.result.assetSizeBytes
+                        ? ` · ${displayBytes(updateDialog.result.assetSizeBytes)}`
+                        : ""}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+          </div>
+          {updateDialog.mode === "confirm" && (
+            <div className="actions update-dialog-actions">
+              <button onClick={() => setUpdateDialog(null)}>取消</button>
+              <button
+                className="primary"
+                onClick={() => void startUpdate(updateDialog.result)}
+              >
+                立马更新
+              </button>
+            </div>
+          )}
+          {updateDialog.mode === "installing" && (
+            <p className="muted-text update-install-note">
+              下载完成后应用会自动退出、覆盖安装并重新打开。
+            </p>
+          )}
+          {updateDialog.mode === "error" && (
+            <div className="actions update-dialog-actions">
+              <button onClick={() => void openReleasePage()}>
+                打开 Release 页面
+              </button>
+              <button className="primary" onClick={() => setUpdateDialog(null)}>
+                关闭
+              </button>
+            </div>
+          )}
+        </AppDialog>
+      )}
       <NotificationToast
         notification={
           boot.authorized && error

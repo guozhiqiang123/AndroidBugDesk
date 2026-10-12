@@ -1189,16 +1189,38 @@ pub fn copy_receipt(id: String, repair: bool, state: State<AppState>) -> Result<
         .set_text(text)
         .map_err(|_| "复制失败".into())
 }
+
 #[tauri::command]
-pub fn open_receipt(id: String, state: State<AppState>) -> Result<()> {
-    let s: Submission = state.store.get("submission", &id)?.ok_or("提交不存在")?;
-    let url = crate::workitem_links::bug_url(s.url.as_deref(), s.identifier.as_deref())
-        .ok_or("云效暂未提供可用工作项编号或链接")?;
+pub fn copy_history_link(identifier: String) -> Result<()> {
+    let url = crate::workitem_links::bug_url(None, Some(&identifier))
+        .ok_or("云效历史未提供可用的工作项编号")?;
+    arboard::Clipboard::new()
+        .map_err(|_| "剪贴板不可用")?
+        .set_text(url)
+        .map_err(|_| "复制失败".into())
+}
+
+#[tauri::command]
+pub fn open_history_item(identifier: String) -> Result<()> {
+    let url = crate::workitem_links::bug_url(None, Some(&identifier))
+        .ok_or("云效历史未提供可用的工作项编号")?;
+    open_confirmed_yunxiao_url(url)
+}
+
+fn open_confirmed_yunxiao_url(url: String) -> Result<()> {
     let u = reqwest::Url::parse(&url).map_err(|_| "链接不合法")?;
     if u.scheme() != "https" || u.host_str() != Some("devops.aliyun.com") {
         return Err("只允许打开已确认的云效链接".into());
     }
     open::that(url).map_err(|_| "打开浏览器失败".into())
+}
+
+#[tauri::command]
+pub fn open_receipt(id: String, state: State<AppState>) -> Result<()> {
+    let s: Submission = state.store.get("submission", &id)?.ok_or("提交不存在")?;
+    let url = crate::workitem_links::bug_url(s.url.as_deref(), s.identifier.as_deref())
+        .ok_or("云效暂未提供可用工作项编号或链接")?;
+    open_confirmed_yunxiao_url(url)
 }
 pub fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let root = app.path().app_local_data_dir()?;

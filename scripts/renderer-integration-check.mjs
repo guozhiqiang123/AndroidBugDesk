@@ -112,7 +112,7 @@ checks: try {
     }
   }
   await page.addInitScript(
-    ({ fixture, metadata, inputHints, postCapture }) => {
+    ({ fixture, metadata, inputHints, postCapture, startupUpdate }) => {
       const clone = (v) => structuredClone(v);
       fixture.sessionId = postCapture
         ? null
@@ -158,6 +158,11 @@ checks: try {
               },
               {
                 projectId: "long-project",
+                enabled: false,
+                packageName: "",
+              },
+              {
+                projectId: "another-project",
                 enabled: false,
                 packageName: "",
               },
@@ -239,6 +244,7 @@ checks: try {
                     id: "long-project",
                     name: "LongProjectWithoutSpaces_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789",
                   },
+                  { id: "another-project", name: "第四项目" },
                 ];
           if (cmd === "load_project_settings")
             return clone(
@@ -249,6 +255,39 @@ checks: try {
             q.settingsByOrg[args.organizationId] = clone(args.settings);
             return clone(q.settingsByOrg[args.organizationId]);
           }
+          if (cmd === "check_for_updates") {
+            const checkCount = q.calls.filter(
+              (call) => call.cmd === "check_for_updates",
+            ).length;
+            const updateAvailable = startupUpdate || checkCount > 1;
+            return {
+              ok: true,
+              currentVersion: "0.1.0",
+              latestVersion: updateAvailable ? "0.2.0" : "0.1.0",
+              hasUpdate: updateAvailable,
+              releaseUrl: `https://github.com/guozhiqiang123/AndroidBugDesk/releases/tag/v${updateAvailable ? "0.2.0" : "0.1.0"}`,
+              publishedAt: "2026-10-12T00:00:00Z",
+              releasesChecked: 2,
+              checkedAtEpochMs: 1791734400000,
+              assetName: updateAvailable
+                ? "Android-Bug-Desk-0.2.0-macos-arm64.dmg"
+                : "Android-Bug-Desk-0.1.0-macos-arm64.dmg",
+              assetSizeBytes: 10485760,
+              canAutoUpdate: updateAvailable,
+              message: updateAvailable
+                ? "发现新版本 v0.2.0，可直接下载安装。"
+                : "当前版本 v0.1.0 已是最新正式版本。",
+              error: null,
+            };
+          }
+          if (cmd === "install_update")
+            return {
+              ok: false,
+              message: "更新失败。",
+              filePath: null,
+              error: "模拟下载安装失败",
+            };
+          if (cmd === "open_release_page") return;
           if (cmd === "select_project") {
             if (q.failProject) throw "模拟项目切换失败";
             q.profile = {
@@ -541,15 +580,82 @@ checks: try {
       postCapture: ["post-capture", "device-connection-row"].includes(
         process.env.QA_SCOPE,
       ),
+      startupUpdate: process.env.QA_SCOPE === "startup-update",
     },
   );
   await page.goto(server.baseUrl);
   await page.getByRole("heading", { name: "登录云效", exact: true }).waitFor();
+  if (process.env.QA_SCOPE === "startup-update") {
+    const dialog = page.getByRole("dialog", {
+      name: "发现新版本",
+      exact: true,
+    });
+    await dialog.waitFor();
+    assert.match(await dialog.innerText(), /v0\.1\.0 → v0\.2\.0/);
+    assert.equal(
+      await dialog
+        .getByRole("button", { name: "立马更新", exact: true })
+        .count(),
+      1,
+    );
+    assert.equal(
+      await dialog.getByRole("button", { name: "取消", exact: true }).count(),
+      1,
+    );
+    assert.equal(await dialog.locator(".app-dialog-close").count(), 1);
+    await dialog.getByRole("button", { name: "取消", exact: true }).click();
+    await dialog.waitFor({ state: "detached" });
+    assert.equal(
+      await page.evaluate(
+        () =>
+          window.__qa.calls.filter((call) => call.cmd === "install_update")
+            .length,
+      ),
+      0,
+    );
+    await page.reload();
+    await page
+      .getByRole("heading", { name: "登录云效", exact: true })
+      .waitFor();
+    const reloadedDialog = page.getByRole("dialog", {
+      name: "发现新版本",
+      exact: true,
+    });
+    await reloadedDialog.waitFor();
+    await reloadedDialog
+      .getByRole("button", { name: "立马更新", exact: true })
+      .click();
+    await page
+      .getByRole("heading", { name: "更新失败", exact: true })
+      .waitFor();
+    assert.equal(
+      await page.evaluate(
+        () =>
+          window.__qa.calls.filter((call) => call.cmd === "install_update")
+            .length,
+      ),
+      1,
+    );
+    break checks;
+  }
   await page.getByRole("tab", { name: "填写 PAT", exact: true }).click();
   assert.equal(await page.locator("input[type=password]").inputValue(), "");
-  assert.deepEqual(
-    await page.evaluate(() => window.__qa.calls.map((c) => c.cmd)),
-    ["bootstrap"],
+  await page.waitForFunction(() =>
+    window.__qa.calls.some((call) => call.cmd === "check_for_updates"),
+  );
+  assert.equal(
+    await page.evaluate(
+      () => window.__qa.calls.filter((call) => call.cmd === "bootstrap").length,
+    ),
+    1,
+  );
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "check_for_updates")
+          .length,
+    ),
+    1,
   );
   await page.locator("input[type=password]").fill("mock-only");
   await page.getByRole("button", { name: "确定", exact: true }).click();
@@ -2284,10 +2390,78 @@ checks: try {
   });
   await page.locator("nav button").filter({ hasText: "设置" }).click();
   await page.getByRole("heading", { name: "项目配置", exact: true }).waitFor();
+  const updateCard = page.getByTestId("update-card");
+  await updateCard.getByRole("heading", { name: "检查更新" }).waitFor();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "check_for_updates")
+          .length,
+    ),
+    1,
+    "the application silently checks GitHub once at startup",
+  );
+  await updateCard
+    .getByRole("button", { name: "检查更新", exact: true })
+    .click();
+  await updateCard
+    .getByText("发现新版本 v0.2.0，可直接下载安装。", { exact: true })
+    .waitFor();
+  assert.match(await updateCard.innerText(), /当前版本\s*v0\.1\.0/);
+  assert.match(await updateCard.innerText(), /最新正式版本\s*v0\.2\.0/);
+  assert.match(await updateCard.innerText(), /10\.0 MB/);
+  await updateCard
+    .getByRole("button", { name: "立马更新", exact: true })
+    .click();
+  const updateErrorDialog = page.getByRole("dialog", {
+    name: "更新失败",
+    exact: true,
+  });
+  await updateErrorDialog.waitFor();
+  assert.match(await updateErrorDialog.innerText(), /模拟下载安装失败/);
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "install_update")
+          .length,
+    ),
+    1,
+  );
+  await updateErrorDialog
+    .getByRole("button", { name: "关闭", exact: true })
+    .click();
+  await updateCard
+    .getByRole("button", { name: "打开 Release 页面", exact: true })
+    .click();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "open_release_page")
+          .length,
+    ),
+    1,
+  );
   assert.equal(
     await page.getByRole("button", { name: "退出登录", exact: true }).count(),
     1,
   );
+  assert.equal(await page.locator(".project-setting-row").count(), 3);
+  assert.equal(
+    await page.getByRole("checkbox", { name: "第四项目" }).count(),
+    0,
+  );
+  await page
+    .getByRole("button", { name: "展开全部（4 项）", exact: true })
+    .click();
+  assert.equal(await page.locator(".project-setting-row").count(), 4);
+  assert.equal(
+    await page.getByRole("checkbox", { name: "第四项目" }).count(),
+    1,
+  );
+  await page
+    .getByRole("button", { name: "收起（仅显示 3 项）", exact: true })
+    .click();
+  assert.equal(await page.locator(".project-setting-row").count(), 3);
   const settingsSearch = page.getByRole("searchbox", { name: "搜索项目" });
   await settingsSearch.fill("第二");
   assert.equal(
@@ -2332,6 +2506,11 @@ checks: try {
       },
       {
         projectId: "long-project",
+        enabled: false,
+        packageName: "",
+      },
+      {
+        projectId: "another-project",
         enabled: false,
         packageName: "",
       },
@@ -2697,6 +2876,7 @@ checks: try {
           "bound session disables device refresh",
           "homepage removes versions selector and retains sprint selector",
           "settings page owns organization and logout controls",
+          "settings update card checks the GitHub Release list only on demand and opens the fixed release page",
           "project settings save filters homepage projects",
           "all projects disabled shows recovery banner",
           "failed settings save preserves edited values and applied state",

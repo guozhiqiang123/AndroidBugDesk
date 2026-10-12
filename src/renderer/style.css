@@ -699,6 +699,16 @@ code {
 .project-setting-row:last-child {
   border-bottom: 0;
 }
+.project-settings-expand {
+  display: flex;
+  justify-content: center;
+  padding-top: 8px;
+}
+.project-settings-expand button {
+  min-width: 180px;
+  color: #2f69d9;
+  background: #f4f7fd;
+}
 .project-setting-row .check {
   margin: 0;
   min-width: 0;
@@ -763,6 +773,158 @@ code {
   border-radius: 7px;
   padding: 7px 10px;
   background: #fbfcfe;
+}
+.update-card {
+  border-color: #d8e2f2;
+  background: linear-gradient(180deg, #ffffff 0%, #f8faff 100%);
+}
+.update-card.update-available {
+  border-color: #a8d9c7;
+  background: linear-gradient(180deg, #ffffff 0%, #f2fbf7 100%);
+}
+.update-card.update-error {
+  border-color: #e8c5bd;
+  background: linear-gradient(180deg, #ffffff 0%, #fff8f6 100%);
+}
+.update-status-badge {
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #edf2fa;
+  color: #60728e;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.update-available .update-status-badge {
+  background: #e6f7ef;
+  color: #238261;
+}
+.update-error .update-status-badge {
+  background: #fff0ec;
+  color: #b44936;
+}
+.update-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+.update-summary strong {
+  display: block;
+  font-size: 13px;
+}
+.update-summary p {
+  margin: 4px 0 0;
+  color: #64738b;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.update-indicator {
+  width: 9px;
+  height: 9px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #8ba2c5;
+}
+.update-checking .update-indicator {
+  background: #3b75e8;
+  box-shadow: 0 0 0 4px #3b75e820;
+}
+.update-available .update-indicator,
+.update-current .update-indicator {
+  background: #33a77f;
+}
+.update-error .update-indicator {
+  background: #c4543d;
+}
+.update-version-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 220px));
+  gap: 10px;
+  margin-top: 14px;
+}
+.update-version-grid > div {
+  padding: 10px 12px;
+  border: 1px solid #e2e7f0;
+  border-radius: 8px;
+  background: #ffffffb8;
+}
+.update-version-grid span,
+.update-version-grid strong {
+  display: block;
+}
+.update-version-grid span {
+  color: #76849b;
+  font-size: 11px;
+}
+.update-version-grid strong {
+  margin-top: 4px;
+  color: #223047;
+  font-size: 14px;
+}
+.update-check-note {
+  margin: 10px 0 0;
+}
+.update-actions {
+  justify-content: flex-end;
+}
+.app-dialog.update-dialog {
+  width: min(560px, calc(100vw - 48px));
+}
+.update-dialog-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+.update-dialog-body > div {
+  min-width: 0;
+  flex: 1;
+}
+.update-dialog-body p {
+  margin: 0;
+  line-height: 1.7;
+}
+.update-spinner {
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  margin-top: 2px;
+  border: 3px solid #dce6f8;
+  border-top-color: #2f69d9;
+  border-radius: 50%;
+  animation: update-spin 0.8s linear infinite;
+}
+.update-dialog-details {
+  display: grid;
+  gap: 8px;
+  margin: 16px 0 0;
+}
+.update-dialog-details > div {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+}
+.update-dialog-details dt {
+  color: #76849b;
+}
+.update-dialog-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.update-dialog-actions {
+  justify-content: flex-end;
+  margin-top: 22px;
+}
+.update-dialog-actions button {
+  min-width: 104px;
+}
+.update-install-note {
+  margin: 18px 0 0 38px;
+}
+@keyframes update-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .banner.success {
   background: #eaf8f2;
@@ -1111,18 +1273,36 @@ details {
   font-size: 12px;
   line-height: 1.8;
 }
+.history-main {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+.card.history-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  margin-bottom: 0;
+  padding: 0;
+  overflow: hidden;
+}
 .history-tabs {
-  position: sticky;
-  top: 0;
-  z-index: 20;
+  flex: 0 0 auto;
   display: flex;
   gap: 6px;
   border-bottom: 1px solid #e4e9f1;
-  margin: -20px -24px 14px;
   padding: 8px 24px 0;
   border-radius: 12px 12px 0 0;
   background: white;
   box-shadow: 0 4px 8px #15254308;
+}
+.history-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 14px 24px 20px;
 }
 .history-tabs button {
   border: 0;

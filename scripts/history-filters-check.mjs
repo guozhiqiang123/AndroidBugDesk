@@ -240,7 +240,13 @@ try {
             };
             return clone(d);
           }
-          if (cmd === "copy_receipt" || cmd === "open_receipt") return;
+          if (
+            cmd === "copy_receipt" ||
+            cmd === "open_receipt" ||
+            cmd === "copy_history_link" ||
+            cmd === "open_history_item"
+          )
+            return;
           if (cmd === "submit_bug") {
             q.submissions.find((s) => s.draftId === args.id).state =
               "submitted";
@@ -317,32 +323,31 @@ try {
   assert.equal(tabs[0].y, tabs[1].y);
   assert.ok(tabs[1].x > tabs[0].x);
   const stickyTabs = root.locator(".history-tabs");
+  const historyScroll = root.locator(".history-scroll");
   const initialTabTop = await stickyTabs.evaluate(
     (node) => node.getBoundingClientRect().top,
   );
-  await page.evaluate(() => window.scrollTo(0, 600));
+  await historyScroll.evaluate((node) => node.scrollTo(0, 600));
   await page.waitForFunction(
-    () =>
-      Math.abs(
-        document.querySelector(".history-tabs").getBoundingClientRect().top,
-      ) < 1,
+    () => document.querySelector(".history-scroll").scrollTop > 0,
   );
   assert.equal(
-    await stickyTabs.evaluate((node) => getComputedStyle(node).position),
-    "sticky",
+    await stickyTabs.evaluate((node) => node.getBoundingClientRect().top),
+    initialTabTop,
   );
   assert.ok(initialTabTop > 0);
+  assert.equal(await page.evaluate(() => window.scrollY), 0);
   await page.screenshot({
     path: path.join(output, "sticky-tabs-scrolled.png"),
   });
-  await page.evaluate(() => window.scrollTo(0, 0));
+  await historyScroll.evaluate((node) => node.scrollTo(0, 0));
   const firstLocalHeight = await root
     .locator(".submission")
     .first()
     .evaluate((node) => node.getBoundingClientRect().height);
   assert.ok(firstLocalHeight < 150, `local row height: ${firstLocalHeight}`);
   scenarios.push(
-    "horizontal tabs stay fixed while scrolling; local rows are compact; one active panel; no cloud calls on local entry",
+    "horizontal tabs stay outside the scrolling content; local rows are compact; one active panel; no cloud calls on local entry",
   );
   await root.getByRole("button", { name: "下一页", exact: true }).click();
   assert.equal(await root.locator(".submission").count(), 10);
@@ -415,11 +420,42 @@ try {
   await root.getByRole("tab", { name: "云效历史 Bug", exact: true }).click();
   await root.getByText("云效记录 2", { exact: true }).waitFor();
   assert.equal(await root.locator(".submission").count(), 2);
+  const remoteCard = root
+    .locator(".submission")
+    .filter({ hasText: "云效记录 1" });
+  await remoteCard
+    .getByRole("button", { name: "打开云效", exact: true })
+    .click();
+  await remoteCard
+    .getByRole("button", { name: "复制链接", exact: true })
+    .click();
+  assert.equal(
+    await remoteCard
+      .getByRole("button", { name: "复制修复任务输入", exact: true })
+      .count(),
+    0,
+  );
+  assert.deepEqual(
+    await page.evaluate(() =>
+      window.__qa.calls
+        .filter((call) =>
+          ["open_history_item", "copy_history_link"].includes(call.cmd),
+        )
+        .map((call) => ({ cmd: call.cmd, args: call.args })),
+    ),
+    [
+      { cmd: "open_history_item", args: { identifier: "CLOUD-1" } },
+      { cmd: "copy_history_link", args: { identifier: "CLOUD-1" } },
+    ],
+  );
+  scenarios.push(
+    "cloud rows expose safe open and copy-link actions but omit repair input without local evidence",
+  );
   const firstRemoteHeight = await root
     .locator(".submission")
     .first()
     .evaluate((node) => node.getBoundingClientRect().height);
-  assert.ok(firstRemoteHeight < 90, `remote row height: ${firstRemoteHeight}`);
+  assert.ok(firstRemoteHeight < 130, `remote row height: ${firstRemoteHeight}`);
   await root.getByRole("button", { name: "加载更多", exact: true }).click();
   await root.getByText("云效记录 3", { exact: true }).waitFor();
   assert.equal(await root.locator(".submission").count(), 3);
