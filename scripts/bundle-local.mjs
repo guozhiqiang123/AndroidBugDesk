@@ -7,6 +7,7 @@ import {
   readdir,
   rmdir,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
@@ -267,7 +268,22 @@ export async function bundleLocalMac({
     if (detectedArch !== arch)
       throw new Error(`Expected ${arch}, got ${detectedArch}`);
     await assertSourceUnchanged(projectDir, snapshot);
-    const dmgStart = Date.now();
+    const dmgDirectory = join(bundleRoot, "dmg");
+    try {
+      for (const entry of await readdir(dmgDirectory, {
+        withFileTypes: true,
+      })) {
+        if (
+          entry.isFile() &&
+          entry.name.startsWith(`${productName}_${version}_`) &&
+          entry.name.endsWith(".dmg")
+        ) {
+          await unlink(join(dmgDirectory, entry.name));
+        }
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
     await phase("bundle-dmg", process.execPath, [
       cli,
       "bundle",
@@ -281,7 +297,6 @@ export async function bundleLocalMac({
       "--strict",
       app,
     ]);
-    const dmgDirectory = join(bundleRoot, "dmg");
     const fresh = [];
     for (const entry of await readdir(dmgDirectory, { withFileTypes: true })) {
       if (
@@ -291,7 +306,7 @@ export async function bundleLocalMac({
       )
         continue;
       const path = join(dmgDirectory, entry.name);
-      if ((await stat(path)).mtimeMs >= dmgStart) fresh.push(path);
+      fresh.push(path);
     }
     if (fresh.length !== 1)
       throw new Error(
