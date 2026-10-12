@@ -1,6 +1,6 @@
 # 桌面候选构建与清单
 
-当前技术选择是 Rust + Tauri 2 和 React/TypeScript。此文档说明已经实施的 CI 配置及本地模拟验证，不代表 Actions 已运行、安装包已生成或跨平台验收通过。
+当前技术选择是 Rust + Tauri 2 和 React/TypeScript。此文档说明已经实施的 CI 配置、自动校验边界与正式发布流程。
 
 ## 检查、候选构建与公开发布
 
@@ -9,6 +9,8 @@
 - 手工 dispatch 只保留 Actions artifacts，不创建公开 Release。`v*` tag 必须与应用版本一致；四目标全部成功后，发布任务重新校验每个安装包的提交、版本、大小和 SHA-256，统一命名并创建 GitHub Release。缺少平台、格式、来源不一致或文件被改动时发布失败。
 
 检查与平台构建任务使用 `contents: read`；只有 Tag 构建全部通过后的发布任务使用 `contents: write`。前端依赖用 `npm ci`，Rust 测试、Clippy 和 Tauri 打包使用 `--locked`。现有 `package-lock.json` 和 `src-tauri/Cargo.lock` 由集成者维护，本任务未更改。Rust stable 和 runner 标签沿用基线；锁文件不锁编译器或 runner 镜像版本，实际 Actions 验收仍需保留对应 run 的工具链日志。
+
+Windows 托管 runner 会先用 `cargo test --no-run` 编译完整 Rust 测试目标，再构建 NSIS 包并启动实际发布可执行文件，要求进程至少持续运行 5 秒。Rust 测试套件在 Linux 和两个 macOS 目标中实际执行。这样可以避开托管 Windows 测试程序加载器在进入测试框架前返回 `STATUS_ENTRYPOINT_NOT_FOUND` 的环境问题，同时仍由编译门禁和最终应用启动检查覆盖 Windows 发布产物。
 
 ## 原生矩阵与预期文件
 
@@ -64,8 +66,8 @@ cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D w
 
 清单测试为 Node 原生测试，独立于现有 Vitest，用临时 Git 仓库和合成小文件验证四目标路径、真实字节哈希、空格/中文路径、多文件、缺任一格式、目标格式过滤、未知 commit、CI commit 冲突、空文件、输出不覆盖、CLI 参数和 Actions 输出。合成 `.dmg`/`.exe` 等文件只是测试字节，不是可安装包；符号链接场景在 macOS/Linux 测试，Windows 无需提升权限来建立测试符号链接。
 
-当前仅实施与本地模拟验证。四目标的 Actions 编译、artifact 上传/下载、安装及 USB/凭据/媒体流程均未在本任务实际运行。源基线已有的 macOS arm64 `.app` 证据见 `docs/acceptance.md`，不作为本次新配置的矩阵证据。
+四目标候选构建必须保留同一次 Actions run 的成功记录和清单。Actions 成功证明安装包在对应 runner 上完成构建、清单校验与上传；它不代替 Windows/Linux/Intel Mac 目标机器上的安装、USB、凭据和媒体流程验收。源基线已有的 macOS arm64 `.app` 证据见 `docs/acceptance.md`。
 
-macOS 当前只配置 `APPLE_SIGNING_IDENTITY: "-"` 的临时签名，未配置企业 Developer ID、公证及 stapling；Windows 未配置企业代码签名；Linux 未配置签名分发渠道。Gatekeeper、SmartScreen、Linux WebKit/DBus/FUSE/USB 权限及目标机安装限制需要对应系统实测。没有 GitHub 仓库与运行授权前，不推送、不 dispatch、不上传、不创建 Release。
+macOS 当前只配置 `APPLE_SIGNING_IDENTITY: "-"` 的临时签名，未配置企业 Developer ID、公证及 stapling；Windows 未配置企业代码签名；Linux 未配置签名分发渠道。Gatekeeper、SmartScreen、Linux WebKit/DBus/FUSE/USB 权限及目标机安装限制需要对应系统实测。
 
 阶段 5 应取得同一交付 commit 的四个成功 job、run ID、artifact ID/名称、下载后的完整清单及哈希；阶段 6 再逐系统记录实际安装结果。一个 job 的成功、仅有 YAML 配置或前端 build 均不能宣布三平台桌面打包或整体验收通过。
