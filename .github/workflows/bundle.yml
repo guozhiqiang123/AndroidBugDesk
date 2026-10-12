@@ -52,7 +52,7 @@ jobs:
       - name: Build native desktop packages
         env:
           APPLE_SIGNING_IDENTITY: "-"
-        run: npm run tauri -- build --locked --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
       - name: Archive macOS application bundle
         if: runner.os == 'macOS'
         run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/${{ matrix.target }}/release/bundle/macos/Android Bug Desk.app" "src-tauri/target/${{ matrix.target }}/release/bundle/Android-Bug-Desk-${{ matrix.target }}.app.zip"

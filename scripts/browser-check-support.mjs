@@ -1,10 +1,11 @@
-import { mkdir, writeFile, appendFile } from "node:fs/promises";
+import { mkdir, writeFile, appendFile, realpath } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { createServer, createLogger } from "vite";
 import { sourceSnapshot, assertSourceUnchanged } from "./workflow-source.mjs";
 
 export async function startBrowserCheck(output, projectDir = process.cwd()) {
   output = resolve(output);
+  projectDir = await realpath(resolve(projectDir));
   await mkdir(output, { recursive: true });
   // Remove stale success before a new run. A failure must never retain passed:true.
   await writeFile(
