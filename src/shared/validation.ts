@@ -111,9 +111,6 @@ export function validateDraft(
   req("jenkinsPackageUrl", d.jenkinsPackageUrl, "Jenkins包地址");
   req("title", d.title, "问题标题");
   req("app.packageName", d.app.packageName, "当前项目的 Android 包名配置");
-  req("preconditions", d.preconditions, "复现条件");
-  req("steps", d.steps, "复现步骤");
-  req("expected", d.expected, "期望表现");
   req("actual", d.actual, "问题表现");
   if (!d.frequency.firstDiscovery) {
     const { attempts, occurrences } = d.frequency;

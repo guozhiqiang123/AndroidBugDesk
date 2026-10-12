@@ -161,6 +161,8 @@ mod tests {
             metadata: Mutex::new(Some(metadata.clone())),
             adb: Mutex::new(None),
             collector: Mutex::new(None),
+            page_observer: Mutex::new(None),
+            page_observer_generation: std::sync::Arc::new(AtomicU64::new(0)),
             locks: Mutex::new(HashSet::new()),
         };
         let app = tauri::test::mock_builder()

@@ -12,6 +12,7 @@ import {
   type Snapshot,
   type Attachment,
   type Option,
+  type Source,
 } from "../shared/domain";
 import type {
   AuthResult,
@@ -132,6 +133,20 @@ function displayBytes(size?: number | null) {
     unit += 1;
   }
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+function sourceStatusLabel(source?: Source) {
+  if (!source) return "未采集";
+  if (source.status === "collected") return "自动采集";
+  if (source.status === "manual") return "人工补充";
+  if (source.status === "not_applicable") return "未采用";
+  return "采集失败";
+}
+function sourceTime(source?: Source) {
+  if (!source?.at) return "";
+  const value = new Date(source.at);
+  return Number.isNaN(value.getTime())
+    ? source.at
+    : value.toLocaleString("zh-CN", { hour12: false });
 }
 function App() {
   const [boot, setBoot] = useState<Bootstrap | null>(initialWorkspace),
@@ -664,7 +679,8 @@ function App() {
     })();
   }, []);
   useEffect(() => {
-    if (!isTauri() || !boot?.authorized || !draft?.sessionId) return;
+    if (!isTauri() || !boot?.authorized || !draft || !serial || tab !== "new")
+      return;
     let active = true;
     const draftId = draft.id;
     const timer = window.setInterval(() => {
@@ -677,16 +693,31 @@ function App() {
           if (!stored) return;
           setDraft((current) => {
             if (!current || current.id !== draftId) return current;
+            const keepManualPage = current.sources.bugPage?.status === "manual";
+            const storedPageSource = stored.sources.bugPage;
+            const pageChanged =
+              !keepManualPage &&
+              (current.bugPage !== stored.bugPage ||
+                JSON.stringify(current.sources.bugPage) !==
+                  JSON.stringify(storedPageSource));
             if (
               JSON.stringify(current.attachments) ===
                 JSON.stringify(stored.attachments) &&
               JSON.stringify(current.collectionErrors) ===
-                JSON.stringify(stored.collectionErrors)
+                JSON.stringify(stored.collectionErrors) &&
+              !pageChanged
             )
               return current;
             setPreview(false);
             return {
               ...current,
+              bugPage: keepManualPage ? current.bugPage : stored.bugPage,
+              sources: keepManualPage
+                ? current.sources
+                : {
+                    ...current.sources,
+                    ...(storedPageSource ? { bugPage: storedPageSource } : {}),
+                  },
               attachments: stored.attachments,
               collectionErrors: stored.collectionErrors,
               previewConfirmed: false,
@@ -701,7 +732,7 @@ function App() {
       active = false;
       window.clearInterval(timer);
     };
-  }, [boot?.authorized, draft?.id, draft?.sessionId]);
+  }, [boot?.authorized, draft?.id, serial, tab]);
   useEffect(() => {
     setFieldErrors({});
     setBackendIssues([]);
@@ -720,6 +751,13 @@ function App() {
     >;
     for (const p of parts.slice(0, -1)) obj = obj[p] as Record<string, unknown>;
     obj[parts.at(-1)!] = value;
+    if (path === "bugPage") {
+      next.sources.bugPage = {
+        status: "manual",
+        at: new Date().toISOString(),
+        detail: "人工输入",
+      };
+    }
     if (path !== "previewConfirmed") next.previewConfirmed = false;
     setDraft(next);
     setDirty(true);
@@ -928,6 +966,12 @@ function App() {
       setNotice("");
       throw failure;
     }
+  };
+  const removeAllAttachments = async () => {
+    const current = activeDraftRef.current;
+    if (!current?.attachments.length) return;
+    await mutate("remove_all_attachments");
+    setNotice("已移除所有附件");
   };
   const newDraft = async () => {
     if (!boot?.authorized || !profileConfigured(boot.profile) || !projectId) {
@@ -1379,11 +1423,9 @@ function App() {
       >
         <span>
           {label}
-          {draft?.sources[path] && draft.sources[path].status !== "failed" && (
+          {draft?.sources[path] && (
             <small className={`source ${draft.sources[path].status}`}>
-              {draft.sources[path].status === "collected"
-                ? "自动采集"
-                : "人工补充"}
+              {sourceStatusLabel(draft.sources[path])}
             </small>
           )}
         </span>
@@ -1407,6 +1449,14 @@ function App() {
         {!text.trim() && draft?.sources[path]?.status === "failed" && (
           <small className="error-text">
             {path === "bugPage" ? "未能自动读取当前页面" : "未能自动读取该信息"}
+          </small>
+        )}
+        {path === "bugPage" && draft?.sources.bugPage && (
+          <small className="field-source-detail">
+            {sourceTime(draft.sources.bugPage)
+              ? `${sourceTime(draft.sources.bugPage)} · `
+              : ""}
+            {draft.sources.bugPage.detail}
           </small>
         )}
         {opts.warning && <small className="warning-text">{opts.warning}</small>}
@@ -2193,19 +2243,20 @@ function App() {
                       hint: "描述实际发生的问题表现",
                       aliases: ["customFields.description"],
                     })}
-                    {field("expected", "期望表现（必填）", {
+                    {field("bugPage", "Bug所在页面（选填）", {
+                      fullWidth: true,
+                      hint: "自动记录目标应用最近一次前台页面，也可人工填写",
+                    })}
+                    {field("expected", "期望表现（选填）", {
                       multi: true,
-                      required: true,
                       hint: "需要描述清楚应该是什么表现，越清楚越好",
                     })}
-                    {field("preconditions", "复现条件（必填）", {
+                    {field("preconditions", "复现条件（选填）", {
                       multi: true,
-                      required: true,
                       hint: "补充安装方式、账号（如有）、网络情况、涉及的云控（如有）",
                     })}
-                    {field("steps", "复现步骤（必填）", {
+                    {field("steps", "复现步骤（选填）", {
                       multi: true,
-                      required: true,
                       hint: "每行填写一步，描述可执行的操作",
                     })}
                   </div>
@@ -2447,6 +2498,20 @@ function App() {
                       </small>
                     ))}
                   </div>
+                  {draft.attachments.length > 0 && (
+                    <div className="action-item">
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={frozen || !!busy}
+                        onClick={() =>
+                          void run("移除所有附件", removeAllAttachments)
+                        }
+                      >
+                        移除所有附件
+                      </button>
+                    </div>
+                  )}
                 </div>
                 {(boot.captures ?? [])
                   .filter(
@@ -2692,6 +2757,26 @@ function App() {
                       <dd className="preserve">{draft.jenkinsPackageUrl}</dd>
                       <dt>问题标题</dt>
                       <dd>{draft.title}</dd>
+                      <dt>Bug所在页面</dt>
+                      <dd className="preserve">
+                        {draft.bugPage || "未采集"}
+                        {draft.sources.bugPage && (
+                          <small className="preview-source-detail">
+                            {sourceStatusLabel(draft.sources.bugPage)}
+                            {sourceTime(draft.sources.bugPage)
+                              ? ` · ${sourceTime(draft.sources.bugPage)}`
+                              : ""}
+                            {draft.sources.bugPage.detail
+                              ? ` · ${draft.sources.bugPage.detail}`
+                              : ""}
+                          </small>
+                        )}
+                        {!draft.sources.bugPage && (
+                          <small className="preview-source-detail">
+                            来源未记录
+                          </small>
+                        )}
+                      </dd>
                       <dt>复现条件</dt>
                       <dd>{draft.preconditions}</dd>
                       <dt>复现步骤</dt>

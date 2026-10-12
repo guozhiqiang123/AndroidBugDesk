@@ -1,8 +1,9 @@
 //! Local fake-ADB verification of the inspection command's persistence boundary.
 #![cfg(unix)]
-use crate::{commands, model::*, validation};
+use crate::{adb, commands, evidence, model::*, store::Store, validation};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use tauri::Manager;
 
 fn fake_adb(root: &Path) -> PathBuf {
@@ -28,13 +29,17 @@ if args[1:3] == ['dumpsys', 'activity']:
     if mode == 'paused':
         (root / 'ready').touch()
         while not (root / 'release').exists(): time.sleep(.01)
-    print('mResumedActivity: null' if mode == 'missing' else 'mResumedActivity: ActivityRecord{abc u0 com.example.front/.Home t1}')
+    package = 'com.google.android.apps.nexuslauncher' if mode == 'foreign' else 'com.example.test'
+    activity = '.NexusLauncherActivity' if mode == 'foreign' else '.Home'
+    print('mResumedActivity: null' if mode == 'missing' else f'mResumedActivity: ActivityRecord{{abc u0 {package}/{activity} t1}}')
 elif args[1:3] == ['dumpsys', 'window']:
-    print('mCurrentFocus=null' if mode == 'missing' else 'mCurrentFocus=Window{abc u0 com.example.front/.Home}')
+    package = 'com.google.android.apps.nexuslauncher' if mode == 'foreign' else 'com.example.test'
+    activity = '.NexusLauncherActivity' if mode == 'foreign' else '.Home'
+    print('mCurrentFocus=null' if mode == 'missing' else f'mCurrentFocus=Window{{abc u0 {package}/{activity}}}')
 elif args[1:3] == ['dumpsys', 'package']:
     print('versionName=2.0\nversionCode=0 minSdk=24')
 elif args[1:3] == ['am', 'get-current-user']: print('0')
-elif args[1:3] == ['pm', 'list']: print('package:com.example.front')
+elif args[1:3] == ['pm', 'list']: print('package:com.example.test')
 elif args[1] == 'getprop':
     print(('Model-' + serial) if args[2] == 'ro.product.model' else '14')
 elif args[1] == 'cat': print('MemTotal: 8192000 kB\nMemAvailable: 4096000 kB')
@@ -112,6 +117,50 @@ fn saving_an_event_before_session_start_preserves_its_source() {
     validation::check_shape(&saved).unwrap();
 }
 
+#[test]
+fn stale_page_observer_generation_cannot_write_the_draft() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, draft) = app(temp.path(), PathBuf::from("unused-adb"));
+    let store = &app.state::<commands::AppState>().store;
+    let id = string(&draft, "id");
+    let target = adb::PageObservationTarget {
+        store: store.clone(),
+        draft_id: id.clone(),
+        scope: "alice:test-org:test-project:".into(),
+        package: "com.example.test".into(),
+    };
+    let generation = AtomicU64::new(2);
+    assert!(!adb::record_observed_page(
+        &target,
+        "com.example.test.StaleActivity",
+        "stale observer",
+        "2026-10-12T09:00:00Z",
+        Some((&generation, 1)),
+    )
+    .unwrap());
+    assert_eq!(store.draft(&id).unwrap()["bugPage"], draft["bugPage"]);
+}
+
+#[test]
+fn startup_removes_a_legacy_automatic_launcher_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::new(temp.path()).unwrap();
+    let mut draft: Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/valid-draft.json")).unwrap();
+    let id = string(&draft, "id");
+    draft["bugPage"] = json!("com.google.android.apps.nexuslauncher.NexusLauncherActivity");
+    draft["sources"]["bugPage"] = json!({
+        "status":"collected","at":"2026-10-10T00:00:00Z","detail":"旧版 ADB 前台页面"
+    });
+    store.put("draft", &id, &draft).unwrap();
+    drop(store);
+    let state = commands::AppState::new(temp.path().to_path_buf()).unwrap();
+    let migrated = state.store.draft(&id).unwrap();
+    assert_eq!(migrated["bugPage"], "");
+    assert_eq!(migrated["sources"]["bugPage"]["status"], "not_applicable");
+    assert!(string(&migrated, "sources.bugPage.detail").contains("NexusLauncherActivity"));
+}
+
 #[tokio::test]
 async fn inspected_values_survive_save_and_partial_device_switch_without_losing_manual_data() {
     let temp = tempfile::tempdir().unwrap();
@@ -122,9 +171,9 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
         .await
         .unwrap();
     assert_eq!(snapshot["details"]["foregroundActivity"], ".Home");
-    assert_eq!(snapshot["bugPage"], "com.example.front.Home");
+    assert_eq!(snapshot["bugPage"], "com.example.test.Home");
     let store = &app.state::<commands::AppState>().store;
-    let mut draft = store.draft(&id).unwrap();
+    let draft = store.draft(&id).unwrap();
     validation::check_shape(&draft).unwrap();
     assert_eq!(draft["bugPage"], snapshot["bugPage"]);
     assert_eq!(draft["sources"]["bugPage"]["status"], "collected");
@@ -136,8 +185,23 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
         store.get::<Value>("snapshot", &id).unwrap().unwrap(),
         snapshot
     );
-    draft["title"] = json!("设备读取后保留用户的标题编辑");
-    let saved = commands::save_draft(draft, app.state()).unwrap();
+    let mut stale = draft.clone();
+    adb::record_observed_page(
+        &adb::PageObservationTarget {
+            store: store.clone(),
+            draft_id: id.clone(),
+            scope: "alice:test-org:test-project:".into(),
+            package: "com.example.test".into(),
+        },
+        "com.example.test.DetailActivity",
+        "test observer",
+        "2026-10-12T09:00:00Z",
+        None,
+    )
+    .unwrap();
+    stale["title"] = json!("设备读取后保留用户的标题编辑");
+    let saved = commands::save_draft(stale, app.state()).unwrap();
+    assert_eq!(saved["bugPage"], "com.example.test.DetailActivity");
     assert_eq!(saved["app"]["packageName"], "com.example.test");
     assert_eq!(saved["sources"]["app.packageName"]["status"], "manual");
     assert_eq!(
@@ -146,13 +210,37 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
     );
     assert_eq!(saved["sources"]["device.model"]["status"], "collected");
     assert_eq!(saved["sources"]["bugPage"]["status"], "collected");
+    std::fs::write(temp.path().join("mode"), "foreign").unwrap();
+    let foreign = commands::inspect_device(id.clone(), "USB-B".into(), app.state())
+        .await
+        .unwrap();
+    assert_eq!(foreign["bugPage"], "");
+    assert_eq!(foreign["sources"]["bugPage"]["status"], "not_applicable");
+    let retained_after_launcher = store.draft(&id).unwrap();
+    assert_eq!(
+        retained_after_launcher["bugPage"],
+        "com.example.test.DetailActivity"
+    );
+    assert_eq!(
+        retained_after_launcher["sources"]["bugPage"]["status"],
+        "collected"
+    );
+    let profile = app
+        .state::<commands::AppState>()
+        .profile
+        .lock()
+        .unwrap()
+        .clone();
+    let report = evidence::report(&retained_after_launcher, &profile);
+    assert!(!report.contains("NexusLauncherActivity"));
+    assert!(report.contains("com.example.test.DetailActivity"));
     std::fs::write(temp.path().join("mode"), "missing").unwrap();
     commands::inspect_device(id.clone(), "USB-B".into(), app.state())
         .await
         .unwrap();
     let partial = store.draft(&id).unwrap();
-    assert_eq!(partial["bugPage"], "");
-    assert_eq!(partial["sources"]["bugPage"]["status"], "failed");
+    assert_eq!(partial["bugPage"], "com.example.test.DetailActivity");
+    assert_eq!(partial["sources"]["bugPage"]["status"], "collected");
     validation::check_shape(&partial).unwrap();
     assert_eq!(partial["device"]["model"], "Model-USB-B");
     assert_eq!(partial["app"]["packageName"], "com.example.test");
@@ -166,6 +254,7 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
         .contains(&json!("原有采集缺口")));
     let mut manual = partial;
     manual["bugPage"] = json!("照片恢复结果页");
+    manual["sources"]["bugPage"] = json!({"status":"manual","at":now(),"detail":"人工输入"});
     let manual = commands::save_draft(manual, app.state()).unwrap();
     assert_eq!(manual["sources"]["bugPage"]["status"], "manual");
     commands::inspect_device(id.clone(), "USB-B".into(), app.state())
@@ -179,8 +268,19 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
         .await
         .unwrap();
     let refreshed = store.draft(&id).unwrap();
-    assert_eq!(refreshed["bugPage"], "com.example.front.Home");
-    assert_eq!(refreshed["sources"]["bugPage"]["status"], "collected");
+    assert_eq!(refreshed["bugPage"], "照片恢复结果页");
+    assert_eq!(refreshed["sources"]["bugPage"]["status"], "manual");
+    let mut cleared = refreshed;
+    cleared["bugPage"] = json!("");
+    cleared["sources"]["bugPage"] = json!({"status":"manual","at":now(),"detail":"人工清空"});
+    let cleared = commands::save_draft(cleared, app.state()).unwrap();
+    assert_eq!(cleared["bugPage"], "");
+    commands::inspect_device(id.clone(), "USB-B".into(), app.state())
+        .await
+        .unwrap();
+    let still_cleared = store.draft(&id).unwrap();
+    assert_eq!(still_cleared["bugPage"], "");
+    assert_eq!(still_cleared["sources"]["bugPage"]["status"], "manual");
     let calls = std::fs::read_to_string(temp.path().join("calls.jsonl")).unwrap();
     for call in calls.lines() {
         let args: Vec<String> = serde_json::from_str(call).unwrap();

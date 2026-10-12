@@ -70,6 +70,38 @@ fn attachments_are_optional_for_all_kinds() {
     }
 }
 
+#[tokio::test]
+async fn remove_all_attachments_uses_an_authoritative_backend_mutation() {
+    use tauri::Manager;
+
+    let (server, _remote, api) = mock(Remote::default()).await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+
+    let mut renderer_echo = d;
+    renderer_echo["attachments"] = json!([]);
+    let preserved = crate::commands::save_draft(renderer_echo, app.state()).unwrap();
+    assert_eq!(
+        preserved["attachments"].as_array().unwrap().len(),
+        1,
+        "ordinary draft saves must not replace backend-managed attachments"
+    );
+
+    let removed = crate::commands::remove_all_attachments(id.clone(), app.state()).unwrap();
+    assert!(removed["attachments"].as_array().unwrap().is_empty());
+    assert_eq!(removed["previewConfirmed"], false);
+    assert!(store.draft(&id).unwrap()["attachments"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn every_log_is_validated_independently_of_legacy_confirmation() {
     let m = metadata();
@@ -331,6 +363,11 @@ fn bug_page_is_optional_and_report_uses_the_effective_value() {
         let mut d = fixture();
         if let Some(page) = page {
             d["bugPage"] = json!(page);
+            if !page.is_empty() {
+                d["sources"]["bugPage"] = json!({
+                    "status":"manual","at":"2026-10-12T00:00:00Z","detail":"人工输入"
+                });
+            }
         } else {
             d.as_object_mut().unwrap().remove("bugPage");
         }
@@ -345,8 +382,19 @@ fn bug_page_is_optional_and_report_uses_the_effective_value() {
         );
         if let Some(page) = page.filter(|v| !v.is_empty()) {
             assert!(report.contains(page));
+            assert!(report.contains("采集时间："));
+            assert!(report.contains("来源："));
+            assert!(report.contains(&string(&d, "sources.bugPage.detail")));
         }
     }
+    let mut legacy = fixture();
+    legacy["bugPage"] = json!("com.google.android.apps.nexuslauncher.NexusLauncherActivity");
+    legacy["sources"]["bugPage"] = json!({
+        "status":"collected","at":"2026-10-10T00:00:00Z","detail":"旧版自动采集"
+    });
+    let report = evidence::report(&legacy, &m.profile);
+    assert!(!report.contains("NexusLauncherActivity"));
+    assert!(!report.contains("## Bug所在页面"));
 }
 
 #[test]
@@ -609,9 +657,6 @@ fn every_base_missing_field_is_blocked() {
         "title",
         "workitemTypeId",
         "assignedTo",
-        "preconditions",
-        "steps",
-        "expected",
         "actual",
     ] {
         let mut d = fixture();
@@ -628,7 +673,7 @@ fn every_base_missing_field_is_blocked() {
     }
 }
 #[test]
-fn reproduction_steps_only_require_non_blank_content() {
+fn optional_reproduction_steps_accept_short_multiline_content() {
     let m = metadata();
     let mut d = fixture();
     d["steps"] = json!("3331111\n444\n555\n666");
@@ -636,15 +681,25 @@ fn reproduction_steps_only_require_non_blank_content() {
     assert!(validation::validate(&d, &m.profile, None, false, false).is_empty());
 }
 #[test]
-fn problem_fields_are_required_and_manual_time_is_not_a_submission_gate() {
+fn optional_problem_fields_accept_blank_whitespace_and_placeholder_content() {
+    let m = metadata();
+    for path in ["preconditions", "steps", "expected"] {
+        for value in ["", " \n\t ", "未知"] {
+            let mut d = fixture();
+            d[path] = json!(value);
+            for online in [true, false] {
+                assert!(validation::validate(&d, &m.profile, Some(&m), true, online).is_empty());
+            }
+        }
+    }
+}
+#[test]
+fn required_problem_fields_and_manual_time_submission_gate() {
     let m = metadata();
     for (path, label) in [
         ("jenkinsPackageUrl", "Jenkins包地址"),
         ("title", "问题标题"),
         ("actual", "问题表现"),
-        ("preconditions", "复现条件"),
-        ("steps", "复现步骤"),
-        ("expected", "期望表现"),
     ] {
         let mut d = fixture();
         d[path] = json!(" \n\t ");

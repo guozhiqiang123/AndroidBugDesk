@@ -359,12 +359,13 @@ checks: try {
             };
             Object.assign(draft().app, snapshot.app);
             Object.assign(draft().device, snapshot.device);
-            const keepManual =
-              !snapshot.bugPage && draft().sources.bugPage?.status === "manual";
-            if (!keepManual) draft().bugPage = snapshot.bugPage;
+            const keepExisting =
+              draft().sources.bugPage?.status === "manual" ||
+              (!snapshot.bugPage && !!draft().bugPage);
+            if (!keepExisting) draft().bugPage = snapshot.bugPage;
             const priorPageSource = draft().sources.bugPage;
             draft().sources = { ...draft().sources, ...snapshot.sources };
-            if (keepManual) draft().sources.bugPage = priorPageSource;
+            if (keepExisting) draft().sources.bugPage = priorPageSource;
             return clone(snapshot);
           }
           if (cmd === "start_session")
@@ -1722,15 +1723,21 @@ checks: try {
     ["jenkinsPackageUrl", "Jenkins包地址（必填）"],
     ["title", "问题标题（必填）"],
     ["actual", "问题表现（必填）"],
-    ["preconditions", "复现条件（必填）"],
-    ["steps", "复现步骤（必填）"],
-    ["expected", "期望表现（必填）"],
+    ["bugPage", "Bug所在页面（选填）"],
+    ["preconditions", "复现条件（选填）"],
+    ["steps", "复现步骤（选填）"],
+    ["expected", "期望表现（选填）"],
   ];
   const problemInput = (id) =>
     page.locator(`#field-${id} input, #field-${id} textarea`);
   for (const [id, label] of problemFields) {
-    assert.equal(await page.locator(`#field-${id} > span`).innerText(), label);
-    assert.equal(await problemInput(id).getAttribute("required"), "");
+    assert.ok(
+      (await page.locator(`#field-${id} > span`).innerText()).startsWith(label),
+    );
+    assert.equal(
+      await problemInput(id).getAttribute("required"),
+      ["jenkinsPackageUrl", "title", "actual"].includes(id) ? "" : null,
+    );
   }
   assert.equal(
     await page
@@ -1769,6 +1776,7 @@ checks: try {
         const jenkins = field("jenkinsPackageUrl"),
           title = field("title"),
           actual = field("actual"),
+          bugPage = field("bugPage"),
           conditions = field("preconditions"),
           steps = field("steps"),
           expected = field("expected");
@@ -1779,10 +1787,11 @@ checks: try {
           orderedFullRows:
             title.top >= jenkins.bottom &&
             actual.top >= title.bottom &&
-            conditions.top >= title.bottom,
+            bugPage.top >= actual.bottom &&
+            conditions.top >= bugPage.bottom,
           rowsAligned:
-            Math.abs(actual.top - expected.top) <= 1 &&
-            Math.abs(steps.top - conditions.top) <= 1,
+            Math.abs(expected.top - conditions.top) <= 1 &&
+            steps.top >= conditions.bottom,
           noOverflow: document.documentElement.scrollWidth <= innerWidth,
         };
       });
@@ -2091,7 +2100,9 @@ checks: try {
     /标题至少|请补充/,
   );
   await titleField.locator("input").fill(savedTitle);
-  for (const [id, label] of problemFields) {
+  for (const [id, label] of problemFields.filter(([id]) =>
+    ["jenkinsPackageUrl", "title", "actual"].includes(id),
+  )) {
     const input = problemInput(id);
     const saved = await input.inputValue();
     await input.fill(" \t ");
@@ -2263,6 +2274,9 @@ checks: try {
   assert.equal(await previewDialog.locator(".app-dialog-close").count(), 1);
   const previewText = await previewDialog.locator(".preview").innerText();
   assert.match(previewText, /Jenkins包地址/);
+  assert.match(previewText, /Bug所在页面/);
+  assert.match(previewText, /com\.example\.mock\.MainActivity/);
+  assert.match(previewText, /自动采集/);
   assert.match(
     previewText,
     /https:\/\/jenkins\.example\.test\/job\/android\/128\/artifact\/app\.apk/,
@@ -2294,6 +2308,24 @@ checks: try {
   await page.waitForFunction(
     () => document.activeElement?.textContent?.trim() === "进入提交预览",
   );
+  const bugPageField = page.locator('[id="field-bugPage"]');
+  assert.match(
+    await bugPageField.locator(".field-source-detail").innerText(),
+    /ADB mock page/,
+  );
+  await bugPageField.locator("input").fill("人工确认的页面");
+  await page.getByRole("button", { name: "保存草稿", exact: true }).click();
+  await page.getByRole("button", { name: "刷新设备", exact: true }).click();
+  assert.equal(
+    await bugPageField.locator("input").inputValue(),
+    "人工确认的页面",
+  );
+  assert.match(await bugPageField.locator(".source").innerText(), /人工补充/);
+  await bugPageField.locator("input").fill("");
+  await page.getByRole("button", { name: "保存草稿", exact: true }).click();
+  await page.getByRole("button", { name: "刷新设备", exact: true }).click();
+  assert.equal(await bugPageField.locator("input").inputValue(), "");
+  assert.match(await bugPageField.locator(".source").innerText(), /人工补充/);
   await page.evaluate(() => {
     const field = window.__qa.metadata.fields.find(
       (item) => item.id === "labels",
@@ -2861,8 +2893,9 @@ checks: try {
           "compact project settings rows fit narrow viewport",
           "fresh empty settings keep project selection and draft creation gated until one project is enabled",
           "settings package mapping synchronizes the hidden collected package identity",
-          "Jenkins package address and five problem fields are required with exact hints; manual time inputs are absent",
+          "Jenkins package address, title, and actual behavior are required while the remaining problem fields are optional; manual time inputs are absent",
           "Jenkins package address and title each span a full row across three viewport sizes",
+          "Bug page shows source details and manual values or manual clearing survive device refresh",
           "blank problem fields block preview and navigate to the corresponding field",
           "field errors use Chinese navigation labels without summary duplication",
           "frequency errors navigate locally and late capture does not require attachments",

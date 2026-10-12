@@ -5,11 +5,13 @@ use tauri::State;
 
 #[tauri::command]
 pub fn delete_draft(id: String, state: State<'_, AppState>) -> Result<()> {
+    state.stop_page_observer();
     delete_for_state(&state, &id)
 }
 
 #[tauri::command]
 pub fn delete_drafts(ids: Vec<String>, state: State<'_, AppState>) -> Result<()> {
+    state.stop_page_observer();
     delete_many_for_state(&state, &ids)
 }
 

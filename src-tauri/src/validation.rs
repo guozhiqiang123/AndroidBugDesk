@@ -138,9 +138,6 @@ pub fn validate(
     req!("jenkinsPackageUrl", "Jenkins包地址");
     req!("title", "问题标题");
     req!("app.packageName", "当前项目的 Android 包名配置");
-    req!("preconditions", "复现条件");
-    req!("steps", "复现步骤");
-    req!("expected", "期望表现");
     req!("actual", "问题表现");
     if !bool_at(d, "frequency.firstDiscovery") {
         let a = string(d, "frequency.attempts").parse::<u64>().unwrap_or(0);

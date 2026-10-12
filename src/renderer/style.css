@@ -1110,6 +1110,17 @@ code {
   background: #fff3e8;
   color: #b77a39;
 }
+.source.manual {
+  background: #eef2ff;
+  color: #526cc2;
+}
+.source.not_applicable {
+  background: #f2f4f7;
+  color: #758499;
+}
+.field > .field-source-detail {
+  color: #758499;
+}
 fieldset {
   border: 0;
   margin: 0;
@@ -1238,6 +1249,12 @@ details {
 .preview dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+.preview-source-detail {
+  display: block;
+  margin-top: 4px;
+  color: #758499;
+  font-size: 11px;
 }
 .preview-confirm-actions {
   display: flex;

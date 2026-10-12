@@ -61,6 +61,7 @@ fn auth_result(status: &str, user: Option<UserIdentity>, message: &str) -> AuthR
     }
 }
 pub fn invalidate(state: &AppState) {
+    state.stop_page_observer();
     let mut user = state.user.lock().unwrap();
     state.auth_epoch.fetch_add(1, Ordering::SeqCst);
     *user = None;

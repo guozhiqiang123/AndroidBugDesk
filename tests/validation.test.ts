@@ -59,9 +59,6 @@ describe("提交门槛", () => {
     "title",
     "workitemTypeId",
     "assignedTo",
-    "preconditions",
-    "steps",
-    "expected",
     "actual",
   ])("缺少 %s 阻止提交", (path) => {
     const v = d();
@@ -76,9 +73,6 @@ describe("提交门槛", () => {
     ["jenkinsPackageUrl", "Jenkins包地址"],
     ["title", "问题标题"],
     ["actual", "问题表现"],
-    ["preconditions", "复现条件"],
-    ["steps", "复现步骤"],
-    ["expected", "期望表现"],
   ] as const)("%s 只有空白时在线与离线核对均阻止提交", (path, label) => {
     const v = d();
     v[path] = " \n\t ";
@@ -109,7 +103,18 @@ describe("提交门槛", () => {
     v.title = "闪退";
     expect(check(v)).toEqual([]);
   });
-  it("复现步骤只要求非空，不用每行满足主观字数门槛", () => {
+  it.each(["preconditions", "steps", "expected"] as const)(
+    "%s 留空或填写占位内容时均不阻止提交",
+    (path) => {
+      for (const value of ["", " \n\t ", "未知"]) {
+        const v = d();
+        v[path] = value;
+        expect(check(v)).toEqual([]);
+        expect(validateDraft(v, m().profile, null, false, false)).toEqual([]);
+      }
+    },
+  );
+  it("选填的复现步骤内容不受主观字数门槛", () => {
     const v = d();
     v.steps = "3331111\n444\n555\n666";
     expect(check(v)).toEqual([]);
@@ -209,9 +214,9 @@ describe("提交门槛", () => {
   it("占位问题信息被阻止，未选择日志和人工时间不设门槛", () => {
     const v = d();
     v.event.occurredAt = "2026-10-09T08:00:00";
-    v.preconditions = "未知";
+    v.actual = "未知";
     v.attachments[0].confirmed = false;
-    expect(check(v).map((issue) => issue.field)).toEqual(["preconditions"]);
+    expect(check(v).map((issue) => issue.field)).toEqual(["actual"]);
     expect(check(v).some((issue) => issue.field.startsWith("event."))).toBe(
       false,
     );

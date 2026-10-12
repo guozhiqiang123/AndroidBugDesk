@@ -100,7 +100,7 @@ try {
                 {
                   projectId: metadata.profile.projectId,
                   enabled: true,
-                  packageName: "",
+                  packageName: q.draft.app.packageName,
                 },
               ],
             };
@@ -108,7 +108,9 @@ try {
           if (cmd === "new_draft") return clone(q.draft);
           if (cmd === "load_selection_memory") return {};
           if (cmd === "save_draft") {
+            const attachments = clone(q.draft.attachments);
             q.draft = clone(args.draft);
+            q.draft.attachments = attachments;
             return clone(q.draft);
           }
           if (cmd === "save_attachment_coverage") {
@@ -123,6 +125,11 @@ try {
             q.draft.attachments = q.draft.attachments.filter(
               (a) => a.id !== args.attachmentId,
             );
+            return clone(q.draft);
+          }
+          if (cmd === "remove_all_attachments") {
+            q.draft.attachments = [];
+            q.draft.previewConfirmed = false;
             return clone(q.draft);
           }
           if (cmd === "preview_attachment") {
@@ -151,8 +158,40 @@ try {
     await page.getByRole("button", { name: "从草稿移除", exact: true }).count(),
     0,
   );
+  const removeAll = page.getByRole("button", {
+    name: "移除所有附件",
+    exact: true,
+  });
+  await removeAll.waitFor();
+  assert.ok(
+    await removeAll.evaluate(
+      (button) =>
+        getComputedStyle(button).backgroundColor !== "rgb(255, 255, 255)",
+    ),
+  );
   for (const width of [980, 1280, 1440]) {
     await page.setViewportSize({ width, height: 900 });
+    const actionGeometry = await page
+      .locator(".attachment-actions")
+      .evaluate((row) => {
+        const buttons = [
+          ...row.querySelectorAll(":scope > .action-item > button"),
+        ];
+        const boxes = buttons.map((button) => button.getBoundingClientRect());
+        return {
+          labels: buttons.map((button) => button.textContent?.trim()),
+          aligned:
+            boxes.every((box) => Math.abs(box.top - boxes[0].top) < 1) &&
+            boxes.every((box) => Math.abs(box.width - boxes[0].width) < 1) &&
+            row.scrollWidth <= row.clientWidth,
+        };
+      });
+    assert.equal(actionGeometry.labels.length, 4);
+    assert.equal(actionGeometry.labels[0], "设备环境快照");
+    assert.ok(actionGeometry.labels[1]?.startsWith("补采证据"));
+    assert.equal(actionGeometry.labels[2], "导入附件");
+    assert.equal(actionGeometry.labels[3], "移除所有附件");
+    assert.ok(actionGeometry.aligned, `Action layout at ${width}px`);
     const geometry = await page.locator(".attachment").evaluateAll((cards) =>
       cards.map((card) => {
         const body = card
@@ -242,6 +281,28 @@ try {
     ),
     false,
   );
+  await page.getByRole("button", { name: "关闭提交预览", exact: true }).click();
+  await removeAll.click();
+  await page.waitForFunction(
+    () =>
+      document.querySelectorAll(".attachment").length === 0 &&
+      ![...document.querySelectorAll("button")].some(
+        (button) => button.textContent?.trim() === "移除所有附件",
+      ),
+  );
+  assert.deepEqual(
+    await page.evaluate(() => window.__qa.draft.attachments),
+    [],
+  );
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter(
+          (call) => call.cmd === "remove_all_attachments",
+        ).length,
+    ),
+    1,
+  );
   assert.deepEqual(errors, []);
   await server.verifySource();
   await writeFile(
@@ -256,6 +317,7 @@ try {
           "coverage save accepts no confirmation flag",
           "remove action changes draft",
           "legacy false confirmation still appears in upload preview",
+          "remove-all action is blue, clears the draft, and hides when empty",
         ],
         mode: "Actual React with mocked IPC; no cloud, USB or system viewer launch",
       },

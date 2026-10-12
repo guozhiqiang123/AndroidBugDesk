@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     path::PathBuf,
-    sync::{atomic::AtomicU64, Mutex},
+    sync::{atomic::AtomicU64, Arc, Mutex},
 };
 use tauri::{Manager, State};
 use zeroize::Zeroize;
@@ -22,6 +22,8 @@ pub struct AppState {
     pub metadata: Mutex<Option<Metadata>>,
     pub adb: Mutex<Option<PathBuf>>,
     pub collector: Mutex<Option<adb::Collector>>,
+    pub page_observer: Mutex<Option<adb::PageObserver>>,
+    pub page_observer_generation: Arc<AtomicU64>,
     pub locks: Mutex<HashSet<String>>,
 }
 pub(crate) const SERVICE: &str = "com.qa.androidbugdesk";
@@ -30,6 +32,11 @@ impl AppState {
         let store = Store::new(&root)?;
         store.recover()?;
         crate::capture::recover(&store)?;
+        for mut draft in store.list("draft")? {
+            if adb::clear_mismatched_automatic_page(&mut draft) {
+                store.put("draft", &string(&draft, "id"), &draft)?;
+            }
+        }
         for mut session in store.list("session")? {
             if session["stoppedAt"].is_null() {
                 session["stoppedAt"] = json!(now());
@@ -57,8 +64,17 @@ impl AppState {
             metadata: Mutex::new(None),
             adb: Mutex::new(adb::discover()),
             collector: Mutex::new(None),
+            page_observer: Mutex::new(None),
+            page_observer_generation: Arc::new(AtomicU64::new(0)),
             locks: Mutex::new(HashSet::new()),
         })
+    }
+    pub fn stop_page_observer(&self) {
+        self.page_observer_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(observer) = self.page_observer.lock().unwrap().take() {
+            adb::stop_page_observer(observer);
+        }
     }
     pub fn api(&self) -> Result<Api> {
         if self.user.lock().unwrap().is_none() {
@@ -158,6 +174,7 @@ pub async fn clear_auth(state: State<'_, AppState>) -> Result<()> {
     if !state.locks.lock().unwrap().is_empty() {
         return Err("请等待本次提交结束后再退出登录".into());
     }
+    state.stop_page_observer();
     crate::workspace::invalidate(&state);
     state.oauth_flow.cancel();
     let oauth = state.oauth.lock().unwrap().take();
@@ -250,6 +267,7 @@ pub async fn select_project(
     project_id: String,
     state: State<'_, AppState>,
 ) -> Result<Profile> {
+    state.stop_page_observer();
     crate::workspace::observed_error(
         &state,
         crate::workspace::select_project(&state, organization_id, project_id).await,
@@ -325,6 +343,7 @@ pub async fn list_remote_history(
 }
 #[tauri::command]
 pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
+    state.stop_page_observer();
     let file = rfd::AsyncFileDialog::new()
         .add_filter("项目配置", &["json"])
         .pick_file()
@@ -356,6 +375,7 @@ pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
 }
 #[tauri::command]
 pub fn new_draft(state: State<AppState>) -> Result<Value> {
+    state.stop_page_observer();
     let scope = crate::workspace::current_scope(&state, "")?;
     let mut d: Value =
         serde_json::from_str(include_str!("../../schemas/empty-draft.json")).unwrap();
@@ -370,6 +390,8 @@ pub fn new_draft(state: State<AppState>) -> Result<Value> {
 #[tauri::command]
 pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     let _write = state.store.writes.lock().unwrap();
+    let incoming_page = string(&draft, "bugPage");
+    let incoming_page_source = draft["sources"]["bugPage"].clone();
     crate::project_settings::apply_current_package(&state, &mut draft)?;
     validation::check_shape(&draft)?;
     let id = string(&draft, "id");
@@ -380,10 +402,30 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     draft["sessionId"] = old["sessionId"].clone();
     draft["collectionErrors"] = old["collectionErrors"].clone();
     draft["sources"] = old["sources"].clone();
-    if string(&draft, "bugPage") != string(&old, "bugPage") {
+    if incoming_page_source["status"] == "manual"
+        && (incoming_page != string(&old, "bugPage")
+            || old["sources"]["bugPage"]["status"] != "manual")
+    {
         let prior = old["sources"]["bugPage"].clone();
+        draft["bugPage"] = json!(incoming_page);
         draft["sources"]["bugPage"] =
             json!({"status":"manual","at":now(),"detail":format!("人工输入；原始来源：{}",prior)});
+    } else if old["sources"]["bugPage"]["status"] != "manual"
+        && !string(&old, "bugPage").is_empty()
+        && !adb::draft_bug_page_is_trusted(&old)
+    {
+        let old_page = string(&old, "bugPage");
+        let target_package = string(&draft, "app.packageName");
+        draft["bugPage"] = json!("");
+        draft["sources"]["bugPage"] = json!({
+            "status":"not_applicable",
+            "at":now(),
+            "detail":format!("已清除旧自动页面 {old_page}：与目标包 {target_package} 不一致")
+        });
+    } else {
+        // The page observer may have updated storage after the renderer last
+        // refreshed. Never let that stale automatic echo roll the page back.
+        draft["bugPage"] = old["bugPage"].clone();
     }
     draft["event"]["originalAt"] = old["event"]["originalAt"].clone();
     draft["event"]["source"] = old["event"]["source"].clone();
@@ -443,6 +485,7 @@ pub async fn choose_adb(state: State<'_, AppState>) -> Result<String> {
     if !String::from_utf8_lossy(&bytes).contains("Android Debug Bridge") {
         return Err("所选程序不是 ADB".into());
     }
+    state.stop_page_observer();
     *state.adb.lock().unwrap() = Some(file.path().into());
     Ok(file.path().to_string_lossy().into())
 }
@@ -456,6 +499,7 @@ pub async fn inspect_device(
     serial: String,
     state: State<'_, AppState>,
 ) -> Result<Value> {
+    state.stop_page_observer();
     state.editable(&id)?;
     let scope = crate::workspace::current_scope(&state, "")?;
     if state.store.get::<String>("draft_scope", &id)?.as_deref() != Some(&scope) {
@@ -519,18 +563,22 @@ pub async fn inspect_device(
                 draft["app"][key] = value.clone();
             }
             let mut sources = draft["sources"].as_object().cloned().unwrap_or_default();
-            let keep_manual_page = string(&snapshot, "bugPage").is_empty()
-                && sources
-                    .get("bugPage")
-                    .is_some_and(|source| source["status"] == "manual");
-            if !keep_manual_page {
+            let existing_page = string(&draft, "bugPage");
+            let snapshot_page = string(&snapshot, "bugPage");
+            let existing_is_manual = sources
+                .get("bugPage")
+                .is_some_and(|source| source["status"] == "manual");
+            let existing_is_valid = adb::draft_bug_page_is_trusted(&draft);
+            let keep_existing_page = existing_is_manual
+                || (existing_is_valid && snapshot_page.is_empty() && !existing_page.is_empty());
+            if !keep_existing_page {
                 draft["bugPage"] = snapshot["bugPage"].clone();
             }
             if let Some(observed) = snapshot["sources"].as_object() {
                 sources.extend(
                     observed
                         .iter()
-                        .filter(|(key, _)| !keep_manual_page || key.as_str() != "bugPage")
+                        .filter(|(key, _)| !keep_existing_page || key.as_str() != "bugPage")
                         .map(|(key, value)| (key.clone(), value.clone())),
                 );
             }
@@ -552,6 +600,23 @@ pub async fn inspect_device(
             state
                 .store
                 .put_many(&[("draft", &id, &draft), ("snapshot", &id, &snapshot)])?;
+            let observer_generation = state
+                .page_observer_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let observer = adb::start_page_observer(
+                path,
+                serial,
+                adb::PageObservationTarget {
+                    store: state.store.clone(),
+                    draft_id: id.clone(),
+                    scope,
+                    package: configured_package,
+                },
+                state.page_observer_generation.clone(),
+                observer_generation,
+            );
+            *state.page_observer.lock().unwrap() = Some(observer);
             Ok(snapshot)
         }
         Some("offline") => Err("所选 USB 设备处于离线状态，请重新连接后重试".into()),
@@ -1091,6 +1156,18 @@ pub fn remove_attachment(
             && !(string(a, "role") == "report" && string(a, "derivedFrom") == attachment_id)
     });
     d["previewConfirmed"] = json!(false);
+    state.store.put("draft", &id, &d)?;
+    Ok(d)
+}
+#[tauri::command]
+pub fn remove_all_attachments(id: String, state: State<AppState>) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
+    state.editable(&id)?;
+    let mut d = state.store.draft(&id)?;
+    d["attachments"] = json!([]);
+    d["previewConfirmed"] = json!(false);
+    validation::check_shape(&d)?;
+    state.assert_no_token(&d)?;
     state.store.put("draft", &id, &d)?;
     Ok(d)
 }

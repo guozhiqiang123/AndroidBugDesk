@@ -69,6 +69,7 @@ pub fn run() {
             commands::preview_attachment,
             commands::save_attachment_coverage,
             commands::remove_attachment,
+            commands::remove_all_attachments,
             commands::export_evidence,
             commands::submit_bug,
             commands::reconcile_submission,
@@ -89,6 +90,7 @@ pub fn run() {
                 if let Some(c) = state.collector.lock().unwrap().as_ref() {
                     let _ = c.stop.send(true);
                 }
+                state.stop_page_observer();
                 if let Some(t) = state.token.lock().unwrap().as_mut() {
                     use zeroize::Zeroize;
                     t.zeroize();

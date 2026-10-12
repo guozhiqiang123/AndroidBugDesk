@@ -9,6 +9,8 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{atomic::AtomicU64, Arc},
+    time::Duration,
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::watch};
 pub fn valid_serial(s: &str) -> Result<()> {
@@ -248,6 +250,54 @@ pub struct ForegroundComponent {
     pub source: &'static str,
 }
 
+fn component_page(component: &ForegroundComponent) -> String {
+    if component.activity.starts_with('.') {
+        format!("{}{}", component.package, component.activity)
+    } else {
+        component.activity.clone()
+    }
+}
+
+pub fn target_component_page(
+    component: &ForegroundComponent,
+    target_package: &str,
+) -> Option<String> {
+    (component.package == target_package).then(|| component_page(component))
+}
+
+pub fn page_belongs_to_package(page: &str, target_package: &str) -> bool {
+    page == target_package
+        || page
+            .strip_prefix(target_package)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+pub fn draft_bug_page_is_trusted(draft: &Value) -> bool {
+    let page = string(draft, "bugPage");
+    let target_package = string(draft, "app.packageName");
+    page.is_empty()
+        || draft["sources"]["bugPage"]["status"] == "manual"
+        || string(draft, "sources.bugPage.detail").contains(&format!("目标包 {target_package}"))
+        || page_belongs_to_package(&page, &target_package)
+}
+
+pub fn clear_mismatched_automatic_page(draft: &mut Value) -> bool {
+    let page = string(draft, "bugPage");
+    if draft_bug_page_is_trusted(draft) {
+        return false;
+    }
+    let target_package = string(draft, "app.packageName");
+    draft["bugPage"] = json!("");
+    draft["sources"]["bugPage"] = json!({
+        "status": "not_applicable",
+        "at": now(),
+        "detail": format!("已清除旧自动页面 {page}：与目标包 {target_package} 不一致"),
+    });
+    draft["previewConfirmed"] = json!(false);
+    draft["updatedAt"] = json!(now());
+    true
+}
+
 fn valid_component_package(package: &str) -> bool {
     valid_package(package).is_ok()
 }
@@ -340,41 +390,56 @@ pub async fn inspect_snapshot(path: &Path, serial: &str, target_package: &str) -
     // observed separately and is used only for the optional Bug page.
     let mut snapshot = snapshot_impl(path, serial, target_package, true).await?;
     snapshot["details"]["serial"] = json!(serial);
+    let observed_at: String;
+    let page_status: &str;
+    let page_detail: String;
     match foreground(path, serial).await {
         Ok(component) => {
             snapshot["details"]["foregroundPackage"] = json!(component.package);
             snapshot["details"]["foregroundActivity"] = json!(component.activity);
             snapshot["details"]["foregroundSource"] = json!(component.source);
-            match foreground(path, serial).await {
-                Ok(final_component) if final_component.package != component.package => {
-                    snapshot["details"]["foregroundPackage"] = json!("");
-                    snapshot["details"]["foregroundActivity"] = json!("");
-                    snapshot["details"]["foregroundSource"] = json!("");
-                    snapshot["errors"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(json!("采集期间前台应用发生切换，未记录 Bug 所在页面"));
-                }
-                Err(error) => {
-                    snapshot["details"]["foregroundPackage"] = json!("");
-                    snapshot["details"]["foregroundActivity"] = json!("");
-                    snapshot["details"]["foregroundSource"] = json!("");
-                    snapshot["errors"]
-                        .as_array_mut()
-                        .unwrap()
-                        .push(json!(format!("采集结束时无法复核前台页面: {error}")));
-                }
-                Ok(final_component) => {
-                    snapshot["details"]["foregroundActivity"] = json!(final_component.activity);
-                    snapshot["details"]["foregroundSource"] = json!(final_component.source);
+            if component.package != target_package {
+                observed_at = now();
+                page_status = "not_applicable";
+                page_detail = format!(
+                    "ADB 前台页面属于其他应用 {}，与目标包 {} 不一致，未采用",
+                    component.package, target_package
+                );
+            } else {
+                match foreground(path, serial).await {
+                    Ok(final_component) if final_component.package != target_package => {
+                        observed_at = now();
+                        snapshot["details"]["foregroundPackage"] = json!("");
+                        snapshot["details"]["foregroundActivity"] = json!("");
+                        snapshot["details"]["foregroundSource"] = json!("");
+                        page_status = "not_applicable";
+                        page_detail = "采集期间前台应用离开目标包，未采用当前页面".into();
+                    }
+                    Err(error) => {
+                        observed_at = now();
+                        page_status = "failed";
+                        snapshot["details"]["foregroundPackage"] = json!("");
+                        snapshot["details"]["foregroundActivity"] = json!("");
+                        snapshot["details"]["foregroundSource"] = json!("");
+                        page_detail = format!("采集结束时无法复核目标应用前台页面：{error}");
+                    }
+                    Ok(final_component) => {
+                        observed_at = now();
+                        snapshot["details"]["foregroundActivity"] = json!(final_component.activity);
+                        snapshot["details"]["foregroundSource"] = json!(final_component.source);
+                        page_status = "collected";
+                        page_detail = format!(
+                            "ADB 目标应用前台页面（目标包 {target_package}）：{}",
+                            final_component.source
+                        );
+                    }
                 }
             }
         }
         Err(error) => {
-            snapshot["errors"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!(error));
+            observed_at = now();
+            page_status = "failed";
+            page_detail = format!("未能自动读取目标应用前台页面：{error}");
             snapshot["details"]["foregroundPackage"] = json!("");
             snapshot["details"]["foregroundActivity"] = json!("");
             snapshot["details"]["foregroundSource"] = json!("");
@@ -382,23 +447,150 @@ pub async fn inspect_snapshot(path: &Path, serial: &str, target_package: &str) -
     }
     let activity = string(&snapshot, "details.foregroundActivity");
     let package = string(&snapshot, "details.foregroundPackage");
-    let bug_page = if activity.starts_with('.') && !package.is_empty() {
-        format!("{package}{activity}")
+    let bug_page = if package == target_package && !activity.is_empty() {
+        component_page(&ForegroundComponent {
+            package,
+            activity,
+            source: "snapshot",
+        })
     } else {
-        activity
+        String::new()
     };
-    let collected = !bug_page.is_empty();
     snapshot["bugPage"] = json!(bug_page);
     snapshot["sources"]["bugPage"] = json!({
-        "status": if collected { "collected" } else { "failed" },
-        "at": snapshot["capturedAt"],
-        "detail": if collected {
-            format!("ADB 前台页面：{}", string(&snapshot, "details.foregroundSource"))
-        } else {
-            "未能自动读取前台页面；此项选填".into()
-        }
+        "status": page_status,
+        "at": observed_at,
+        "detail": page_detail,
     });
     Ok(snapshot)
+}
+
+pub struct PageObserver {
+    pub draft_id: String,
+    stop: watch::Sender<bool>,
+    task: tauri::async_runtime::JoinHandle<()>,
+}
+
+impl PageObserver {
+    fn stop(&self) {
+        let _ = self.stop.send(true);
+        self.task.abort();
+    }
+}
+
+impl Drop for PageObserver {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+pub fn stop_page_observer(observer: PageObserver) {
+    observer.stop();
+}
+
+#[derive(Clone)]
+pub struct PageObservationTarget {
+    pub store: Store,
+    pub draft_id: String,
+    pub scope: String,
+    pub package: String,
+}
+
+pub fn record_observed_page(
+    target: &PageObservationTarget,
+    page: &str,
+    source: &str,
+    observed_at: &str,
+    generation: Option<(&AtomicU64, u64)>,
+) -> Result<bool> {
+    let _write = target.store.writes.lock().unwrap();
+    if generation.is_some_and(|(current, expected)| {
+        current.load(std::sync::atomic::Ordering::SeqCst) != expected
+    }) {
+        return Ok(false);
+    }
+    if target
+        .store
+        .get::<String>("draft_scope", &target.draft_id)?
+        .as_deref()
+        != Some(&target.scope)
+        || target.store.editable(&target.draft_id).is_err()
+    {
+        return Ok(false);
+    }
+    let mut draft = match target.store.get::<Value>("draft", &target.draft_id)? {
+        Some(draft) => draft,
+        None => return Ok(false),
+    };
+    if string(&draft, "app.packageName") != target.package {
+        return Ok(false);
+    }
+    if draft["sources"]["bugPage"]["status"] == "manual" {
+        return Ok(true);
+    }
+    if string(&draft, "bugPage") == page && draft["sources"]["bugPage"]["status"] == "collected" {
+        return Ok(true);
+    }
+    draft["bugPage"] = json!(page);
+    draft["sources"]["bugPage"] = json!({
+        "status": "collected",
+        "at": observed_at,
+        "detail": format!("ADB 持续前台观察（目标包 {}）：{source}", target.package),
+    });
+    draft["previewConfirmed"] = json!(false);
+    draft["updatedAt"] = json!(now());
+    target.store.put("draft", &target.draft_id, &draft)?;
+    Ok(true)
+}
+
+pub fn start_page_observer(
+    path: PathBuf,
+    serial: String,
+    target: PageObservationTarget,
+    generation: Arc<AtomicU64>,
+    expected_generation: u64,
+) -> PageObserver {
+    let (stop, mut cancelled) = watch::channel(false);
+    let observer_draft_id = target.draft_id.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = cancelled.changed() => {
+                    if changed.is_err() || *cancelled.borrow() { break; }
+                }
+                _ = interval.tick() => {}
+            }
+            let component = tokio::select! {
+                changed = cancelled.changed() => {
+                    if changed.is_err() || *cancelled.borrow() { break; }
+                    continue;
+                }
+                result = foreground(&path, &serial) => result,
+            };
+            let Ok(component) = component else { continue };
+            let Some(page) = target_component_page(&component, &target.package) else {
+                continue;
+            };
+            let observed_at = now();
+            match record_observed_page(
+                &target,
+                &page,
+                component.source,
+                &observed_at,
+                Some((&generation, expected_generation)),
+            ) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => break,
+            }
+        }
+    });
+    PageObserver {
+        draft_id: observer_draft_id,
+        stop,
+        task,
+    }
 }
 
 pub async fn snapshot(path: &Path, serial: &str, package: &str) -> Result<Value> {
@@ -1115,6 +1307,38 @@ mod gap_tests {
         assert!(!system_overlay("com.example.app"));
     }
 
+    #[test]
+    fn target_page_accepts_only_the_configured_package() {
+        let target = ForegroundComponent {
+            package: "com.photo.recovery.global.tt".into(),
+            activity: ".page.ResultActivity".into(),
+            source: "focused",
+        };
+        assert_eq!(
+            target_component_page(&target, "com.photo.recovery.global.tt").as_deref(),
+            Some("com.photo.recovery.global.tt.page.ResultActivity")
+        );
+        let launcher = ForegroundComponent {
+            package: "com.google.android.apps.nexuslauncher".into(),
+            activity: ".NexusLauncherActivity".into(),
+            source: "focused",
+        };
+        assert_eq!(
+            target_component_page(&launcher, "com.photo.recovery.global.tt"),
+            None
+        );
+        let third_party_activity = json!({
+            "bugPage":"com.vendor.sdk.HostActivity",
+            "app":{"packageName":"com.photo.recovery.global.tt"},
+            "sources":{"bugPage":{
+                "status":"collected",
+                "at":"2026-10-12T00:00:00Z",
+                "detail":"ADB 持续前台观察（目标包 com.photo.recovery.global.tt）：focused"
+            }}
+        });
+        assert!(draft_bug_page_is_trusted(&third_party_activity));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn inspect_snapshot_fake_adb_reads_the_selected_device_foreground() {
@@ -1130,6 +1354,27 @@ mod gap_tests {
         assert_eq!(value["device"]["model"], "Pixel Fake");
         assert_eq!(value["bugPage"], "com.example.app.MainActivity");
         assert_eq!(value["sources"]["bugPage"]["status"], "collected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inspect_snapshot_does_not_record_the_launcher_as_the_bug_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let adb = fake_adb(
+            temp.path(),
+            "if [ \"$4\" = dumpsys ] && [ \"$5\" = activity ]; then printf '%s\\n' 'mResumedActivity: ActivityRecord{abc u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t1}'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$5\" = window ]; then printf '%s\\n' 'mCurrentFocus=Window{abc u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity}'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.product.model ]; then printf 'Pixel Fake\\n'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.build.version.release ]; then printf '14\\n'; exit 0; fi\nif [ \"$4\" = cat ]; then printf 'MemTotal: 1234 kB\\nMemAvailable: 456 kB\\n'; exit 0; fi\nif [ \"$4\" = wm ]; then printf 'Physical size: 1080x2400\\n'; exit 0; fi\nif [ \"$4\" = am ]; then printf '0\\n'; exit 0; fi\nif [ \"$4\" = pm ]; then printf 'package:com.photo.recovery.global.tt\\n'; exit 0; fi\nif [ \"$4\" = date ]; then printf '2026-10-09T12:00:00+0800\\n'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$6\" = com.photo.recovery.global.tt ]; then printf 'versionName=1.2.3\\nversionCode=42\\n'; exit 0; fi\nexit 0",
+        );
+        let value = inspect_snapshot(&adb, "USB-A", "com.photo.recovery.global.tt")
+            .await
+            .unwrap();
+        assert_eq!(value["bugPage"], "");
+        assert_eq!(value["sources"]["bugPage"]["status"], "not_applicable");
+        assert!(string(&value, "sources.bugPage.detail").contains("不一致"));
+        assert!(!value["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error.as_str().unwrap_or_default().contains("Launcher")));
     }
 
     #[cfg(unix)]

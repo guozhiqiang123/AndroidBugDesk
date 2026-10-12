@@ -613,6 +613,14 @@ pub fn safe_name(s: &str) -> String {
 fn md(s: &str) -> String {
     s.replace('<', "&lt;").replace('>', "&gt;")
 }
+fn effective_bug_page(d: &Value) -> String {
+    let page = string(d, "bugPage");
+    if crate::adb::draft_bug_page_is_trusted(d) {
+        page
+    } else {
+        String::new()
+    }
+}
 pub fn report(d: &Value, p: &Profile) -> String {
     let app = json!({
         "packageName": string(d, "app.packageName"),
@@ -630,10 +638,31 @@ pub fn report(d: &Value, p: &Profile) -> String {
     ];
     let mut out = format!("# {}\n\n项目：{}\n\n", md(&string(d, "title")), md(&p.name));
     for (title, key) in rows {
-        if key == "bugPage" && string(d, key).trim().is_empty() {
+        let value = if key == "bugPage" {
+            effective_bug_page(d)
+        } else {
+            string(d, key)
+        };
+        if key == "bugPage" && value.trim().is_empty() {
             continue;
         }
-        out.push_str(&format!("## {title}\n\n{}\n\n", md(&string(d, key))));
+        out.push_str(&format!("## {title}\n\n{}\n\n", md(&value)));
+        if key == "bugPage" {
+            let source = &d["sources"]["bugPage"];
+            let status = match string(source, "status").as_str() {
+                "collected" => "自动采集",
+                "manual" => "人工补充",
+                "not_applicable" => "未采用",
+                "failed" => "采集失败",
+                _ => "未记录",
+            };
+            out.push_str(&format!(
+                "采集时间：{}  \n来源：{}；{}\n\n",
+                md(&string(source, "at")),
+                status,
+                md(&string(source, "detail"))
+            ));
+        }
     }
     out.push_str("## 复现步骤\n\n");
     for (i, s) in string(d, "steps")
@@ -758,7 +787,7 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
     let manifest = json!({"schemaVersion":"1.0","evidenceId":id,"sessionId":d["sessionId"],"clientVersion":env!("CARGO_PKG_VERSION"),"createdAt":now(),
         "scope":{"organizationId":p.organization_id,"projectId":p.project_id,"versions":d["versions"],"sprint":d["sprint"],"multicaParentTaskId":null},
         "installedArtifact":{"identity":d["app"]},
-        "problem":{"jenkinsPackageUrl":d["jenkinsPackageUrl"],"kind":d["kind"],"title":d["title"],"bugPage":string(d,"bugPage"),"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"collection":d["sources"],"gaps":d["collectionErrors"],
+        "problem":{"jenkinsPackageUrl":d["jenkinsPackageUrl"],"kind":d["kind"],"title":d["title"],"bugPage":effective_bug_page(d),"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"collection":d["sources"],"gaps":d["collectionErrors"],
         "files":files.iter().map(|a|json!({"id":a.id,"relativePath":Path::new(&a.path).strip_prefix(&dir).unwrap().to_string_lossy(),"mime":a.mime,"size":a.size,"sha256":a.sha256,"role":a.role,"source":a.source,"derivedFrom":a.derived_from,"includedInZip":include_media || !["image","video"].contains(&a.role.as_str()),"coverage":{"start":a.coverage_start,"end":a.coverage_end}})).collect::<Vec<_>>()});
     for (name, value) in [
         ("manifest.json", manifest),
