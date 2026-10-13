@@ -473,6 +473,7 @@ pub struct PageObserver {
 
 impl PageObserver {
     fn stop(&self) {
+        crate::diagnostics::event("page_observer", "stop requested");
         let _ = self.stop.send(true);
         self.task.abort();
     }
@@ -550,11 +551,13 @@ pub fn start_page_observer(
     generation: Arc<AtomicU64>,
     expected_generation: u64,
 ) -> PageObserver {
+    crate::diagnostics::event("page_observer", "started");
     let (stop, mut cancelled) = watch::channel(false);
     let observer_draft_id = target.draft_id.clone();
     let task = tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut collection_error_logged = false;
         loop {
             tokio::select! {
                 changed = cancelled.changed() => {
@@ -569,7 +572,19 @@ pub fn start_page_observer(
                 }
                 result = foreground(&path, &serial) => result,
             };
-            let Ok(component) = component else { continue };
+            let component = match component {
+                Ok(component) => {
+                    collection_error_logged = false;
+                    component
+                }
+                Err(_) => {
+                    if !collection_error_logged {
+                        crate::diagnostics::event("page_observer", "foreground read failed");
+                        collection_error_logged = true;
+                    }
+                    continue;
+                }
+            };
             let Some(page) = target_component_page(&component, &target.package) else {
                 continue;
             };
@@ -582,9 +597,17 @@ pub fn start_page_observer(
                 Some((&generation, expected_generation)),
             ) {
                 Ok(true) => {}
-                Ok(false) | Err(_) => break,
+                Ok(false) => {
+                    crate::diagnostics::event("page_observer", "stopped because scope changed");
+                    break;
+                }
+                Err(_) => {
+                    crate::diagnostics::event("page_observer", "stopped after persistence error");
+                    break;
+                }
             }
         }
+        crate::diagnostics::event("page_observer", "task ended");
     });
     PageObserver {
         draft_id: observer_draft_id,

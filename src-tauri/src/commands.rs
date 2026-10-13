@@ -499,6 +499,7 @@ pub async fn inspect_device(
     serial: String,
     state: State<'_, AppState>,
 ) -> Result<Value> {
+    crate::diagnostics::event("device", "inspection started");
     state.stop_page_observer();
     state.editable(&id)?;
     let scope = crate::workspace::current_scope(&state, "")?;
@@ -617,6 +618,7 @@ pub async fn inspect_device(
                 observer_generation,
             );
             *state.page_observer.lock().unwrap() = Some(observer);
+            crate::diagnostics::event("device", "inspection completed and observer started");
             Ok(snapshot)
         }
         Some("offline") => Err("所选 USB 设备处于离线状态，请重新连接后重试".into()),
@@ -1301,7 +1303,9 @@ pub fn open_receipt(id: String, state: State<AppState>) -> Result<()> {
 }
 pub fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let root = app.path().app_local_data_dir()?;
+    crate::diagnostics::init(&root)?;
     let state = AppState::new(root).map_err(std::io::Error::other)?;
     app.manage(state);
+    crate::diagnostics::start_main_thread_watchdog(app.handle().clone());
     Ok(())
 }

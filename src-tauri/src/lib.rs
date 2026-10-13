@@ -1,6 +1,7 @@
 pub mod adb;
 pub mod capture;
 pub mod commands;
+pub mod diagnostics;
 pub mod drafts;
 pub mod evidence;
 pub mod history;
@@ -22,6 +23,7 @@ pub mod workitem_links;
 pub mod workspace;
 pub mod yunxiao;
 pub fn run() {
+    diagnostics::install_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             use tauri::Manager;
@@ -91,6 +93,7 @@ pub fn run() {
                     let _ = c.stop.send(true);
                 }
                 state.stop_page_observer();
+                diagnostics::event("app", "exit requested");
                 if let Some(t) = state.token.lock().unwrap().as_mut() {
                     use zeroize::Zeroize;
                     t.zeroize();

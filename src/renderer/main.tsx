@@ -682,9 +682,11 @@ function App() {
     if (!isTauri() || !boot?.authorized || !draft || !serial || tab !== "new")
       return;
     let active = true;
+    let polling = false;
     const draftId = draft.id;
-    const timer = window.setInterval(() => {
-      if (busyGate.current) return;
+    const refreshCollectedState = () => {
+      if (document.hidden || busyGate.current || polling) return;
+      polling = true;
       void invoke<Bootstrap>("bootstrap")
         .then((b) => {
           if (!active) return;
@@ -726,11 +728,22 @@ function App() {
         })
         .catch((e) => {
           if (active) setError(`读取本地采集进度失败：${String(e)}`);
+        })
+        .finally(() => {
+          polling = false;
         });
-    }, 1500);
+    };
+    const refreshWhenVisible = () => {
+      if (!document.hidden) refreshCollectedState();
+    };
+    const timer = window.setInterval(refreshCollectedState, 3000);
+    window.addEventListener("focus", refreshCollectedState);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => {
       active = false;
       window.clearInterval(timer);
+      window.removeEventListener("focus", refreshCollectedState);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [boot?.authorized, draft?.id, serial, tab]);
   useEffect(() => {
