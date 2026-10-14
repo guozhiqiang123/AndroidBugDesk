@@ -202,8 +202,24 @@ checks: try {
         derivedFrom: parent,
         confirmed: false,
       });
+      let nextCallbackId = 1;
+      const callbacks = new Map();
+      const transformCallback = (callback, once = false) => {
+        const id = nextCallbackId++;
+        callbacks.set(id, (payload) => {
+          callback?.(payload);
+          if (once) callbacks.delete(id);
+        });
+        return id;
+      };
+      const unregisterCallback = (id) => callbacks.delete(id);
+      const emitChannel = (channel, index, message) => {
+        callbacks.get(channel.id)?.({ index, message });
+      };
       window.__TAURI_INTERNALS__ = {
         convertFileSrc: () => "",
+        transformCallback,
+        unregisterCallback,
         invoke: async (cmd, args = {}) => {
           q.calls.push({ cmd, args: clone(args) });
           if (cmd === "bootstrap")
@@ -286,13 +302,38 @@ checks: try {
               error: null,
             };
           }
-          if (cmd === "install_update")
+          if (cmd === "install_update") {
+            emitChannel(args.onProgress, 0, {
+              phase: "connecting",
+              downloadedBytes: 0,
+              totalBytes: 0,
+              percent: null,
+              bytesPerSecond: 0,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            emitChannel(args.onProgress, 1, {
+              phase: "downloading",
+              downloadedBytes: 5 * 1024 * 1024,
+              totalBytes: 10 * 1024 * 1024,
+              percent: 50,
+              bytesPerSecond: 1024 * 1024,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            emitChannel(args.onProgress, 2, {
+              phase: "verifying",
+              downloadedBytes: 10 * 1024 * 1024,
+              totalBytes: 10 * 1024 * 1024,
+              percent: 100,
+              bytesPerSecond: 2 * 1024 * 1024,
+            });
+            callbacks.get(args.onProgress.id)?.({ index: 3, end: true });
             return {
               ok: false,
               message: "更新失败。",
               filePath: null,
               error: "模拟下载安装失败",
             };
+          }
           if (cmd === "open_release_page") return;
           if (cmd === "select_project") {
             if (q.failProject) throw "模拟项目切换失败";
@@ -646,6 +687,15 @@ checks: try {
     await reloadedDialog
       .getByRole("button", { name: "立马更新", exact: true })
       .click();
+    const installingDialog = page.getByRole("dialog", {
+      name: "正在更新",
+      exact: true,
+    });
+    await installingDialog.waitFor();
+    await installingDialog
+      .getByRole("progressbar", { name: "更新下载进度" })
+      .waitFor();
+    await installingDialog.getByText(/50%.*1\.0 MB\/s/).waitFor();
     await page
       .getByRole("heading", { name: "更新失败", exact: true })
       .waitFor();
@@ -657,6 +707,23 @@ checks: try {
       ),
       1,
     );
+    fs.writeFileSync(
+      path.join(output, "result.json"),
+      JSON.stringify(
+        {
+          passed: true,
+          mode: "startup update dialog with mocked IPC progress",
+          scenarios: [
+            "startup update can be cancelled without starting installation",
+            "update install renders streamed download progress before failure",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    await server.verifySource();
+    console.log("2 startup update scenarios passed; no remote download.");
     break checks;
   }
   await page.getByRole("tab", { name: "填写 PAT", exact: true }).click();
@@ -2462,6 +2529,14 @@ checks: try {
   await updateCard
     .getByRole("button", { name: "立马更新", exact: true })
     .click();
+  const installingUpdateDialog = page.getByRole("dialog", {
+    name: "正在更新",
+    exact: true,
+  });
+  await installingUpdateDialog
+    .getByRole("progressbar", { name: "更新下载进度" })
+    .waitFor();
+  await installingUpdateDialog.getByText(/50%.*1\.0 MB\/s/).waitFor();
   const updateErrorDialog = page.getByRole("dialog", {
     name: "更新失败",
     exact: true,

@@ -1,6 +1,7 @@
-use crate::model::Result;
+use crate::{diagnostics, model::Result};
 use reqwest::{header, Client, Url};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::env;
@@ -8,14 +9,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::AppHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::{ipc::Channel, AppHandle};
+use tokio::io::AsyncWriteExt;
 
 const RELEASES_API_URL: &str =
     "https://api.github.com/repos/guozhiqiang123/AndroidBugDesk/releases?per_page=20";
 const RELEASES_PAGE_URL: &str = "https://github.com/guozhiqiang123/AndroidBugDesk/releases";
 const RELEASE_DOWNLOAD_PREFIX: &str = "/guozhiqiang123/AndroidBugDesk/releases/download/";
 const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Deserialize)]
@@ -64,6 +69,16 @@ pub struct UpdateInstallResult {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProgress {
+    phase: String,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    percent: Option<u8>,
+    bytes_per_second: u64,
+}
+
 #[derive(Debug)]
 struct DownloadedUpdateAsset {
     file_path: PathBuf,
@@ -90,42 +105,121 @@ impl Drop for UpdateGuard {
 pub async fn check_for_updates() -> UpdateCheckResult {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let checked_at_epoch_ms = now_ms();
+    let operation = diagnostics::OperationGuard::begin(
+        "update",
+        "check",
+        30,
+        json!({
+            "platform": env::consts::OS,
+            "architecture": env::consts::ARCH,
+            "proxySource": proxy_source(),
+        }),
+    );
     match fetch_releases(RELEASES_API_URL).await {
-        Ok(releases) => build_update_result(current_version, checked_at_epoch_ms, releases),
-        Err(error) => update_error(current_version, checked_at_epoch_ms, error),
+        Ok(releases) => {
+            let result = build_update_result(current_version, checked_at_epoch_ms, releases);
+            operation.finish(
+                "success",
+                json!({"hasUpdate":result.has_update,"autoUpdate":result.can_auto_update}),
+            );
+            result
+        }
+        Err(error) => {
+            operation.finish("failed", json!({"errorKind":update_error_kind(&error)}));
+            update_error(current_version, checked_at_epoch_ms, error)
+        }
     }
 }
 
 #[tauri::command]
-pub async fn install_update(app: AppHandle) -> UpdateInstallResult {
+pub async fn install_update(
+    app: AppHandle,
+    on_progress: Channel<UpdateProgress>,
+) -> UpdateInstallResult {
     let guard = match UpdateGuard::acquire() {
         Ok(guard) => guard,
         Err(error) => return install_error(error),
     };
+    let operation = diagnostics::OperationGuard::begin(
+        "update",
+        "install",
+        UPDATE_DOWNLOAD_TIMEOUT.as_secs(),
+        json!({
+            "platform": env::consts::OS,
+            "architecture": env::consts::ARCH,
+            "proxySource": proxy_source(),
+        }),
+    );
+    emit_update_progress(
+        &on_progress,
+        &operation,
+        UpdateProgress::new("connecting", 0, 0, 0),
+    );
     let releases = match fetch_releases(RELEASES_API_URL).await {
         Ok(releases) => releases,
-        Err(error) => return install_error(error),
+        Err(error) => {
+            operation.finish(
+                "failed",
+                json!({"stage":"release_check","errorKind":update_error_kind(&error)}),
+            );
+            return install_error(error);
+        }
     };
     let latest = match latest_stable_release(&releases) {
         Some(release) => release,
-        None => return install_error("GitHub Release 列表中没有可识别的正式版本".into()),
+        None => {
+            operation.finish(
+                "failed",
+                json!({"stage":"release_check","errorKind":"missing_release"}),
+            );
+            return install_error("GitHub Release 列表中没有可识别的正式版本".into());
+        }
     };
     if compare_versions(&latest.tag_name, env!("CARGO_PKG_VERSION")) != Ordering::Greater {
+        operation.finish(
+            "failed",
+            json!({"stage":"release_check","errorKind":"already_current"}),
+        );
         return install_error("当前版本已经是最新正式版本。".into());
     }
     let asset = match selected_auto_update_asset(latest) {
         Some(asset) => asset,
-        None => return install_error("新版本没有适配当前系统与架构的可安装文件。".into()),
+        None => {
+            operation.finish(
+                "failed",
+                json!({"stage":"release_check","errorKind":"missing_platform_asset"}),
+            );
+            return install_error("新版本没有适配当前系统与架构的可安装文件。".into());
+        }
     };
-    let downloaded = match download_and_verify_asset(asset).await {
+    let downloaded = match download_and_verify_asset(asset, &on_progress, &operation).await {
         Ok(downloaded) => downloaded,
-        Err(error) => return install_error(error),
+        Err(error) => {
+            operation.finish(
+                "failed",
+                json!({"stage":"download","errorKind":update_error_kind(&error)}),
+            );
+            return install_error(error);
+        }
     };
+    emit_update_progress(
+        &on_progress,
+        &operation,
+        UpdateProgress::new("preparing", asset.size, asset.size, 0),
+    );
     if let Err(error) = launch_update_installer(&downloaded.file_path) {
+        operation.finish(
+            "failed",
+            json!({"stage":"installer","errorKind":"installer_launch"}),
+        );
         return install_error(error);
     }
 
     let file_path = downloaded.file_path.to_string_lossy().to_string();
+    operation.finish(
+        "installer_started",
+        json!({"downloadedBytes":asset.size,"assetBytes":asset.size}),
+    );
     std::mem::forget(guard);
     let app_for_exit = app.clone();
     std::thread::spawn(move || {
@@ -157,7 +251,7 @@ async fn fetch_releases(url: &str) -> Result<Vec<GitHubRelease>> {
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
-        .map_err(|error| format!("无法连接 GitHub：{error}"))?;
+        .map_err(|error| reqwest_error_message("连接 GitHub", &error))?;
     let status = response.status();
     if !status.is_success() {
         return Err(if status.as_u16() == 403 || status.as_u16() == 429 {
@@ -178,7 +272,106 @@ fn github_client(timeout: Duration) -> Result<Client> {
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
-        .map_err(|error| format!("无法初始化更新请求：{error}"))
+        .map_err(|_| "无法初始化更新请求。".to_string())
+}
+
+impl UpdateProgress {
+    fn new(phase: &str, downloaded_bytes: u64, total_bytes: u64, elapsed_ms: u64) -> Self {
+        let percent = (total_bytes > 0)
+            .then(|| ((downloaded_bytes as u128 * 100 / total_bytes as u128).min(100)) as u8);
+        let bytes_per_second = if elapsed_ms == 0 {
+            0
+        } else {
+            (downloaded_bytes as u128 * 1_000 / elapsed_ms as u128).min(u64::MAX as u128) as u64
+        };
+        Self {
+            phase: phase.into(),
+            downloaded_bytes,
+            total_bytes,
+            percent,
+            bytes_per_second,
+        }
+    }
+}
+
+fn emit_update_progress(
+    channel: &Channel<UpdateProgress>,
+    operation: &diagnostics::OperationGuard,
+    progress: UpdateProgress,
+) {
+    operation.progress(json!({
+        "phase": progress.phase,
+        "downloadedBytes": progress.downloaded_bytes,
+        "totalBytes": progress.total_bytes,
+        "percent": progress.percent,
+        "bytesPerSecond": progress.bytes_per_second,
+    }));
+    let _ = channel.send(progress);
+}
+
+fn proxy_source() -> &'static str {
+    const PROXY_ENVIRONMENT_KEYS: [&str; 6] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    if PROXY_ENVIRONMENT_KEYS
+        .iter()
+        .any(|key| env::var_os(key).is_some_and(|value| !value.to_string_lossy().trim().is_empty()))
+    {
+        "environment"
+    } else {
+        "system-or-direct"
+    }
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+fn reqwest_error_message(action: &str, error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!("{action}超时，请检查系统代理或网络连接。")
+    } else if error.is_connect() {
+        format!("{action}失败，请检查系统代理、系统证书或网络连接。")
+    } else {
+        format!("{action}失败，请检查网络连接后重试。")
+    }
+}
+
+fn update_error_kind(error: &str) -> &'static str {
+    if error.contains("没有进展") {
+        "idle_timeout"
+    } else if error.contains("超时") {
+        "timeout"
+    } else if error.contains("HTTP") || error.contains("限制") {
+        "http"
+    } else if error.contains("SHA256") || error.contains("大小") {
+        "integrity"
+    } else if error.contains("文件") || error.contains("目录") || error.contains("写入") {
+        "filesystem"
+    } else if error.contains("Release") || error.contains("版本") || error.contains("安装包") {
+        "release"
+    } else if error.contains("网络") || error.contains("连接") || error.contains("证书") {
+        "network"
+    } else {
+        "other"
+    }
 }
 
 fn latest_stable_release(releases: &[GitHubRelease]) -> Option<&GitHubRelease> {
@@ -313,12 +506,22 @@ fn allowed_download_url(url: &str) -> bool {
         && parsed.path().starts_with(RELEASE_DOWNLOAD_PREFIX)
 }
 
-async fn download_and_verify_asset(asset: &GitHubAsset) -> Result<DownloadedUpdateAsset> {
+async fn download_and_verify_asset(
+    asset: &GitHubAsset,
+    on_progress: &Channel<UpdateProgress>,
+    operation: &diagnostics::OperationGuard,
+) -> Result<DownloadedUpdateAsset> {
     if !valid_asset_for_install(asset) {
         return Err("Release 安装包缺少有效的大小、SHA256 或官方下载地址。".into());
     }
-    let client = github_client(Duration::from_secs(900))?;
-    let response = client
+    let update_dir = env::temp_dir().join("android-bug-desk-updates");
+    cleanup_update_dir(&update_dir);
+    fs::create_dir_all(&update_dir).map_err(|_| "创建更新目录失败".to_string())?;
+    let destination = update_dir.join(&asset.name);
+    let partial = destination.with_extension("download");
+
+    let client = github_client(UPDATE_DOWNLOAD_TIMEOUT)?;
+    let response = match client
         .get(&asset.browser_download_url)
         .header(header::ACCEPT, "application/octet-stream")
         .header(
@@ -327,8 +530,23 @@ async fn download_and_verify_asset(asset: &GitHubAsset) -> Result<DownloadedUpda
         )
         .send()
         .await
-        .map_err(|error| format!("下载安装包失败：{error}"))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            diagnostics::debug_event(
+                "update",
+                "request_failed",
+                json!({"stage":"connect","errorKind":reqwest_error_kind(&error)}),
+            );
+            return Err(reqwest_error_message("连接更新服务器", &error));
+        }
+    };
     if !response.status().is_success() {
+        diagnostics::debug_event(
+            "update",
+            "http_failed",
+            json!({"stage":"download","status":response.status().as_u16()}),
+        );
         return Err(format!("下载安装包失败（HTTP {}）。", response.status()));
     }
     if let Some(length) = response.content_length() {
@@ -336,34 +554,156 @@ async fn download_and_verify_asset(asset: &GitHubAsset) -> Result<DownloadedUpda
             return Err("安装包下载大小与 GitHub Release 信息不一致。".into());
         }
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("读取安装包失败：{error}"))?;
-    verify_downloaded_bytes(asset, &bytes)?;
-
-    let update_dir = env::temp_dir().join("android-bug-desk-updates");
-    cleanup_update_dir(&update_dir);
-    fs::create_dir_all(&update_dir).map_err(|error| format!("创建更新目录失败：{error}"))?;
-    let destination = update_dir.join(&asset.name);
-    let partial = destination.with_extension("download");
-    fs::write(&partial, &bytes).map_err(|error| format!("写入安装包失败：{error}"))?;
-    fs::rename(&partial, &destination).map_err(|error| format!("保存安装包失败：{error}"))?;
+    emit_update_progress(
+        on_progress,
+        operation,
+        UpdateProgress::new("downloading", 0, asset.size, 0),
+    );
+    stream_response_to_file(response, asset, &partial, UPDATE_IDLE_TIMEOUT, |progress| {
+        emit_update_progress(on_progress, operation, progress)
+    })
+    .await?;
+    if fs::rename(&partial, &destination).is_err() {
+        let _ = fs::remove_file(&partial);
+        return Err("保存安装包失败。".into());
+    }
     Ok(DownloadedUpdateAsset {
         file_path: destination,
     })
 }
 
-fn verify_downloaded_bytes(asset: &GitHubAsset, bytes: &[u8]) -> Result<()> {
-    if bytes.len() as u64 != asset.size || bytes.len() as u64 > MAX_UPDATE_BYTES {
+async fn stream_response_to_file<F>(
+    mut response: reqwest::Response,
+    asset: &GitHubAsset,
+    partial: &Path,
+    idle_timeout: Duration,
+    mut report: F,
+) -> Result<()>
+where
+    F: FnMut(UpdateProgress),
+{
+    let mut partial_guard = PartialDownloadGuard::new(partial);
+    let mut file = tokio::fs::File::create(partial)
+        .await
+        .map_err(|_| "创建临时安装包失败。".to_string())?;
+    let started = Instant::now();
+    let mut last_progress = Instant::now();
+    let mut downloaded = 0_u64;
+    let mut hasher = Sha256::new();
+
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                diagnostics::debug_event(
+                    "update",
+                    "request_failed",
+                    json!({"stage":"body","errorKind":reqwest_error_kind(&error)}),
+                );
+                return Err(reqwest_error_message("读取安装包", &error));
+            }
+            Err(_) => {
+                return Err(format!(
+                    "安装包下载连续 {}没有进展，请检查系统代理或网络连接。",
+                    display_duration(idle_timeout)
+                ));
+            }
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        downloaded = downloaded
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| "安装包大小溢出，已取消更新。".to_string())?;
+        if downloaded > asset.size || downloaded > MAX_UPDATE_BYTES {
+            return Err("安装包实际大小超过 GitHub Release 声明，已取消更新。".into());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| "写入临时安装包失败。".to_string())?;
+        hasher.update(&chunk);
+        if last_progress.elapsed() >= PROGRESS_INTERVAL || downloaded == asset.size {
+            report(UpdateProgress::new(
+                "downloading",
+                downloaded,
+                asset.size,
+                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            ));
+            last_progress = Instant::now();
+        }
+    }
+
+    file.flush()
+        .await
+        .map_err(|_| "写入临时安装包失败。".to_string())?;
+    file.sync_all()
+        .await
+        .map_err(|_| "保存临时安装包失败。".to_string())?;
+    drop(file);
+    report(UpdateProgress::new(
+        "verifying",
+        downloaded,
+        asset.size,
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+    ));
+    verify_download_summary(asset, downloaded, &hex::encode(hasher.finalize()))?;
+    partial_guard.keep();
+    Ok(())
+}
+
+fn display_duration(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{} 秒", duration.as_secs())
+    } else {
+        format!("{} 毫秒", duration.as_millis())
+    }
+}
+
+fn verify_download_summary(asset: &GitHubAsset, downloaded: u64, actual_hash: &str) -> Result<()> {
+    if downloaded != asset.size || downloaded > MAX_UPDATE_BYTES {
         return Err("安装包实际大小与 GitHub Release 信息不一致。".into());
     }
     let expected_hash = expected_sha256(asset).ok_or("Release 安装包缺少 SHA256。")?;
-    let actual_hash = hex::encode(Sha256::digest(bytes));
     if actual_hash != expected_hash {
         return Err("安装包 SHA256 校验失败，已取消更新。".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn verify_downloaded_bytes(asset: &GitHubAsset, bytes: &[u8]) -> Result<()> {
+    verify_download_summary(
+        asset,
+        bytes.len() as u64,
+        &hex::encode(Sha256::digest(bytes)),
+    )
+}
+
+struct PartialDownloadGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl PartialDownloadGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            keep: false,
+        }
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PartialDownloadGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn cleanup_update_dir(directory: &Path) {
@@ -748,6 +1088,107 @@ mod tests {
             verify_downloaded_bytes(&release_asset, body).unwrap_err(),
             "安装包实际大小与 GitHub Release 信息不一致。"
         );
+    }
+
+    #[test]
+    fn update_progress_reports_bounded_percent_and_average_speed() {
+        let progress = UpdateProgress::new("downloading", 5_000, 10_000, 2_000);
+        assert_eq!(progress.percent, Some(50));
+        assert_eq!(progress.bytes_per_second, 2_500);
+
+        let overrun = UpdateProgress::new("downloading", 11_000, 10_000, 1_000);
+        assert_eq!(overrun.percent, Some(100));
+        assert_eq!(UpdateProgress::new("connecting", 0, 0, 0).percent, None);
+    }
+
+    #[tokio::test]
+    async fn streamed_download_writes_verifies_and_reports_progress() {
+        let body = b"streamed verified release package";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/asset"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}/asset", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let mut release_asset = asset("Android-Bug-Desk-0.2.0-macos-arm64.dmg");
+        release_asset.size = body.len() as u64;
+        release_asset.digest = Some(format!("sha256:{}", hex::encode(Sha256::digest(body))));
+        let temp = tempfile::tempdir().unwrap();
+        let partial = temp.path().join("update.download");
+        let mut progress = Vec::new();
+
+        stream_response_to_file(
+            response,
+            &release_asset,
+            &partial,
+            Duration::from_secs(1),
+            |item| progress.push(item),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(&partial).unwrap(), body);
+        assert!(progress.iter().any(|item| item.phase == "downloading"));
+        assert_eq!(progress.last().unwrap().phase, "verifying");
+        assert_eq!(progress.last().unwrap().percent, Some(100));
+        assert!(progress
+            .windows(2)
+            .all(|items| items[0].downloaded_bytes <= items[1].downloaded_bytes));
+    }
+
+    #[tokio::test]
+    async fn stalled_download_times_out_and_removes_the_partial_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1_024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/asset"))
+            .send()
+            .await
+            .unwrap();
+        let mut release_asset = asset("Android-Bug-Desk-0.2.0-macos-arm64.dmg");
+        release_asset.size = 8;
+        release_asset.digest = Some(format!("sha256:{}", "0".repeat(64)));
+        let temp = tempfile::tempdir().unwrap();
+        let partial = temp.path().join("update.download");
+
+        let error = stream_response_to_file(
+            response,
+            &release_asset,
+            &partial,
+            Duration::from_millis(40),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("连续 40 毫秒没有进展"), "{error}");
+        assert!(!partial.exists());
+        server.abort();
     }
 
     #[test]

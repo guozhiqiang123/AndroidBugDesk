@@ -637,3 +637,11 @@ DMG：`artifacts/local-dialog-refresh-macos-arm64-20261010/Android Bug Desk_0.1.
 - 188 项前端测试、180 项 Rust 测试（3 项外部环境测试按设计忽略）、类型检查、生产构建、Rust 格式、严格 Clippy、53 个实际 React/mock IPC 场景和差异检查通过。
 - 用户完成原生验收后，固定本机流程一次生成并校验 macOS ARM64 应用和 DMG；覆盖安装后签名、架构、文件哈希、主窗口、“开发者选项”和“开启调试”均通过，且没有新增 DiagnosticReports。产物位于 `artifacts/local-software-diagnostics-macos-arm64-20261014/`，DMG SHA-256 为 `960669b465d7b7f81a9af0149c0543f5bbd19a7a2861de401d5a2ca7bb068568`。
 - 正式版本统一升级为 `0.3.0`；`v0.3.0` 标签用于触发 GitHub Actions 的 macOS、Windows 和 Linux 安装包及 Release 流程。
+
+## 自动更新系统代理与流式下载验收（2026-10-14）
+
+- `reqwest` 已启用 `system-proxy` 与 `rustls-tls-native-roots`；Windows 常见手动系统代理、macOS SystemConfiguration 和环境变量代理由同一更新客户端处理，TLS 继续强制校验。
+- 安装包按块写入临时文件并增量计算 SHA-256。声明大小不符、超过 512 MiB、哈希不符或连续 45 秒无数据均失败并清理 `.download` 文件；总请求硬上限为 15 分钟。
+- 更新弹窗显示连接、下载、校验和准备安装阶段；下载阶段显示真实百分比、字节数和平均速度。失败后仍可关闭弹窗或打开 GitHub Release 页面。
+- 诊断只记录平台、架构、代理来源类别、阶段、字节数和错误类别；不记录代理地址、代理凭据、下载 URL 或响应正文。
+- 本机自动化通过 188 项前端测试、183 项 Rust 测试（3 项外部环境测试按设计忽略）、类型检查、生产构建、Rust 格式、严格 Clippy、20 项发布包测试、10 项流程测试和 53 个完整 React/mock IPC 场景，另有 2 个启动更新专项场景。Windows 手动系统代理与 PAC/WPAD 仍需正式 Windows 安装包验证，本轮未打包或安装。

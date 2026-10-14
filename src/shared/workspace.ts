@@ -70,6 +70,13 @@ export interface UpdateInstallResult {
   filePath: string | null;
   error: string | null;
 }
+export interface UpdateProgress {
+  phase: "connecting" | "downloading" | "verifying" | "preparing";
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number | null;
+  bytesPerSecond: number;
+}
 export interface WorkspaceCommands {
   check_auth: AuthResult;
   login: AuthResult;

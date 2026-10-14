@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import {
   draftSchema,
   type Draft,
@@ -22,6 +22,7 @@ import type {
   DraftProjectScope,
   UpdateCheckResult,
   UpdateInstallResult,
+  UpdateProgress,
   DeveloperOptions,
 } from "../shared/workspace";
 import appPackage from "../../package.json";
@@ -104,6 +105,7 @@ type UpdateDialogState = {
   mode: "confirm" | "installing" | "error";
   result: UpdateCheckResult;
   message: string;
+  progress: UpdateProgress | null;
 } | null;
 const stateLabels: Record<string, string> = {
   ready: "证据已固定",
@@ -135,6 +137,35 @@ function displayBytes(size?: number | null) {
     unit += 1;
   }
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+function updateProgressMessage(progress: UpdateProgress) {
+  if (progress.phase === "connecting")
+    return "正在连接更新服务器，并读取系统代理设置。";
+  if (progress.phase === "verifying")
+    return "安装包下载完成，正在校验大小和 SHA-256。";
+  if (progress.phase === "preparing")
+    return "安装包校验通过，正在准备覆盖安装。";
+  const transferred = `${displayBytes(progress.downloadedBytes)} / ${displayBytes(progress.totalBytes)}`;
+  const speed = progress.bytesPerSecond
+    ? ` · ${displayBytes(progress.bytesPerSecond)}/s`
+    : "";
+  return `正在下载安装包：${transferred}${speed}`;
+}
+function updateProgressDetail(progress: UpdateProgress) {
+  if (progress.phase === "connecting") return "准备连接";
+  const transferred = progress.totalBytes
+    ? `${progress.downloadedBytes ? displayBytes(progress.downloadedBytes) : "0 B"} / ${displayBytes(progress.totalBytes)}`
+    : progress.downloadedBytes
+      ? displayBytes(progress.downloadedBytes)
+      : "";
+  const values = [
+    progress.percent !== null ? `${progress.percent}%` : "",
+    transferred,
+    progress.phase === "downloading" && progress.bytesPerSecond
+      ? `${displayBytes(progress.bytesPerSecond)}/s`
+      : "",
+  ];
+  return values.filter(Boolean).join(" · ");
 }
 function sourceStatusLabel(source?: Source) {
   if (!source) return "未采集";
@@ -313,6 +344,7 @@ function App() {
           mode: "confirm",
           result,
           message: result.message,
+          progress: null,
         });
       }
     } catch (cause) {
@@ -328,22 +360,39 @@ function App() {
     setUpdateDialog({
       mode: "installing",
       result,
-      message: "正在下载安装包并校验完整性，请保持网络连接。",
+      message: "正在连接更新服务器，并读取系统代理设置。",
+      progress: null,
     });
+    const onProgress = new Channel<UpdateProgress>();
+    onProgress.onmessage = (progress) => {
+      setUpdateDialog((current) =>
+        current?.mode === "installing"
+          ? {
+              ...current,
+              progress,
+              message: updateProgressMessage(progress),
+            }
+          : current,
+      );
+    };
     try {
-      const installed = await invoke<UpdateInstallResult>("install_update");
+      const installed = await invoke<UpdateInstallResult>("install_update", {
+        onProgress,
+      });
       if (!installed.ok) throw installed.error || installed.message;
-      setUpdateDialog({
+      setUpdateDialog((current) => ({
         mode: "installing",
         result,
         message: installed.message,
-      });
+        progress: current?.progress ?? null,
+      }));
     } catch (cause) {
-      setUpdateDialog({
+      setUpdateDialog((current) => ({
         mode: "error",
         result,
         message: typeof cause === "string" ? cause : String(cause),
-      });
+        progress: current?.progress ?? null,
+      }));
     }
   };
   const openReleasePage = async () => {
@@ -3154,6 +3203,25 @@ function App() {
                   </div>
                 )}
               </dl>
+              {updateDialog.mode === "installing" && updateDialog.progress && (
+                <div className="update-download-status">
+                  <div
+                    className="update-progress-track"
+                    role="progressbar"
+                    aria-label="更新下载进度"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={updateDialog.progress.percent ?? undefined}
+                  >
+                    <span
+                      style={{
+                        width: `${updateDialog.progress.percent ?? 0}%`,
+                      }}
+                    />
+                  </div>
+                  <small>{updateProgressDetail(updateDialog.progress)}</small>
+                </div>
+              )}
             </div>
           </div>
           {updateDialog.mode === "confirm" && (
