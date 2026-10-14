@@ -33,9 +33,35 @@ elif a[0]=='bugreport':
  if mode=='bad-report':print('failed',file=sys.stderr);sys.exit(1)
  with zipfile.ZipFile(Path(a[1])/'bugreport-fake.zip','w') as z:z.writestr('bugreport.txt','Bugreport for fake Android')
 elif a[0]=='logcat':
- assert '--uid=10123' in a,a
+ if mode in ['uid-unsupported','legacy-logcat'] and '--uid=10123' in a:
+  print('Unrecognized Option',file=sys.stderr)
+  print('Usage: logcat [options] [filterspecs]',file=sys.stderr)
+  sys.exit(1)
+ if mode=='legacy-logcat' and '--pid=321' in a:
+  print('Unrecognized Option',file=sys.stderr)
+  print('Usage: logcat [options] [filterspecs]',file=sys.stderr)
+  sys.exit(1)
+ if mode=='legacy-logcat':
+  assert '--uid=10123' not in a and '--pid=321' not in a,a
+  assert 'threadtime' in a,a
+  print('10-13 15:00:00.000   999   999 I OTHER: private other-app line')
+  print('10-13 15:00:01.000   321   322 E APP: target failure')
+  print('    at com.example.test.Main.run(Main.java:10)')
+  print('10-13 15:00:02.000   999   999 I OTHER: another private line')
+  sys.exit(0)
+ assert '--uid=10123' in a or '--pid=321' in a,a
  if mode=='empty':print('--------- beginning of main')
  else:print('1789102800.000 123 456 E APP: Permission denied is app log content\n1789102900.010 123 456 E APP: java.lang.RuntimeException: test crash')
+elif a[:2]==['shell','pidof']:
+ assert a[2:]==['com.example.test'],a
+ if mode=='legacy-logcat':
+  print('pidof: not found',file=sys.stderr)
+  sys.exit(127)
+ print('321')
+elif a[:2]==['shell','ps']:
+ print('USER PID PPID VSIZE RSS WCHAN PC NAME')
+ print('u0_a123 321 1 1000 100 0 0 com.example.test')
+ print('u0_a124 999 1 1000 100 0 0 com.other.private')
 elif a[:2]==['shell','uiautomator']:print('UI hierarchy dumped to: '+a[-1])
 elif a[:2]==['exec-out','cat']:print('<?xml version="1.0"?><hierarchy><node text="test"/></hierarchy>')
 elif a[:2]==['shell','rm']:assert a[2]=='-f' and a[3].startswith('/sdcard/AndroidBugDesk-')
@@ -576,6 +602,110 @@ async fn absent_history_does_not_claim_coverage_and_missing_mapping_blocks_all_c
         .unwrap_err()
         .contains("未配置 Android 包名"));
     assert_eq!(trace(temp.path()).len(), before);
+}
+
+#[tokio::test]
+async fn unsupported_uid_logcat_safely_falls_back_to_current_package_pids() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, original) = app(temp.path(), fake_adb(temp.path()));
+    let state = app.state::<AppState>();
+    let id = string(&original, "id");
+    std::fs::write(temp.path().join("mode"), "uid-unsupported").unwrap();
+
+    let job = prepare(&state, &id, "USB-A", selected(&["logs", "crash"]), None)
+        .await
+        .unwrap();
+    execute(&state, &string(&job, "id")).await.unwrap();
+
+    let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
+    assert_eq!(snapshot["jobs"][0]["status"], "partial");
+    for item in ["logs", "crash"] {
+        assert_eq!(snapshot["jobs"][0]["items"][item]["status"], "partial");
+    }
+    let files = attachments(&state.store.draft(&id).unwrap()).unwrap();
+    for item in ["logs", "crash"] {
+        let result = receipt(
+            files
+                .iter()
+                .find(|attachment| attachment.name == format!("post-capture-{item}.zip"))
+                .unwrap(),
+        );
+        assert_eq!(result["logFilter"]["fallbackMode"], "currentProcessPid");
+        assert_eq!(result["logFilter"]["historicalCoverageLimited"], true);
+        assert_eq!(result["logFilter"]["processIds"], json!([321]));
+        assert!(result["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|argument| argument == "--pid=321")));
+        assert!(result["commands"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("已切换"));
+    }
+    let calls = trace(temp.path());
+    assert!(calls
+        .iter()
+        .any(|args| args.iter().any(|arg| arg == "--uid=10123")));
+    assert!(calls
+        .iter()
+        .any(|args| args == &["-s", "USB-A", "shell", "pidof", "com.example.test"]));
+    assert!(calls
+        .iter()
+        .any(|args| args.iter().any(|arg| arg == "--pid=321")));
+}
+
+#[tokio::test]
+async fn legacy_logcat_is_filtered_in_memory_and_never_saves_other_apps() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, original) = app(temp.path(), fake_adb(temp.path()));
+    let state = app.state::<AppState>();
+    let id = string(&original, "id");
+    std::fs::write(temp.path().join("mode"), "legacy-logcat").unwrap();
+
+    let job = prepare(&state, &id, "USB-A", selected(&["logs"]), None)
+        .await
+        .unwrap();
+    execute(&state, &string(&job, "id")).await.unwrap();
+
+    let files = attachments(&state.store.draft(&id).unwrap()).unwrap();
+    let logs = files
+        .iter()
+        .find(|attachment| attachment.name == "post-capture-logs.zip")
+        .unwrap();
+    let result = receipt(logs);
+    assert_eq!(result["status"], "partial");
+    assert_eq!(
+        result["logFilter"]["fallbackMode"],
+        "localCurrentProcessPid"
+    );
+    let local = result["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| command["compatibilityFallback"] == "localCurrentProcessPid")
+        .unwrap();
+    assert_eq!(local["status"], "complete");
+    assert_eq!(local["rawDeviceLogPersisted"], false);
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&logs.path).unwrap()).unwrap();
+    let name = (0..zip.len())
+        .map(|index| zip.by_index(index).unwrap().name().to_string())
+        .find(|name| name.ends_with("-logs.txt"))
+        .unwrap();
+    let mut filtered = String::new();
+    zip.by_name(&name)
+        .unwrap()
+        .read_to_string(&mut filtered)
+        .unwrap();
+    assert!(filtered.contains("target failure"));
+    assert!(filtered.contains("com.example.test.Main.run"));
+    assert!(!filtered.contains("private other-app line"));
+    assert!(!filtered.contains("another private line"));
 }
 #[tokio::test]
 async fn authorization_injection_scope_and_duplicate_jobs_reject_before_collection() {

@@ -322,16 +322,11 @@ fn commands(item: &str, package: &str, target_uid: Option<u32>) -> Vec<Vec<Strin
         ],
         "logs" if target_uid.is_some() => {
             let filter = format!("--uid={}", target_uid.unwrap());
-            vec![cmd(&[
-                "logcat", "-d", "-v", "epoch", &filter, "-b", "main", "-b", "system", "-b",
-                "events",
-            ])]
+            vec![logcat_command(item, &filter)]
         }
         "crash" if target_uid.is_some() => {
             let filter = format!("--uid={}", target_uid.unwrap());
-            vec![cmd(&[
-                "logcat", "-d", "-v", "epoch", &filter, "-b", "crash",
-            ])]
+            vec![logcat_command(item, &filter)]
         }
         "app" if !package.is_empty() => vec![
             app(&["shell", "dumpsys", "package"]),
@@ -393,6 +388,124 @@ fn commands(item: &str, package: &str, target_uid: Option<u32>) -> Vec<Vec<Strin
         _ => vec![],
     }
 }
+
+fn logcat_command(item: &str, filter: &str) -> Vec<String> {
+    let mut args = vec![
+        "logcat".into(),
+        "-d".into(),
+        "-v".into(),
+        "epoch".into(),
+        filter.into(),
+        "-b".into(),
+    ];
+    if item == "crash" {
+        args.push("crash".into());
+    } else {
+        args.extend(
+            ["main", "-b", "system", "-b", "events"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    args
+}
+
+fn unfiltered_logcat_command(item: &str) -> Vec<String> {
+    let mut args = vec![
+        "logcat".into(),
+        "-d".into(),
+        "-v".into(),
+        "threadtime".into(),
+        "-b".into(),
+    ];
+    if item == "crash" {
+        args.push("crash".into());
+    } else {
+        args.extend(
+            ["main", "-b", "system", "-b", "events"]
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    args
+}
+
+fn unsupported_log_filter(args: &[String], error: &str) -> bool {
+    let has_filter = args
+        .iter()
+        .any(|argument| argument.starts_with("--uid=") || argument.starts_with("--pid="));
+    let lower = error.to_ascii_lowercase();
+    has_filter
+        && (lower.contains("unrecognized option")
+            || lower.contains("unknown option")
+            || lower.contains("invalid option"))
+}
+
+fn package_pids(output: &[u8]) -> Vec<u32> {
+    let mut pids = output
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter_map(|part| std::str::from_utf8(part).ok()?.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids.truncate(64);
+    pids
+}
+
+fn package_pids_from_ps(output: &[u8], package: &str) -> Vec<u32> {
+    let text = String::from_utf8_lossy(output);
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let pid_column = header
+        .split_whitespace()
+        .position(|column| column.eq_ignore_ascii_case("PID"))
+        .unwrap_or(1);
+    let mut pids = lines
+        .filter_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            let process = columns.last().copied()?;
+            (process == package || process.starts_with(&format!("{package}:")))
+                .then(|| columns.get(pid_column)?.parse::<u32>().ok())
+                .flatten()
+        })
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids.truncate(64);
+    pids
+}
+
+fn log_line_pid(line: &str) -> Option<u32> {
+    let columns = line.split_whitespace().collect::<Vec<_>>();
+    if columns.first()?.parse::<f64>().is_ok() {
+        return columns.get(1)?.parse().ok();
+    }
+    let date = columns.first()?;
+    if date.len() == 5 && date.as_bytes().get(2) == Some(&b'-') {
+        return columns.get(2)?.parse().ok();
+    }
+    None
+}
+
+fn filter_logs_for_pids(output: &[u8], pids: &[u32]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(output);
+    let mut filtered = String::new();
+    let mut keep = false;
+    for line in text.lines() {
+        if let Some(pid) = log_line_pid(line) {
+            keep = pids.contains(&pid);
+        }
+        if keep {
+            filtered.push_str(line);
+            filtered.push('\n');
+        }
+    }
+    filtered.into_bytes()
+}
 fn unavailable(item: &str, output: &str) -> bool {
     let text = output.trim();
     if text.is_empty() {
@@ -452,7 +565,13 @@ async fn collect(
     let package = string(job, "targetPackage");
     let mut receipt = json!({"status":"running","startedAt":now(),"serial":serial,"targetPackage":package,"bugOccurredAt":job["bugOccurredAt"],"timeSemantics":job["timeSemantics"],"commands":[],"attachments":[]});
     if item == "bugreport" {
-        let mut captured = adb::bugreport(path, &serial, &state.store.root, 120).await?;
+        let mut captured = adb::bugreport(
+            path,
+            &serial,
+            &state.store.root,
+            adb::BUGREPORT_TIMEOUT_SECONDS,
+        )
+        .await?;
         if let Some(attachment) = captured.attachment.as_mut() {
             attachment.source = format!(
                 "事后补采系统报告；采集项：{}；目标应用 {package}；采集于 {}；不保证问题时刻的完整覆盖",
@@ -582,6 +701,169 @@ async fn collect(
                     ));
                 }
             }
+            Err(error) if unsupported_log_filter(args, &error) => {
+                missed = true;
+                observation["status"] = json!("unavailable");
+                observation["error"] =
+                    json!("设备 logcat 不支持 UID 过滤，已切换为当前目标应用进程过滤");
+                observations.push(observation);
+
+                let pid_args = vec!["shell".to_string(), "pidof".to_string(), package.clone()];
+                let started = now();
+                let pid_output = adb::output(
+                    path,
+                    Some(&serial),
+                    &["shell", "pidof", package.as_str()],
+                    5,
+                )
+                .await;
+                let mut pid_argv = vec!["-s".to_string(), serial.clone()];
+                pid_argv.extend(pid_args);
+                let mut pid_observation = json!({"argv":pid_argv,"startedAt":started,"finishedAt":now(),"purpose":"resolveCurrentTargetProcesses"});
+                let mut pids = match pid_output {
+                    Ok(bytes) => {
+                        let pids = package_pids(&bytes);
+                        if pids.is_empty() {
+                            pid_observation["status"] = json!("unavailable");
+                            pid_observation["error"] =
+                                json!("目标应用当前没有运行，无法在此设备上安全降级采集日志");
+                        } else {
+                            pid_observation["status"] = json!("complete");
+                            pid_observation["processIds"] = json!(pids);
+                        }
+                        pids
+                    }
+                    Err(error) => {
+                        pid_observation["status"] = json!("failed");
+                        pid_observation["error"] = json!(error);
+                        Vec::new()
+                    }
+                };
+                observations.push(pid_observation);
+                if pids.is_empty() {
+                    let started = now();
+                    let ps_output = adb::output(path, Some(&serial), &["shell", "ps"], 5).await;
+                    let mut ps_observation = json!({
+                        "argv":["-s",serial,"shell","ps"],
+                        "startedAt":started,
+                        "finishedAt":now(),
+                        "purpose":"resolveCurrentTargetProcesses"
+                    });
+                    match ps_output {
+                        Ok(bytes) => {
+                            pids = package_pids_from_ps(&bytes, &package);
+                            if pids.is_empty() {
+                                ps_observation["status"] = json!("unavailable");
+                                ps_observation["error"] =
+                                    json!("目标应用当前没有运行，无法在此设备上安全降级采集日志");
+                            } else {
+                                ps_observation["status"] = json!("complete");
+                                ps_observation["processIds"] = json!(pids);
+                            }
+                        }
+                        Err(error) => {
+                            ps_observation["status"] = json!("failed");
+                            ps_observation["error"] = json!(error);
+                        }
+                    }
+                    observations.push(ps_observation);
+                }
+                receipt["logFilter"]["fallbackMode"] = json!("currentProcessPid");
+                receipt["logFilter"]["historicalCoverageLimited"] = json!(true);
+                receipt["logFilter"]["processIds"] = json!(pids);
+
+                let mut requires_local_filter = false;
+                for pid in &pids {
+                    if let Err(error) = binding(state, job) {
+                        interrupted = Some(error);
+                        break;
+                    }
+                    let fallback_args = logcat_command(item, &format!("--pid={pid}"));
+                    let started = now();
+                    let refs = fallback_args.iter().map(String::as_str).collect::<Vec<_>>();
+                    let fallback_output = adb::output(path, Some(&serial), &refs, 15).await;
+                    let mut fallback_argv = vec!["-s".to_string(), serial.clone()];
+                    fallback_argv.extend(fallback_args.iter().cloned());
+                    let mut fallback_observation = json!({
+                        "argv":fallback_argv,
+                        "startedAt":started,
+                        "finishedAt":now(),
+                        "compatibilityFallback":"currentProcessPid"
+                    });
+                    match fallback_output {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            let empty = unavailable(item, &text);
+                            fallback_observation["status"] =
+                                json!(if empty { "unavailable" } else { "complete" });
+                            fallback_observation["logBounds"] =
+                                log_bounds(&text).unwrap_or(Value::Null);
+                            if empty {
+                                fallback_observation["error"] = json!(
+                                    "当前目标应用进程没有可用日志；历史日志未纳入本次兼容采集"
+                                );
+                            }
+                            if !bytes.is_empty() {
+                                let file_index = observations.len();
+                                files.push((format!("{file_index:02}-{item}.txt"), bytes));
+                            }
+                        }
+                        Err(error) => {
+                            fallback_observation["status"] = json!("failed");
+                            if unsupported_log_filter(&fallback_args, &error) {
+                                fallback_observation["error"] = json!(
+                                    "设备 logcat 不支持 PID 过滤，已改用本机内存过滤当前进程日志"
+                                );
+                                requires_local_filter = true;
+                            } else {
+                                fallback_observation["error"] = json!(error);
+                            }
+                        }
+                    }
+                    observations.push(fallback_observation);
+                    if requires_local_filter {
+                        break;
+                    }
+                }
+                if requires_local_filter && !pids.is_empty() {
+                    let fallback_args = unfiltered_logcat_command(item);
+                    let started = now();
+                    let refs = fallback_args.iter().map(String::as_str).collect::<Vec<_>>();
+                    let fallback_output = adb::output(path, Some(&serial), &refs, 15).await;
+                    let mut fallback_argv = vec!["-s".to_string(), serial.clone()];
+                    fallback_argv.extend(fallback_args.iter().cloned());
+                    let mut fallback_observation = json!({
+                        "argv":fallback_argv,
+                        "startedAt":started,
+                        "finishedAt":now(),
+                        "compatibilityFallback":"localCurrentProcessPid",
+                        "rawDeviceLogPersisted":false
+                    });
+                    match fallback_output {
+                        Ok(bytes) => {
+                            let filtered = filter_logs_for_pids(&bytes, &pids);
+                            if filtered.is_empty() {
+                                fallback_observation["status"] = json!("unavailable");
+                                fallback_observation["error"] = json!(
+                                    "当前目标应用进程没有可用日志；其他应用日志已丢弃且未保存"
+                                );
+                            } else {
+                                fallback_observation["status"] = json!("complete");
+                                fallback_observation["logBounds"] = Value::Null;
+                                let file_index = observations.len();
+                                files.push((format!("{file_index:02}-{item}.txt"), filtered));
+                            }
+                            receipt["logFilter"]["fallbackMode"] = json!("localCurrentProcessPid");
+                        }
+                        Err(error) => {
+                            fallback_observation["status"] = json!("failed");
+                            fallback_observation["error"] = json!(error);
+                        }
+                    }
+                    observations.push(fallback_observation);
+                }
+                continue;
+            }
             Err(error) => {
                 missed = true;
                 observation["status"] = json!("failed");
@@ -598,7 +880,13 @@ async fn collect(
     }
     let successes = observations
         .iter()
-        .filter(|o| string(o, "status") == "complete")
+        .filter(|o| {
+            string(o, "status") == "complete"
+                && (!["logs", "crash"].contains(&item)
+                    || o["argv"]
+                        .as_array()
+                        .is_some_and(|argv| argv.iter().any(|value| value == "logcat")))
+        })
         .count();
     // The dump command's console message is not the UI tree.
     let useful = successes > 0

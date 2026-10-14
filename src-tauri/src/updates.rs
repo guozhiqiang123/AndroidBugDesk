@@ -479,12 +479,17 @@ fn launch_windows_installer(file_path: &Path) -> Result<()> {
     if file_path.extension().and_then(|value| value.to_str()) != Some("exe") {
         return Err("Windows 更新包格式不正确。".into());
     }
+    let app_executable =
+        env::current_exe().map_err(|error| format!("无法确定当前应用安装位置：{error}"))?;
     let script_path = env::temp_dir().join(format!(
         "install-android-bug-desk-{}.cmd",
         std::process::id()
     ));
-    fs::write(&script_path, windows_install_script(file_path))
-        .map_err(|error| format!("创建安装脚本失败：{error}"))?;
+    fs::write(
+        &script_path,
+        windows_install_script(file_path, &app_executable),
+    )
+    .map_err(|error| format!("创建安装脚本失败：{error}"))?;
     use std::os::windows::process::CommandExt;
     Command::new("cmd")
         .creation_flags(0x08000000)
@@ -499,12 +504,13 @@ fn launch_windows_installer(file_path: &Path) -> Result<()> {
         .map_err(|error| format!("启动 Windows 安装脚本失败：{error}"))
 }
 
-#[cfg(target_os = "windows")]
-fn windows_install_script(file_path: &Path) -> String {
+#[cfg(any(target_os = "windows", test))]
+fn windows_install_script(file_path: &Path, app_executable: &Path) -> String {
     format!(
         r#"@echo off
 setlocal
 set "INSTALLER={installer}"
+set "APP_EXE={app_executable}"
 :wait_app
 tasklist /FI "IMAGENAME eq android-bug-desk.exe" 2>NUL | find /I "android-bug-desk.exe" >NUL
 if not errorlevel 1 (
@@ -512,11 +518,12 @@ if not errorlevel 1 (
   goto wait_app
 )
 start "" /WAIT "%INSTALLER%" /S
-start "" "%LOCALAPPDATA%\Android Bug Desk\android-bug-desk.exe"
+if exist "%APP_EXE%" start "" "%APP_EXE%"
 del /F /Q "%INSTALLER%" >NUL 2>NUL
 del /F /Q "%~f0" >NUL 2>NUL
 "#,
         installer = file_path.to_string_lossy().replace('%', "%%"),
+        app_executable = app_executable.to_string_lossy().replace('%', "%%"),
     )
 }
 
@@ -741,6 +748,19 @@ mod tests {
             verify_downloaded_bytes(&release_asset, body).unwrap_err(),
             "安装包实际大小与 GitHub Release 信息不一致。"
         );
+    }
+
+    #[test]
+    fn windows_script_relaunches_the_actual_install_path_only_when_it_exists() {
+        let script = windows_install_script(
+            Path::new(r"C:\Temp\Android-Bug-Desk-0.2.4-windows-x64-setup.exe"),
+            Path::new(r"D:\QA Tools\Android Bug Desk\android-bug-desk.exe"),
+        );
+        assert!(
+            script.contains(r#"set "APP_EXE=D:\QA Tools\Android Bug Desk\android-bug-desk.exe""#)
+        );
+        assert!(script.contains(r#"if exist "%APP_EXE%" start "" "%APP_EXE%""#));
+        assert!(!script.contains(r"%LOCALAPPDATA%\Android Bug Desk"));
     }
 
     #[tokio::test]

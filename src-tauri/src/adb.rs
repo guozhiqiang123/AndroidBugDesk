@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::watch};
+
+pub const BUGREPORT_TIMEOUT_SECONDS: u64 = 300;
+
 pub fn valid_serial(s: &str) -> Result<()> {
     if regex::Regex::new(r"^[A-Za-z0-9._-]{1,128}$")
         .unwrap()
@@ -68,17 +71,36 @@ pub async fn output(
     args: &[&str],
     timeout: u64,
 ) -> Result<Vec<u8>> {
+    if let Some(serial) = serial {
+        valid_serial(serial)?;
+    }
+    let operation = crate::diagnostics::OperationGuard::begin(
+        "adb",
+        &operation_name(args),
+        timeout,
+        json!({"serialBound":serial.is_some(),"argumentCount":args.len()}),
+    );
     let mut c = command(path);
     if let Some(s) = serial {
-        valid_serial(s)?;
         c.args(["-s", s]);
     }
     c.args(args);
-    let o = tokio::time::timeout(std::time::Duration::from_secs(timeout), c.output())
-        .await
-        .map_err(|_| "ADB 采集超时")?
-        .map_err(|_| "无法启动 ADB，请检查 Platform Tools 路径")?;
+    let o = match tokio::time::timeout(std::time::Duration::from_secs(timeout), c.output()).await {
+        Err(_) => {
+            operation.finish("timeout", json!({}));
+            return Err("ADB 采集超时".into());
+        }
+        Ok(Err(_)) => {
+            operation.finish("spawn_failed", json!({}));
+            return Err("无法启动 ADB，请检查 Platform Tools 路径".into());
+        }
+        Ok(Ok(output)) => output,
+    };
     if !o.status.success() {
+        operation.finish(
+            "failed",
+            json!({"exitCode":o.status.code(),"stdoutBytes":o.stdout.len(),"stderrBytes":o.stderr.len()}),
+        );
         return Err(format!(
             "ADB 采集失败：{}",
             String::from_utf8_lossy(&o.stderr)
@@ -88,9 +110,34 @@ pub async fn output(
         ));
     }
     if o.stdout.len() > 32_000_000 {
+        operation.finish("output_too_large", json!({"stdoutBytes":o.stdout.len()}));
         return Err("ADB 输出过大，请使用系统报告导出".into());
     }
+    operation.finish(
+        "complete",
+        json!({"exitCode":o.status.code(),"stdoutBytes":o.stdout.len(),"stderrBytes":o.stderr.len()}),
+    );
     Ok(o.stdout)
+}
+
+fn operation_name(args: &[&str]) -> String {
+    let first = args.first().copied().unwrap_or("unknown");
+    if first == "shell" {
+        let command = args.get(1).copied().unwrap_or("unknown");
+        let safe = [
+            "am", "cat", "cmd", "df", "dumpsys", "getprop", "ip", "logcat", "pm", "ps", "settings",
+            "wm",
+        ];
+        return if safe.contains(&command) {
+            format!("shell.{command}")
+        } else {
+            "shell.other".into()
+        };
+    }
+    match first {
+        "devices" | "version" | "logcat" | "exec-out" | "bugreport" => first.into(),
+        _ => "other".into(),
+    }
 }
 async fn text(path: &Path, serial: &str, args: &[&str]) -> Result<String> {
     Ok(
@@ -804,6 +851,7 @@ pub struct BugreportCapture {
     pub started_at: String,
     pub finished_at: String,
     pub timed_out: bool,
+    pub timeout_seconds: u64,
     pub exit_code: Option<i32>,
     pub failure: Option<String>,
     pub attachment: Option<Attachment>,
@@ -849,11 +897,18 @@ async fn capture_bugreport(
         started_at: now(),
         finished_at: String::new(),
         timed_out: false,
+        timeout_seconds: timeout.as_secs(),
         exit_code: None,
         failure: None,
         attachment: None,
         directory,
     };
+    let operation = crate::diagnostics::OperationGuard::begin(
+        "adb",
+        "bugreport",
+        timeout.as_secs(),
+        json!({"serialBound":true}),
+    );
     // argv only; no shell, root, package/PID filter, or fallback to another device.
     let child = command(path)
         .args(["-s", serial, "bugreport"])
@@ -863,24 +918,40 @@ async fn capture_bugreport(
         .spawn();
     match child {
         Err(e) => result.failure = Some(format!("ADB 系统报告启动失败：{e}")),
-        Ok(mut child) => match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                result.exit_code = status.code();
-                if !status.success() {
-                    result.failure = Some(format!("ADB 系统报告退出失败：{status}"));
+        Ok(mut child) => {
+            let started = std::time::Instant::now();
+            loop {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    result.timed_out = true;
+                    result.failure = Some(format!(
+                        "ADB 系统报告在 {} 秒内未完成；部分输出不代表采集成功",
+                        result.timeout_seconds
+                    ));
+                    let _ = child.kill().await;
+                    if let Ok(status) = child.wait().await {
+                        result.exit_code = status.code();
+                    }
+                    break;
+                }
+                match tokio::time::timeout(remaining.min(Duration::from_secs(5)), child.wait())
+                    .await
+                {
+                    Ok(Ok(status)) => {
+                        result.exit_code = status.code();
+                        if !status.success() {
+                            result.failure = Some(format!("ADB 系统报告退出失败：{status}"));
+                        }
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        result.failure = Some(format!("ADB 系统报告进程状态读取失败：{e}"));
+                        break;
+                    }
+                    Err(_) => operation.progress(bugreport_progress(&result.directory)),
                 }
             }
-            Ok(Err(e)) => result.failure = Some(format!("ADB 系统报告进程状态读取失败：{e}")),
-            Err(_) => {
-                result.timed_out = true;
-                result.failure = Some("ADB 系统报告超时；部分输出不代表采集成功".into());
-                // Reap only the exact child we started. kill_on_drop also protects cancellation.
-                let _ = child.kill().await;
-                if let Ok(status) = child.wait().await {
-                    result.exit_code = status.code();
-                }
-            }
-        },
+        }
     }
     if result.failure.is_none() {
         let report = (|| -> Result<Attachment> {
@@ -911,7 +982,49 @@ async fn capture_bugreport(
     result.finished_at = now();
     let receipt = serde_json::to_vec_pretty(&result).map_err(|e| e.to_string())?;
     std::fs::write(result.directory.join("receipt.json"), receipt).map_err(|e| e.to_string())?;
+    if result.failure.is_some() {
+        crate::software_diagnostics::prune_bugreport_diagnostics(root);
+    }
+    operation.finish(
+        if result.failure.is_none() {
+            "complete"
+        } else if result.timed_out {
+            "timeout"
+        } else {
+            "failed"
+        },
+        json!({
+            "exitCode":result.exit_code,
+            "timedOut":result.timed_out,
+            "attachmentCreated":result.attachment.is_some(),
+            "progress":bugreport_progress(&result.directory),
+        }),
+    );
     Ok(result)
+}
+
+fn bugreport_progress(directory: &Path) -> Value {
+    fn size(path: &Path) -> (u64, u64) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return (0, 0);
+        };
+        entries.flatten().fold((0, 0), |(files, bytes), entry| {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() => (
+                    files + 1,
+                    bytes + entry.metadata().map(|value| value.len()).unwrap_or(0),
+                ),
+                Ok(kind) if kind.is_dir() && !kind.is_symlink() => {
+                    let nested = size(&path);
+                    (files + nested.0, bytes + nested.1)
+                }
+                _ => (files, bytes),
+            }
+        })
+    }
+    let (files, bytes) = size(directory);
+    json!({"files":files,"bytes":bytes})
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1434,6 +1547,7 @@ mod gap_tests {
             assert_eq!(result.serial, serial);
             assert_eq!(result.exit_code, Some(0));
             assert!(!result.timed_out);
+            assert_eq!(result.timeout_seconds, 5);
             assert!(result.failure.is_none());
             let a = result.attachment.unwrap();
             assert_eq!(a.sha256, crate::evidence::hash_file(&fixture).unwrap().1);
@@ -1503,7 +1617,8 @@ mod gap_tests {
         .unwrap();
         assert!(before.elapsed() < std::time::Duration::from_secs(5));
         assert!(result.timed_out);
-        assert!(result.failure.is_some());
+        assert_eq!(result.timeout_seconds, 1);
+        assert!(result.failure.as_deref().unwrap().contains("1 秒内未完成"));
         assert!(result.attachment.is_none());
         assert!(result.directory.join("partial.txt").is_file());
         let pid = std::fs::read_to_string(pid_path).unwrap();

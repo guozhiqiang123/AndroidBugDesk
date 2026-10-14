@@ -42,6 +42,9 @@ export interface ProjectSetting {
 export interface ProjectSettings {
   entries: ProjectSetting[];
 }
+export interface DeveloperOptions {
+  debugEnabled: boolean;
+}
 export interface DraftProjectScope {
   organizationId: string;
   projectId: string;
@@ -77,6 +80,7 @@ export interface WorkspaceCommands {
   select_project: Profile;
   load_project_settings: ProjectSettings;
   save_project_settings: ProjectSettings;
+  set_developer_options: DeveloperOptions;
   load_selection_memory: Partial<SelectionMemory>;
   remember_selections: void;
   list_remote_history: HistoryPage;

@@ -35,6 +35,45 @@ fn rust_and_ui_fixture_accept_version_zero() {
 }
 
 #[test]
+fn preview_dialog_does_not_require_a_second_confirmation_flag() {
+    let m = metadata();
+    let mut d = fixture();
+    d["previewConfirmed"] = json!(false);
+    assert!(validation::validate(&d, &m.profile, Some(&m), true, true).is_empty());
+}
+
+#[test]
+fn developer_options_are_persisted_outside_login_state() {
+    use tauri::Manager;
+
+    let root = tempfile::tempdir().unwrap();
+    let state = crate::commands::AppState::new(root.path().to_path_buf()).unwrap();
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let saved = crate::commands::set_developer_options(
+        DeveloperOptions {
+            debug_enabled: true,
+        },
+        app.state(),
+    )
+    .unwrap();
+    assert!(saved.debug_enabled);
+    let stored: DeveloperOptions = app
+        .state::<crate::commands::AppState>()
+        .store
+        .get("settings", "developer_options")
+        .unwrap()
+        .unwrap();
+    assert!(stored.debug_enabled);
+    assert_eq!(
+        crate::commands::bootstrap(app.state()).unwrap()["developerOptions"]["debugEnabled"],
+        true
+    );
+}
+
+#[test]
 fn late_capture_field_is_removed_from_draft_and_report() {
     let mut d = fixture();
     assert!(d["event"].get("lateCapture").is_none());

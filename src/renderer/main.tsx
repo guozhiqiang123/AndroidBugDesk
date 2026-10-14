@@ -22,6 +22,7 @@ import type {
   DraftProjectScope,
   UpdateCheckResult,
   UpdateInstallResult,
+  DeveloperOptions,
 } from "../shared/workspace";
 import appPackage from "../../package.json";
 import {
@@ -85,6 +86,7 @@ interface Bootstrap {
   user?: UserIdentity | null;
   metadata: Metadata | null;
   adbPath: string | null;
+  developerOptions: DeveloperOptions;
   drafts: Draft[];
   submissions: Submission[];
   sessions: Session[];
@@ -148,6 +150,21 @@ function sourceTime(source?: Source) {
     ? source.at
     : value.toLocaleString("zh-CN", { hour12: false });
 }
+function recordRendererEvent(
+  event:
+    "ui_action" | "window_error" | "unhandled_rejection" | "event_loop_lag",
+  action: string,
+  phase: "started" | "complete" | "failed" | "observed",
+  durationMs?: number,
+) {
+  if (!isTauri()) return;
+  void invoke("record_renderer_event", {
+    event,
+    action,
+    phase,
+    durationMs: durationMs == null ? null : Math.max(0, Math.round(durationMs)),
+  }).catch(() => undefined);
+}
 function App() {
   const [boot, setBoot] = useState<Bootstrap | null>(initialWorkspace),
     [draft, setDraft] = useState<Draft | null>(null);
@@ -202,6 +219,28 @@ function App() {
   const busyGate = useRef(false);
   const workspaceEpoch = useRef(0);
   const startupUpdateChecked = useRef(false);
+  useEffect(() => {
+    const onError = () =>
+      recordRendererEvent("window_error", "window", "observed");
+    const onRejection = () =>
+      recordRendererEvent("unhandled_rejection", "promise", "observed");
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    let expected = performance.now() + 5_000;
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const delay = now - expected;
+      expected = now + 5_000;
+      if (delay >= 2_000 && delay <= 24 * 60 * 60 * 1_000) {
+        recordRendererEvent("event_loop_lag", "renderer", "observed", delay);
+      }
+    }, 5_000);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+      window.clearInterval(timer);
+    };
+  }, []);
   const refresh = async () => {
     const b = await invoke<Bootstrap>("bootstrap");
     setBoot(b);
@@ -216,6 +255,8 @@ function App() {
     target?: string,
   ) => {
     if (busyGate.current) return;
+    const actionStarted = performance.now();
+    recordRendererEvent("ui_action", name, "started");
     busyGate.current = true;
     setBusy(name);
     setError("");
@@ -223,7 +264,19 @@ function App() {
     if (target) setFieldErrors((current) => ({ ...current, [target]: "" }));
     try {
       await work();
+      recordRendererEvent(
+        "ui_action",
+        name,
+        "complete",
+        performance.now() - actionStarted,
+      );
     } catch (e) {
+      recordRendererEvent(
+        "ui_action",
+        name,
+        "failed",
+        performance.now() - actionStarted,
+      );
       if (isAuthExpired(e))
         await invalidateAuth(`授权已失效：${remoteErrorMessage(e)}`);
       else if (target)
@@ -304,6 +357,19 @@ function App() {
         message: typeof cause === "string" ? cause : String(cause),
       }));
     }
+  };
+  const setDebugEnabled = async (debugEnabled: boolean) => {
+    const options = await invoke<DeveloperOptions>("set_developer_options", {
+      options: { debugEnabled },
+    });
+    setBoot((current) =>
+      current ? { ...current, developerOptions: options } : current,
+    );
+    setNotice(
+      debugEnabled
+        ? "调试已开启，后续操作会写入受限轮转日志。"
+        : "调试已关闭，已停止写入详细运行日志。",
+    );
   };
   useEffect(() => {
     if (!isTauri() || startupUpdateChecked.current) return;
@@ -1384,7 +1450,7 @@ function App() {
     return `field-${path}`;
   };
   const issueNavigationGroups = groupIssuesByNavigationTarget(
-    issues.filter((item) => item.field !== "previewConfirmed"),
+    issues,
     issueNavigationTarget,
   );
   const activeIssueStillPresent = issueNavigationGroups.some(
@@ -1556,7 +1622,6 @@ function App() {
         "steps",
         "expected",
         "attachments",
-        "previewConfirmed",
         "app.packageName",
         "app.versionName",
         "app.versionCode",
@@ -2181,6 +2246,44 @@ function App() {
                 </button>
               </div>
             </section>
+            <section className="card settings-card developer-options-card">
+              <div className="card-title">
+                <div>
+                  <h2>开发者选项</h2>
+                  <p className="muted-text">
+                    开启后记录跨平台运行阶段、耗时、ADB
+                    超时和采集进度，并在新建提交页提供“软件证据”。
+                  </p>
+                </div>
+                <label className="switch-control">
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    aria-label="开启调试"
+                    checked={boot.developerOptions.debugEnabled}
+                    disabled={!!busy}
+                    onChange={(event) =>
+                      void run("更新开发者选项", () =>
+                        setDebugEnabled(event.target.checked),
+                      )
+                    }
+                  />
+                  <span className="switch-track" aria-hidden="true">
+                    <span className="switch-thumb" />
+                  </span>
+                  <strong>
+                    {boot.developerOptions.debugEnabled
+                      ? "调试已开启"
+                      : "开启调试"}
+                  </strong>
+                </label>
+              </div>
+              <p className="muted-text diagnostics-limit-note">
+                详细日志最多约 20 MB，基础日志最多约 4 MB，保留 7
+                天；失败的系统报告诊断最多保留 3 份、合计约 12
+                MB。软件证据包最大 25 MB，并自动替换当前草稿的旧软件证据。
+              </p>
+            </section>
           </>
         )}
         {tab === "new" &&
@@ -2511,6 +2614,22 @@ function App() {
                       </small>
                     ))}
                   </div>
+                  {boot.developerOptions.debugEnabled && (
+                    <div className="action-item">
+                      <button
+                        type="button"
+                        disabled={frozen || !!busy}
+                        onClick={() =>
+                          void run("收集软件证据", async () => {
+                            await mutate("collect_software_evidence");
+                            setNotice("软件证据已生成并加入附件。");
+                          })
+                        }
+                      >
+                        软件证据
+                      </button>
+                    </div>
+                  )}
                   {draft.attachments.length > 0 && (
                     <div className="action-item">
                       <button
@@ -2528,7 +2647,10 @@ function App() {
                 </div>
                 {(boot.captures ?? [])
                   .filter(
-                    (t) => t.draftId === draft.id && t.kind !== "post-capture",
+                    (t) =>
+                      t.draftId === draft.id &&
+                      t.kind !== "post-capture" &&
+                      t.kind !== "software-diagnostics",
                   )
                   .map((t) => (
                     <div className="capture-status" role="status" key={t.id}>
@@ -2720,7 +2842,7 @@ function App() {
                       frozen ||
                       !!busy ||
                       capturePending ||
-                      clientIssues.some((i) => i.field !== "previewConfirmed")
+                      clientIssues.length > 0
                     }
                     onClick={() =>
                       void run("核对主进程校验", async () => {
@@ -2728,12 +2850,8 @@ function App() {
                         const errors = await invoke<
                           { field: string; message: string }[]
                         >("validate_draft", { id: d.id });
-                        setBackendIssues(
-                          errors.filter((i) => i.field !== "previewConfirmed"),
-                        );
-                        if (
-                          errors.some((i) => i.field !== "previewConfirmed")
-                        ) {
+                        setBackendIssues(errors);
+                        if (errors.length > 0) {
                           setPreview(false);
                           return;
                         }
@@ -2818,27 +2936,10 @@ function App() {
                         ，以及不可变证据 ZIP
                       </dd>
                     </dl>
-                    <div className="preview-confirm-actions">
-                      <label className="check">
-                        <input
-                          type="checkbox"
-                          checked={draft.previewConfirmed}
-                          onChange={(e) => {
-                            const next = {
-                              ...draft,
-                              previewConfirmed: e.target.checked,
-                            };
-                            setDraft(next);
-                            setDirty(true);
-                          }}
-                        />
-                        我已核对项目、描述与附件内容，并确认上传
-                      </label>
+                    <div className="preview-submit-actions">
                       <button
                         className="primary"
-                        disabled={
-                          !draft.previewConfirmed || !!busy || capturePending
-                        }
+                        disabled={!!busy || capturePending}
                         onClick={() =>
                           void run("提交 Bug 并核对附件", async () => {
                             const d = await save();

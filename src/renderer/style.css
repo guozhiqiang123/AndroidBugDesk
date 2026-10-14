@@ -786,6 +786,77 @@ code {
   border-color: #e8c5bd;
   background: linear-gradient(180deg, #ffffff 0%, #fff8f6 100%);
 }
+.developer-options-card .card-title {
+  align-items: flex-start;
+}
+.developer-options-card .card-title > div {
+  min-width: 0;
+}
+.developer-options-card .card-title p {
+  margin: 6px 0 0;
+}
+.switch-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  flex-shrink: 0;
+  cursor: pointer;
+  font-size: 12px;
+}
+.switch-control input {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 0;
+  width: 42px;
+  height: 24px;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.switch-control input:disabled {
+  cursor: not-allowed;
+}
+.switch-track {
+  position: relative;
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: #c8d1df;
+  transition: background 0.18s ease;
+}
+.switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px #17253e40;
+  transition: transform 0.18s ease;
+}
+.switch-control input:checked + .switch-track {
+  background: #2864d8;
+}
+.switch-control input:checked + .switch-track .switch-thumb {
+  transform: translateX(18px);
+}
+.switch-control input:focus-visible + .switch-track {
+  outline: 3px solid #b2caff;
+  outline-offset: 2px;
+}
+.switch-control input:disabled + .switch-track,
+.switch-control input:disabled ~ strong {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.diagnostics-limit-note {
+  margin: 4px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid #edf0f5;
+}
 .update-status-badge {
   border-radius: 999px;
   padding: 5px 9px;
@@ -1256,26 +1327,19 @@ details {
   color: #758499;
   font-size: 11px;
 }
-.preview-confirm-actions {
+.preview-submit-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 20px;
   padding-top: 18px;
   border-top: 1px solid #edf1f7;
 }
-.preview-confirm-actions .check {
-  margin: 0;
-}
-.preview-confirm-actions .primary {
+.preview-submit-actions .primary {
   flex: 0 0 auto;
 }
 @media (max-width: 700px) {
-  .preview-confirm-actions {
-    align-items: stretch;
-    flex-direction: column;
-  }
-  .preview-confirm-actions .primary {
+  .preview-submit-actions .primary {
     width: 100%;
   }
 }

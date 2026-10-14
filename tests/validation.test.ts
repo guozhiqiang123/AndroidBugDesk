@@ -26,6 +26,11 @@ describe("提交门槛", () => {
     expect(draftSchema.safeParse(v).success).toBe(false);
   });
   it("有效信息与 versionCode 0 通过", () => expect(check(d())).toEqual([]));
+  it("提交预览弹窗本身完成确认，不再要求额外确认复选框", () => {
+    const v = d();
+    v.previewConfirmed = false;
+    expect(check(v)).toEqual([]);
+  });
   it.each([undefined, "", "com.example.test.RecoveryActivity"])(
     "Bug 所在页面为 %s 时保持可选且兼容已有草稿",
     (bugPage) => {

@@ -30,6 +30,11 @@ pub(crate) const SERVICE: &str = "com.qa.androidbugdesk";
 impl AppState {
     pub fn new(root: PathBuf) -> Result<Self> {
         let store = Store::new(&root)?;
+        let developer_options = store
+            .get::<DeveloperOptions>("settings", "developer_options")?
+            .unwrap_or_default();
+        crate::diagnostics::set_debug_enabled(developer_options.debug_enabled);
+        crate::software_diagnostics::prune_bugreport_diagnostics(&root);
         store.recover()?;
         crate::capture::recover(&store)?;
         for mut draft in store.list("draft")? {
@@ -145,8 +150,45 @@ pub fn bootstrap(state: State<AppState>) -> Result<Value> {
     let draft_scopes = crate::project_settings::draft_scopes_for_state(&state, &drafts)?;
     let submissions = crate::workitem_links::history_with_urls(state.store.list("submission")?);
     Ok(
-        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"rememberLogin":remember_login,"loginMethod":state.store.get::<String>("settings", "login_method")?.unwrap_or_else(|| if remember_login { "pat".into() } else { "oauth".into() }),"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"drafts":drafts,"draftScopes":draft_scopes,"submissions":submissions,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
+        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"rememberLogin":remember_login,"loginMethod":state.store.get::<String>("settings", "login_method")?.unwrap_or_else(|| if remember_login { "pat".into() } else { "oauth".into() }),"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"developerOptions":state.store.get::<DeveloperOptions>("settings", "developer_options")?.unwrap_or_default(),"drafts":drafts,"draftScopes":draft_scopes,"submissions":submissions,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
     )
+}
+#[tauri::command]
+pub fn set_developer_options(
+    options: DeveloperOptions,
+    state: State<AppState>,
+) -> Result<DeveloperOptions> {
+    state.store.put("settings", "developer_options", &options)?;
+    crate::diagnostics::set_debug_enabled(options.debug_enabled);
+    Ok(options)
+}
+#[tauri::command]
+pub fn record_renderer_event(
+    event: String,
+    action: String,
+    phase: String,
+    duration_ms: Option<u64>,
+) -> Result<()> {
+    if ![
+        "ui_action",
+        "window_error",
+        "unhandled_rejection",
+        "event_loop_lag",
+    ]
+    .contains(&event.as_str())
+        || !["started", "complete", "failed", "observed"].contains(&phase.as_str())
+        || action.chars().count() > 80
+        || action.contains(['\r', '\n'])
+        || duration_ms.is_some_and(|value| value > 24 * 60 * 60 * 1_000)
+    {
+        return Err("运行诊断事件格式不正确".into());
+    }
+    crate::diagnostics::debug_event(
+        "renderer",
+        &event,
+        json!({"action":action,"phase":phase,"durationMs":duration_ms}),
+    );
+    Ok(())
 }
 #[tauri::command]
 pub async fn set_auth(token: String, remember: bool, state: State<'_, AppState>) -> Result<()> {
@@ -789,7 +831,13 @@ pub async fn capture_bugreport(id: String, state: State<'_, AppState>) -> Result
         }
         state.store.put("capture", &task_id, &json!({"id":task_id,"draftId":id,"sessionId":sid,"kind":"bugreport","status":"pending","startedAt":now()}))?;
     }
-    let result = adb::bugreport(&path, &string(&session, "serial"), &state.store.root, 120).await;
+    let result = adb::bugreport(
+        &path,
+        &string(&session, "serial"),
+        &state.store.root,
+        adb::BUGREPORT_TIMEOUT_SECONDS,
+    )
+    .await;
     let _write = state.store.writes.lock().unwrap();
     let mut task: Value = state
         .store
@@ -799,6 +847,7 @@ pub async fn capture_bugreport(id: String, state: State<'_, AppState>) -> Result
     let mut d = state.store.draft(&id)?;
     match result {
         Ok(c) => {
+            let raw_directory = c.directory.clone();
             task["status"] = json!(if c.attachment.is_some() {
                 "complete"
             } else {
@@ -810,6 +859,10 @@ pub async fn capture_bugreport(id: String, state: State<'_, AppState>) -> Result
                     .as_array_mut()
                     .unwrap()
                     .push(serde_json::to_value(a).unwrap());
+                // The validated report already lives in its managed attachment directory.
+                // Remove adb's raw destination so the standalone entry point does not keep
+                // a second full-size copy.
+                let _ = std::fs::remove_dir_all(raw_directory);
             } else {
                 d["collectionErrors"]
                     .as_array_mut()
@@ -1153,12 +1206,21 @@ pub fn remove_attachment(
     {
         return Err("来源回执须与关联副本一起保留；请移除关联副本以成组移除".into());
     }
+    let removed: Vec<Attachment> = files
+        .iter()
+        .filter(|a| {
+            a.id == attachment_id
+                || (a.role == "report" && a.derived_from.as_deref() == Some(&attachment_id))
+        })
+        .cloned()
+        .collect();
     d["attachments"].as_array_mut().unwrap().retain(|a| {
         string(a, "id") != attachment_id
             && !(string(a, "role") == "report" && string(a, "derivedFrom") == attachment_id)
     });
     d["previewConfirmed"] = json!(false);
     state.store.put("draft", &id, &d)?;
+    crate::software_diagnostics::cleanup_removed(&state.store, &id, &removed)?;
     Ok(d)
 }
 #[tauri::command]
@@ -1166,11 +1228,13 @@ pub fn remove_all_attachments(id: String, state: State<AppState>) -> Result<Valu
     let _write = state.store.writes.lock().unwrap();
     state.editable(&id)?;
     let mut d = state.store.draft(&id)?;
+    let removed = attachments(&d)?;
     d["attachments"] = json!([]);
     d["previewConfirmed"] = json!(false);
     validation::check_shape(&d)?;
     state.assert_no_token(&d)?;
     state.store.put("draft", &id, &d)?;
+    crate::software_diagnostics::cleanup_removed(&state.store, &id, &removed)?;
     Ok(d)
 }
 #[tauri::command]

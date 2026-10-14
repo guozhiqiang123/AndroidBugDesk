@@ -143,6 +143,7 @@ checks: try {
             },
           ],
         },
+        developerOptions: { debugEnabled: false },
         settingsByOrg: {
           "test-org": {
             entries: [
@@ -212,6 +213,11 @@ checks: try {
               submissions: [],
               sessions: [],
             });
+          if (cmd === "record_renderer_event") return;
+          if (cmd === "set_developer_options") {
+            q.developerOptions = clone(args.options);
+            return clone(q.developerOptions);
+          }
           if (cmd === "login") {
             if (q.failLogin)
               return { status: "invalid", user: null, message: "模拟令牌无效" };
@@ -486,6 +492,20 @@ checks: try {
               draft().attachments.push(
                 attached(file.name, file.role, "导入文件，类型自动识别"),
               );
+            return clone(draft());
+          }
+          if (cmd === "collect_software_evidence") {
+            const prior = draft().attachments.filter(
+              (item) => item.source !== "Android Bug Desk 软件运行诊断",
+            );
+            prior.push(
+              attached(
+                "software-evidence-mock.zip",
+                "report",
+                "Android Bug Desk 软件运行诊断",
+              ),
+            );
+            draft().attachments = prior;
             return clone(draft());
           }
           if (cmd === "redact_log") {
@@ -1080,7 +1100,7 @@ checks: try {
       "重复项目只显示最新一次",
     );
     await captureDialog
-      .getByText(/系统报告已生成 \d+ 秒，通常需要 1–2 分钟/)
+      .getByText(/系统报告已生成 \d+ 秒，通常需要 1–3 分钟/)
       .waitFor();
     await captureDialog.screenshot({
       path: path.join(output, "consolidated-running-bugreport.png"),
@@ -2265,12 +2285,13 @@ checks: try {
     await previewDialog
       .getByRole("checkbox", { name: /我已核对项目、描述与附件内容/ })
       .count(),
-    1,
+    0,
   );
-  assert.equal(
-    await previewDialog.getByRole("button", { name: "提交 Bug" }).count(),
-    1,
-  );
+  const submitBugButton = previewDialog.getByRole("button", {
+    name: "提交 Bug",
+  });
+  assert.equal(await submitBugButton.count(), 1);
+  assert.equal(await submitBugButton.isEnabled(), true);
   assert.equal(await previewDialog.locator(".app-dialog-close").count(), 1);
   const previewText = await previewDialog.locator(".preview").innerText();
   assert.match(previewText, /Jenkins包地址/);
@@ -2290,10 +2311,6 @@ checks: try {
   assert.equal(
     await page.locator(".preview dt").filter({ hasText: "构建" }).count(),
     0,
-  );
-  assert.doesNotMatch(
-    await previewDialog.locator(".preview .check").innerText(),
-    /构建/,
   );
   await previewDialog.screenshot({
     path: path.join(output, "submit-preview-dialog.png"),
@@ -2462,6 +2479,20 @@ checks: try {
   await updateErrorDialog
     .getByRole("button", { name: "关闭", exact: true })
     .click();
+  const debugSwitch = page.getByRole("switch", {
+    name: "开启调试",
+    exact: true,
+  });
+  assert.equal(await debugSwitch.isChecked(), false);
+  assert.match(
+    await page.locator(".developer-options-card").innerText(),
+    /详细日志最多约 20 MB.*基础日志最多约 4 MB.*25 MB/s,
+  );
+  await debugSwitch.check();
+  assert.equal(
+    await page.evaluate(() => window.__qa.developerOptions.debugEnabled),
+    true,
+  );
   await updateCard
     .getByRole("button", { name: "打开 Release 页面", exact: true })
     .click();
@@ -2623,6 +2654,22 @@ checks: try {
     fullPage: true,
   });
   await page.locator("nav button").filter({ hasText: "新建提交" }).click();
+  const softwareEvidence = page.getByRole("button", {
+    name: "软件证据",
+    exact: true,
+  });
+  await softwareEvidence.waitFor();
+  await softwareEvidence.click();
+  await page.getByText("软件证据已生成并加入附件。", { exact: true }).waitFor();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.drafts[0].attachments.filter(
+          (item) => item.source === "Android Bug Desk 软件运行诊断",
+        ).length,
+    ),
+    1,
+  );
   assert.equal(
     await page.evaluate(
       () =>
@@ -2900,7 +2947,7 @@ checks: try {
           "field errors use Chinese navigation labels without summary duplication",
           "frequency errors navigate locally and late capture does not require attachments",
           "native title alias backend errors block preview and navigate to title without inline orange copy",
-          "submission preview, confirmation and submit action share a closable modal with focus return",
+          "submission preview and direct submit action share a closable modal with focus return; no duplicate confirmation checkbox remains",
           "image and dynamic types do not require media; selected log coverage errors stay local",
           "device read failure stays below device selector and clears after retry",
           "login errors render below the PAT input",
@@ -2910,6 +2957,7 @@ checks: try {
           "homepage removes versions selector and retains sprint selector",
           "settings page owns organization and logout controls",
           "settings update card checks the GitHub Release list only on demand and opens the fixed release page",
+          "developer diagnostics persist a custom switch and expose one software-evidence action with explicit disk limits",
           "project settings save filters homepage projects",
           "all projects disabled shows recovery banner",
           "failed settings save preserves edited values and applied state",

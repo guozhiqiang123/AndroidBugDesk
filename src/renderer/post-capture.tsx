@@ -149,7 +149,9 @@ export function PostCaptureEntry({
     const started = new Date(startedAt).getTime();
     if (!Number.isFinite(started)) return "";
     const elapsed = Math.max(0, Math.floor((clock - started) / 1000));
-    return `系统报告已生成 ${elapsed} 秒，通常需要 1–2 分钟，超过约 2 分钟会自动结束`;
+    return elapsed < 180
+      ? `系统报告已生成 ${elapsed} 秒，通常需要 1–3 分钟，Windows 传输可能更久`
+      : `系统报告已生成 ${elapsed} 秒，仍在等待设备生成和传输，超过约 5 分钟会自动结束`;
   };
   return (
     <div className="action-item post-capture-entry" id="field-postCapture">
@@ -267,7 +269,10 @@ export function PostCaptureEntry({
                       <small className="error-text">{result.error}</small>
                     )}
                     {result.commands
-                      ?.filter((command) => command.error)
+                      ?.filter(
+                        (command) =>
+                          command.error && command.error !== result.error,
+                      )
                       .map((command, index) => (
                         <small className="error-text" key={index}>
                           {command.error}

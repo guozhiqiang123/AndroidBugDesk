@@ -58,6 +58,7 @@ export function initialWorkspace() {
     user: null,
     metadata: null as Metadata | null,
     adbPath: null as string | null,
+    developerOptions: { debugEnabled: false },
     drafts: [] as Draft[],
     submissions: [] as Submission[],
     sessions: [] as Session[],

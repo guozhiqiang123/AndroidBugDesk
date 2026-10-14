@@ -94,7 +94,17 @@ pub(crate) fn delete_many_for_state(state: &AppState, ids: &[String]) -> Result<
 }
 
 fn capture_attachment_ids(task: &Value) -> HashSet<String> {
-    if string(task, "kind") != "post-capture" {
+    let kind = string(task, "kind");
+    if kind == "software-diagnostics" {
+        return task["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+    }
+    if kind != "post-capture" {
         return HashSet::new();
     }
     let mut ids = HashSet::new();
@@ -291,19 +301,21 @@ mod tests {
     }
 
     #[test]
-    fn deletion_removes_only_environment_and_post_capture_generated_attachments() {
+    fn deletion_removes_only_generated_capture_attachments() {
         let (dir, state, id) = state();
         let imported_id = uuid();
         let environment_id = uuid();
         let supplemental_id = uuid();
         let old_supplemental_id = uuid();
         let summary_id = uuid();
+        let software_id = uuid();
         let imported = stored_attachment(dir.path(), &imported_id, "imported.png");
         let environment = stored_attachment(dir.path(), &environment_id, "environment.txt");
         let supplemental = stored_attachment(dir.path(), &supplemental_id, "logs.zip");
         let old_supplemental =
             stored_attachment(dir.path(), &old_supplemental_id, "older-logs.zip");
         let summary = stored_attachment(dir.path(), &summary_id, "summary.zip");
+        let software = stored_attachment(dir.path(), &software_id, "software.zip");
         let exported = dir
             .path()
             .join("evidence")
@@ -323,8 +335,23 @@ mod tests {
                         {"id": imported_id},
                         {"id": environment_id},
                         {"id": supplemental_id},
-                        {"id": summary_id}
+                        {"id": summary_id},
+                        {"id": software_id}
                     ]
+                }),
+            )
+            .unwrap();
+        state
+            .store
+            .put(
+                "capture",
+                "software-job",
+                &json!({
+                    "id": "software-job",
+                    "draftId": id,
+                    "kind": "software-diagnostics",
+                    "status": "complete",
+                    "attachments": [software_id]
                 }),
             )
             .unwrap();
@@ -372,6 +399,7 @@ mod tests {
         assert!(!supplemental.exists());
         assert!(!old_supplemental.exists());
         assert!(!summary.exists());
+        assert!(!software.exists());
     }
 
     #[test]

@@ -299,7 +299,5 @@ export function validateDraft(
       if (!metadata.fields.some((f) => f.id === id))
         add("project", `项目必填字段 ${id} 未出现在云效元数据中`);
   }
-  if (online && !d.previewConfirmed)
-    add("previewConfirmed", "请预览并确认项目、描述和附件");
   return [...new Map(issues.map((i) => [i.field + i.message, i])).values()];
 }

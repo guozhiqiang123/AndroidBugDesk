@@ -12,6 +12,7 @@ pub mod model;
 pub mod oauth;
 pub mod post_capture;
 pub mod project_settings;
+pub mod software_diagnostics;
 pub mod store;
 pub mod submission;
 pub mod submission_fields;
@@ -35,6 +36,8 @@ pub fn run() {
         .setup(commands::setup)
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::set_developer_options,
+            commands::record_renderer_event,
             commands::check_auth,
             commands::login,
             oauth::oauth_login,
@@ -72,6 +75,7 @@ pub fn run() {
             commands::save_attachment_coverage,
             commands::remove_attachment,
             commands::remove_all_attachments,
+            software_diagnostics::collect_software_evidence,
             commands::export_evidence,
             commands::submit_bug,
             commands::reconcile_submission,
@@ -94,6 +98,7 @@ pub fn run() {
                 }
                 state.stop_page_observer();
                 diagnostics::event("app", "exit requested");
+                let _ = diagnostics::flush(std::time::Duration::from_millis(200));
                 if let Some(t) = state.token.lock().unwrap().as_mut() {
                     use zeroize::Zeroize;
                     t.zeroize();

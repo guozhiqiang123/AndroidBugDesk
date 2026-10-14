@@ -354,8 +354,5 @@ pub fn validate(
             }
         }
     }
-    if online && !bool_at(d, "previewConfirmed") {
-        add!("previewConfirmed", "请预览并确认项目、描述及附件");
-    }
     errors
 }

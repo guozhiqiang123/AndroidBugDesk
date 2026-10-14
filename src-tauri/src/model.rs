@@ -21,6 +21,11 @@ pub fn bool_at(v: &Value, path: &str) -> bool {
 pub fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeveloperOptions {
+    pub debug_enabled: bool,
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Profile {
