@@ -185,6 +185,11 @@ async fn inspected_values_survive_save_and_partial_device_switch_without_losing_
         store.get::<Value>("snapshot", &id).unwrap().unwrap(),
         snapshot
     );
+    // This assertion exercises stale renderer-save merging, not the live
+    // observer's polling cadence. Stop the observer before injecting the next
+    // deterministic observation so its immediate first tick cannot race the
+    // synthetic DetailActivity value back to the fake ADB's Home value.
+    app.state::<commands::AppState>().stop_page_observer();
     let mut stale = draft.clone();
     adb::record_observed_page(
         &adb::PageObservationTarget {
