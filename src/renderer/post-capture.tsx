@@ -278,6 +278,16 @@ export function PostCaptureEntry({
                           {command.error}
                         </small>
                       ))}
+                    {result.commands
+                      ?.filter((command) => command.warning)
+                      .map((command, index) => (
+                        <small
+                          className="warning-text"
+                          key={`warning-${index}`}
+                        >
+                          {command.warning}
+                        </small>
+                      ))}
                     {retryableItems(job).includes(itemId) && (
                       <button
                         disabled={disabled || running || starting || !serial}

@@ -702,10 +702,9 @@ async fn collect(
                 }
             }
             Err(error) if unsupported_log_filter(args, &error) => {
-                missed = true;
                 observation["status"] = json!("unavailable");
-                observation["error"] =
-                    json!("设备 logcat 不支持 UID 过滤，已切换为当前目标应用进程过滤");
+                observation["warning"] =
+                    json!("设备 logcat 不支持 UID 过滤，已自动改用当前目标应用进程采集");
                 observations.push(observation);
 
                 let pid_args = vec!["shell".to_string(), "pidof".to_string(), package.clone()];
@@ -773,6 +772,7 @@ async fn collect(
                 receipt["logFilter"]["processIds"] = json!(pids);
 
                 let mut requires_local_filter = false;
+                let mut compatibility_complete = !pids.is_empty();
                 for pid in &pids {
                     if let Err(error) = binding(state, job) {
                         interrupted = Some(error);
@@ -799,6 +799,7 @@ async fn collect(
                             fallback_observation["logBounds"] =
                                 log_bounds(&text).unwrap_or(Value::Null);
                             if empty {
+                                compatibility_complete = false;
                                 fallback_observation["error"] = json!(
                                     "当前目标应用进程没有可用日志；历史日志未纳入本次兼容采集"
                                 );
@@ -809,9 +810,10 @@ async fn collect(
                             }
                         }
                         Err(error) => {
+                            compatibility_complete = false;
                             fallback_observation["status"] = json!("failed");
                             if unsupported_log_filter(&fallback_args, &error) {
-                                fallback_observation["error"] = json!(
+                                fallback_observation["warning"] = json!(
                                     "设备 logcat 不支持 PID 过滤，已改用本机内存过滤当前进程日志"
                                 );
                                 requires_local_filter = true;
@@ -826,6 +828,7 @@ async fn collect(
                     }
                 }
                 if requires_local_filter && !pids.is_empty() {
+                    compatibility_complete = false;
                     let fallback_args = unfiltered_logcat_command(item);
                     let started = now();
                     let refs = fallback_args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -849,6 +852,7 @@ async fn collect(
                                 );
                             } else {
                                 fallback_observation["status"] = json!("complete");
+                                compatibility_complete = true;
                                 fallback_observation["logBounds"] = Value::Null;
                                 let file_index = observations.len();
                                 files.push((format!("{file_index:02}-{item}.txt"), filtered));
@@ -861,6 +865,9 @@ async fn collect(
                         }
                     }
                     observations.push(fallback_observation);
+                }
+                if !compatibility_complete {
+                    missed = true;
                 }
                 continue;
             }

@@ -618,9 +618,9 @@ async fn unsupported_uid_logcat_safely_falls_back_to_current_package_pids() {
     execute(&state, &string(&job, "id")).await.unwrap();
 
     let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
-    assert_eq!(snapshot["jobs"][0]["status"], "partial");
+    assert_eq!(snapshot["jobs"][0]["status"], "complete");
     for item in ["logs", "crash"] {
-        assert_eq!(snapshot["jobs"][0]["items"][item]["status"], "partial");
+        assert_eq!(snapshot["jobs"][0]["items"][item]["status"], "complete");
     }
     let files = attachments(&state.store.draft(&id).unwrap()).unwrap();
     for item in ["logs", "crash"] {
@@ -642,10 +642,12 @@ async fn unsupported_uid_logcat_safely_falls_back_to_current_package_pids() {
                 .unwrap()
                 .iter()
                 .any(|argument| argument == "--pid=321")));
-        assert!(result["commands"][0]["error"]
+        assert_eq!(result["status"], "complete");
+        assert!(result["commands"][0]["warning"]
             .as_str()
             .unwrap()
-            .contains("已切换"));
+            .contains("已自动改用"));
+        assert!(result["commands"][0].get("error").is_none());
     }
     let calls = trace(temp.path());
     assert!(calls
@@ -678,7 +680,7 @@ async fn legacy_logcat_is_filtered_in_memory_and_never_saves_other_apps() {
         .find(|attachment| attachment.name == "post-capture-logs.zip")
         .unwrap();
     let result = receipt(logs);
-    assert_eq!(result["status"], "partial");
+    assert_eq!(result["status"], "complete");
     assert_eq!(
         result["logFilter"]["fallbackMode"],
         "localCurrentProcessPid"
@@ -691,6 +693,21 @@ async fn legacy_logcat_is_filtered_in_memory_and_never_saves_other_apps() {
         .unwrap();
     assert_eq!(local["status"], "complete");
     assert_eq!(local["rawDeviceLogPersisted"], false);
+    let pid_fallback = result["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|command| {
+            command["argv"]
+                .as_array()
+                .is_some_and(|argv| argv.iter().any(|argument| argument == "--pid=321"))
+        })
+        .unwrap();
+    assert!(pid_fallback["warning"]
+        .as_str()
+        .unwrap()
+        .contains("本机内存过滤"));
+    assert!(pid_fallback.get("error").is_none());
 
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&logs.path).unwrap()).unwrap();
     let name = (0..zip.len())

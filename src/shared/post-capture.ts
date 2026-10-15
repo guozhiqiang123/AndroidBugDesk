@@ -84,7 +84,12 @@ export interface CaptureItemResult {
   attachments: string[];
   startedAt?: string;
   finishedAt?: string;
-  commands?: { status?: string; error?: string; argv: string[] }[];
+  commands?: {
+    status?: string;
+    error?: string;
+    warning?: string;
+    argv: string[];
+  }[];
 }
 export interface PostCaptureJob {
   id: string;
