@@ -9,7 +9,6 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 use tokio::{io::AsyncReadExt, process::Command, sync::watch};
@@ -290,28 +289,6 @@ pub async fn package_uid(path: &Path, serial: &str, package: &str) -> Result<u32
         .ok_or_else(|| "目标应用 UID 超出支持范围".into())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ForegroundComponent {
-    pub package: String,
-    pub activity: String,
-    pub source: &'static str,
-}
-
-fn component_page(component: &ForegroundComponent) -> String {
-    if component.activity.starts_with('.') {
-        format!("{}{}", component.package, component.activity)
-    } else {
-        component.activity.clone()
-    }
-}
-
-pub fn target_component_page(
-    component: &ForegroundComponent,
-    target_package: &str,
-) -> Option<String> {
-    (component.package == target_package).then(|| component_page(component))
-}
-
 pub fn page_belongs_to_package(page: &str, target_package: &str) -> bool {
     page == target_package
         || page
@@ -345,322 +322,10 @@ pub fn clear_mismatched_automatic_page(draft: &mut Value) -> bool {
     true
 }
 
-fn valid_component_package(package: &str) -> bool {
-    valid_package(package).is_ok()
-}
-
-/// Extract only components from the well-known resumed/focused markers.  In
-/// particular, process lists and arbitrary dumpsys lines are intentionally
-/// ignored so a package name cannot be injected through unrelated output.
-pub fn parse_foreground_components(s: &str, source: &'static str) -> Vec<ForegroundComponent> {
-    let marker = regex::Regex::new(
-        r"(?x)(?P<pkg>[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/(?P<act>[A-Za-z0-9_.$]+)",
-    )
-    .unwrap();
-    s.lines()
-        .filter(|line| {
-            let lower = line.trim_start().to_ascii_lowercase();
-            (lower.starts_with("mresumedactivity")
-                || lower.starts_with("resumedactivity")
-                || lower.starts_with("mcurrentfocus")
-                || lower.starts_with("mfocusedapp"))
-                && !lower.contains("no activity")
-        })
-        .filter_map(|line| {
-            let c = marker.captures(line)?;
-            let package = c.name("pkg")?.as_str().to_string();
-            if !valid_component_package(&package) {
-                return None;
-            }
-            Some(ForegroundComponent {
-                package,
-                activity: c.name("act")?.as_str().to_string(),
-                source,
-            })
-        })
-        .collect()
-}
-
-pub async fn foreground(path: &Path, serial: &str) -> Result<ForegroundComponent> {
-    valid_serial(serial)?;
-    let resumed = text(
-        path,
-        serial,
-        &["shell", "dumpsys", "activity", "activities"],
-    )
-    .await
-    .map(|v| parse_foreground_components(&v, "dumpsys activity activities"))
-    .unwrap_or_default();
-    let focused = text(path, serial, &["shell", "dumpsys", "window", "windows"])
-        .await
-        .map(|v| parse_foreground_components(&v, "dumpsys window windows"))
-        .unwrap_or_default();
-    let resumed = resumed
-        .into_iter()
-        .filter(|c| !system_overlay(&c.package))
-        .collect::<Vec<_>>();
-    let focused = focused
-        .into_iter()
-        .filter(|c| !system_overlay(&c.package))
-        .collect::<Vec<_>>();
-    let distinct = |items: &[ForegroundComponent]| {
-        items
-            .iter()
-            .map(|c| c.package.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-    };
-    if distinct(&resumed) > 1 || distinct(&focused) > 1 {
-        return Err("检测到多个不同前台应用，无法安全确定当前界面".into());
-    }
-    if let (Some(r), Some(f)) = (resumed.first(), focused.first()) {
-        if r.package != f.package {
-            return Err("activity 与 focused window 指向不同应用，无法安全确定当前界面".into());
-        }
-    }
-    focused
-        .into_iter()
-        .next()
-        .or_else(|| resumed.into_iter().next())
-        .ok_or_else(|| "无法确定当前前台应用；请保持应用在前台后重试".into())
-}
-
-fn system_overlay(package: &str) -> bool {
-    matches!(
-        package,
-        "android" | "com.android.systemui" | "com.android.keyguard"
-    )
-}
-
 pub async fn inspect_snapshot(path: &Path, serial: &str, target_package: &str) -> Result<Value> {
-    // App identity always comes from the saved project mapping. Foreground is
-    // observed separately and is used only for the optional Bug page.
     let mut snapshot = snapshot_impl(path, serial, target_package, true).await?;
     snapshot["details"]["serial"] = json!(serial);
-    let observed_at: String;
-    let page_status: &str;
-    let page_detail: String;
-    match foreground(path, serial).await {
-        Ok(component) => {
-            snapshot["details"]["foregroundPackage"] = json!(component.package);
-            snapshot["details"]["foregroundActivity"] = json!(component.activity);
-            snapshot["details"]["foregroundSource"] = json!(component.source);
-            if component.package != target_package {
-                observed_at = now();
-                page_status = "not_applicable";
-                page_detail = format!(
-                    "ADB 前台页面属于其他应用 {}，与目标包 {} 不一致，未采用",
-                    component.package, target_package
-                );
-            } else {
-                match foreground(path, serial).await {
-                    Ok(final_component) if final_component.package != target_package => {
-                        observed_at = now();
-                        snapshot["details"]["foregroundPackage"] = json!("");
-                        snapshot["details"]["foregroundActivity"] = json!("");
-                        snapshot["details"]["foregroundSource"] = json!("");
-                        page_status = "not_applicable";
-                        page_detail = "采集期间前台应用离开目标包，未采用当前页面".into();
-                    }
-                    Err(error) => {
-                        observed_at = now();
-                        page_status = "failed";
-                        snapshot["details"]["foregroundPackage"] = json!("");
-                        snapshot["details"]["foregroundActivity"] = json!("");
-                        snapshot["details"]["foregroundSource"] = json!("");
-                        page_detail = format!("采集结束时无法复核目标应用前台页面：{error}");
-                    }
-                    Ok(final_component) => {
-                        observed_at = now();
-                        snapshot["details"]["foregroundActivity"] = json!(final_component.activity);
-                        snapshot["details"]["foregroundSource"] = json!(final_component.source);
-                        page_status = "collected";
-                        page_detail = format!(
-                            "ADB 目标应用前台页面（目标包 {target_package}）：{}",
-                            final_component.source
-                        );
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            observed_at = now();
-            page_status = "failed";
-            page_detail = format!("未能自动读取目标应用前台页面：{error}");
-            snapshot["details"]["foregroundPackage"] = json!("");
-            snapshot["details"]["foregroundActivity"] = json!("");
-            snapshot["details"]["foregroundSource"] = json!("");
-        }
-    }
-    let activity = string(&snapshot, "details.foregroundActivity");
-    let package = string(&snapshot, "details.foregroundPackage");
-    let bug_page = if package == target_package && !activity.is_empty() {
-        component_page(&ForegroundComponent {
-            package,
-            activity,
-            source: "snapshot",
-        })
-    } else {
-        String::new()
-    };
-    snapshot["bugPage"] = json!(bug_page);
-    snapshot["sources"]["bugPage"] = json!({
-        "status": page_status,
-        "at": observed_at,
-        "detail": page_detail,
-    });
     Ok(snapshot)
-}
-
-pub struct PageObserver {
-    pub draft_id: String,
-    stop: watch::Sender<bool>,
-    task: tauri::async_runtime::JoinHandle<()>,
-}
-
-impl PageObserver {
-    fn stop(&self) {
-        crate::diagnostics::event("page_observer", "stop requested");
-        let _ = self.stop.send(true);
-        self.task.abort();
-    }
-}
-
-impl Drop for PageObserver {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-pub fn stop_page_observer(observer: PageObserver) {
-    observer.stop();
-}
-
-#[derive(Clone)]
-pub struct PageObservationTarget {
-    pub store: Store,
-    pub draft_id: String,
-    pub scope: String,
-    pub package: String,
-}
-
-pub fn record_observed_page(
-    target: &PageObservationTarget,
-    page: &str,
-    source: &str,
-    observed_at: &str,
-    generation: Option<(&AtomicU64, u64)>,
-) -> Result<bool> {
-    let _write = target.store.writes.lock().unwrap();
-    if generation.is_some_and(|(current, expected)| {
-        current.load(std::sync::atomic::Ordering::SeqCst) != expected
-    }) {
-        return Ok(false);
-    }
-    if target
-        .store
-        .get::<String>("draft_scope", &target.draft_id)?
-        .as_deref()
-        != Some(&target.scope)
-        || target.store.editable(&target.draft_id).is_err()
-    {
-        return Ok(false);
-    }
-    let mut draft = match target.store.get::<Value>("draft", &target.draft_id)? {
-        Some(draft) => draft,
-        None => return Ok(false),
-    };
-    if string(&draft, "app.packageName") != target.package {
-        return Ok(false);
-    }
-    if draft["sources"]["bugPage"]["status"] == "manual" {
-        return Ok(true);
-    }
-    if string(&draft, "bugPage") == page && draft["sources"]["bugPage"]["status"] == "collected" {
-        return Ok(true);
-    }
-    draft["bugPage"] = json!(page);
-    draft["sources"]["bugPage"] = json!({
-        "status": "collected",
-        "at": observed_at,
-        "detail": format!("ADB 持续前台观察（目标包 {}）：{source}", target.package),
-    });
-    draft["previewConfirmed"] = json!(false);
-    draft["updatedAt"] = json!(now());
-    target.store.put("draft", &target.draft_id, &draft)?;
-    Ok(true)
-}
-
-pub fn start_page_observer(
-    path: PathBuf,
-    serial: String,
-    target: PageObservationTarget,
-    generation: Arc<AtomicU64>,
-    expected_generation: u64,
-) -> PageObserver {
-    crate::diagnostics::event("page_observer", "started");
-    let (stop, mut cancelled) = watch::channel(false);
-    let observer_draft_id = target.draft_id.clone();
-    let task = tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut collection_error_logged = false;
-        loop {
-            tokio::select! {
-                changed = cancelled.changed() => {
-                    if changed.is_err() || *cancelled.borrow() { break; }
-                }
-                _ = interval.tick() => {}
-            }
-            let component = tokio::select! {
-                changed = cancelled.changed() => {
-                    if changed.is_err() || *cancelled.borrow() { break; }
-                    continue;
-                }
-                result = foreground(&path, &serial) => result,
-            };
-            let component = match component {
-                Ok(component) => {
-                    collection_error_logged = false;
-                    component
-                }
-                Err(_) => {
-                    if !collection_error_logged {
-                        crate::diagnostics::event("page_observer", "foreground read failed");
-                        collection_error_logged = true;
-                    }
-                    continue;
-                }
-            };
-            let Some(page) = target_component_page(&component, &target.package) else {
-                continue;
-            };
-            let observed_at = now();
-            match record_observed_page(
-                &target,
-                &page,
-                component.source,
-                &observed_at,
-                Some((&generation, expected_generation)),
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    crate::diagnostics::event("page_observer", "stopped because scope changed");
-                    break;
-                }
-                Err(_) => {
-                    crate::diagnostics::event("page_observer", "stopped after persistence error");
-                    break;
-                }
-            }
-        }
-        crate::diagnostics::event("page_observer", "task ended");
-    });
-    PageObserver {
-        draft_id: observer_draft_id,
-        stop,
-        task,
-    }
 }
 
 pub async fn snapshot(path: &Path, serial: &str, package: &str) -> Result<Value> {
@@ -1406,111 +1071,52 @@ mod gap_tests {
     }
 
     #[test]
-    fn foreground_parser_accepts_resumed_and_focused_formats_only() {
-        let resumed = parse_foreground_components(
-            "mResumedActivity: ActivityRecord{abc u0 com.example.app/.MainActivity t12}",
-            "resumed",
-        );
-        assert_eq!(resumed[0].package, "com.example.app");
-        assert_eq!(resumed[0].activity, ".MainActivity");
-        let focused = parse_foreground_components(
-            "mCurrentFocus=Window{abc u0 com.vendor.app/com.vendor.app.Home}",
-            "focused",
-        );
-        assert_eq!(focused[0].package, "com.vendor.app");
-        assert!(parse_foreground_components(
-            "uid=1000 com.bad.process\nrandom com.evil.app/.Injected\nmFocusedApp: null",
-            "focused"
-        )
-        .is_empty());
-        assert!(parse_foreground_components(
-            "debug resumedactivity com.evil.app/.Injected",
-            "resumed"
-        )
-        .is_empty());
-    }
-
-    #[test]
-    fn foreground_rejects_conflicting_and_system_overlay_candidates() {
-        let resumed = parse_foreground_components(
-            "mResumedActivity: ActivityRecord{u0 com.one.app/.A}",
-            "resumed",
-        );
-        let focused =
-            parse_foreground_components("mCurrentFocus=Window{u0 com.two.app/.B}", "focused");
-        assert_ne!(resumed[0].package, focused[0].package);
-        assert!(system_overlay("com.android.systemui"));
-        assert!(!system_overlay("com.example.app"));
-    }
-
-    #[test]
-    fn target_page_accepts_only_the_configured_package() {
-        let target = ForegroundComponent {
-            package: "com.photo.recovery.global.tt".into(),
-            activity: ".page.ResultActivity".into(),
-            source: "focused",
-        };
-        assert_eq!(
-            target_component_page(&target, "com.photo.recovery.global.tt").as_deref(),
-            Some("com.photo.recovery.global.tt.page.ResultActivity")
-        );
-        let launcher = ForegroundComponent {
-            package: "com.google.android.apps.nexuslauncher".into(),
-            activity: ".NexusLauncherActivity".into(),
-            source: "focused",
-        };
-        assert_eq!(
-            target_component_page(&launcher, "com.photo.recovery.global.tt"),
-            None
-        );
-        let third_party_activity = json!({
-            "bugPage":"com.vendor.sdk.HostActivity",
+    fn legacy_bug_page_trust_keeps_manual_and_target_package_values_only() {
+        let automatic_target = json!({
+            "bugPage":"com.photo.recovery.global.tt.page.ResultActivity",
             "app":{"packageName":"com.photo.recovery.global.tt"},
-            "sources":{"bugPage":{
-                "status":"collected",
-                "at":"2026-10-12T00:00:00Z",
-                "detail":"ADB 持续前台观察（目标包 com.photo.recovery.global.tt）：focused"
-            }}
+            "sources":{"bugPage":{"status":"collected","detail":"旧版自动采集"}}
         });
-        assert!(draft_bug_page_is_trusted(&third_party_activity));
+        assert!(draft_bug_page_is_trusted(&automatic_target));
+        let automatic_foreign = json!({
+            "bugPage":"com.google.android.apps.nexuslauncher.NexusLauncherActivity",
+            "app":{"packageName":"com.photo.recovery.global.tt"},
+            "sources":{"bugPage":{"status":"collected","detail":"旧版自动采集"}}
+        });
+        assert!(!draft_bug_page_is_trusted(&automatic_foreign));
+        let manual = json!({
+            "bugPage":"人工确认的广告落地页",
+            "app":{"packageName":"com.photo.recovery.global.tt"},
+            "sources":{"bugPage":{"status":"manual","detail":"人工输入"}}
+        });
+        assert!(draft_bug_page_is_trusted(&manual));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn inspect_snapshot_fake_adb_reads_the_selected_device_foreground() {
+    async fn inspect_snapshot_does_not_read_or_return_foreground_activity() {
         let temp = tempfile::tempdir().unwrap();
         let adb = fake_adb(
             temp.path(),
-            "if [ \"$4\" = dumpsys ] && [ \"$5\" = activity ]; then printf '%s\\n' 'mResumedActivity: ActivityRecord{abc u0 com.example.app/.MainActivity t1}'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$5\" = window ]; then printf '%s\\n' 'mCurrentFocus=Window{abc u0 com.example.app/.MainActivity}'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.product.model ]; then printf 'Pixel Fake\\n'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.build.version.release ]; then printf '14\\n'; exit 0; fi\nif [ \"$4\" = cat ]; then printf 'MemTotal: 1234 kB\\nMemAvailable: 456 kB\\n'; exit 0; fi\nif [ \"$4\" = wm ]; then printf 'Physical size: 1080x2400\\n'; exit 0; fi\nif [ \"$4\" = am ]; then printf '0\\n'; exit 0; fi\nif [ \"$4\" = pm ]; then printf 'package:com.example.app\\n'; exit 0; fi\nif [ \"$4\" = date ]; then printf '2026-10-09T12:00:00+0800\\n'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$6\" = com.example.app ]; then printf 'versionName=1.2.3\\nversionCode=42\\n'; exit 0; fi\nexit 0",
+            r#"if [ "$4" = dumpsys ] && { [ "$5" = activity ] || [ "$5" = window ]; }; then exit 91; fi
+if [ "$4" = getprop ] && [ "$5" = ro.product.model ]; then printf 'Pixel Fake\n'; exit 0; fi
+if [ "$4" = getprop ] && [ "$5" = ro.build.version.release ]; then printf '14\n'; exit 0; fi
+if [ "$4" = cat ]; then printf 'MemTotal: 1234 kB\nMemAvailable: 456 kB\n'; exit 0; fi
+if [ "$4" = wm ]; then printf 'Physical size: 1080x2400\n'; exit 0; fi
+if [ "$4" = am ]; then printf '0\n'; exit 0; fi
+if [ "$4" = pm ]; then printf 'package:com.example.app\n'; exit 0; fi
+if [ "$4" = date ]; then printf '2026-10-09T12:00:00+0800\n'; exit 0; fi
+if [ "$4" = dumpsys ] && [ "$6" = com.example.app ]; then printf 'versionName=1.2.3\nversionCode=42\n'; exit 0; fi
+exit 0"#,
         );
         let value = inspect_snapshot(&adb, "USB-A", "com.example.app")
             .await
             .unwrap();
         assert_eq!(value["app"]["packageName"], "com.example.app");
         assert_eq!(value["device"]["model"], "Pixel Fake");
-        assert_eq!(value["bugPage"], "com.example.app.MainActivity");
-        assert_eq!(value["sources"]["bugPage"]["status"], "collected");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn inspect_snapshot_does_not_record_the_launcher_as_the_bug_page() {
-        let temp = tempfile::tempdir().unwrap();
-        let adb = fake_adb(
-            temp.path(),
-            "if [ \"$4\" = dumpsys ] && [ \"$5\" = activity ]; then printf '%s\\n' 'mResumedActivity: ActivityRecord{abc u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity t1}'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$5\" = window ]; then printf '%s\\n' 'mCurrentFocus=Window{abc u0 com.google.android.apps.nexuslauncher/.NexusLauncherActivity}'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.product.model ]; then printf 'Pixel Fake\\n'; exit 0; fi\nif [ \"$4\" = getprop ] && [ \"$5\" = ro.build.version.release ]; then printf '14\\n'; exit 0; fi\nif [ \"$4\" = cat ]; then printf 'MemTotal: 1234 kB\\nMemAvailable: 456 kB\\n'; exit 0; fi\nif [ \"$4\" = wm ]; then printf 'Physical size: 1080x2400\\n'; exit 0; fi\nif [ \"$4\" = am ]; then printf '0\\n'; exit 0; fi\nif [ \"$4\" = pm ]; then printf 'package:com.photo.recovery.global.tt\\n'; exit 0; fi\nif [ \"$4\" = date ]; then printf '2026-10-09T12:00:00+0800\\n'; exit 0; fi\nif [ \"$4\" = dumpsys ] && [ \"$6\" = com.photo.recovery.global.tt ]; then printf 'versionName=1.2.3\\nversionCode=42\\n'; exit 0; fi\nexit 0",
-        );
-        let value = inspect_snapshot(&adb, "USB-A", "com.photo.recovery.global.tt")
-            .await
-            .unwrap();
-        assert_eq!(value["bugPage"], "");
-        assert_eq!(value["sources"]["bugPage"]["status"], "not_applicable");
-        assert!(string(&value, "sources.bugPage.detail").contains("不一致"));
-        assert!(!value["errors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|error| error.as_str().unwrap_or_default().contains("Launcher")));
+        assert!(value.get("bugPage").is_none());
+        assert!(value["sources"].get("bugPage").is_none());
+        assert!(value["details"].get("foregroundActivity").is_none());
     }
 
     #[cfg(unix)]

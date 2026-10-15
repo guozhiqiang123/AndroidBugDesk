@@ -1,5 +1,7 @@
 # Bug 所在页面采集修正计划
 
+> 2026-10-15：本方案中的自动读取与持续观察已停止使用。“Bug所在页面”现为纯人工选填；需要设备侧页面与任务关系时使用“Activity任务栈”补采项。现行方案见 [`activity-stack-capture.md`](activity-stack-capture.md)。
+
 日期：2026-10-12
 状态：已完成
 

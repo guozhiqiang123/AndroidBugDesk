@@ -222,7 +222,6 @@ pub fn save_project_settings(
     settings: ProjectSettings,
     state: State<'_, AppState>,
 ) -> Result<ProjectSettings> {
-    state.stop_page_observer();
     save_for_state(&state, &organization_id, settings)
 }
 

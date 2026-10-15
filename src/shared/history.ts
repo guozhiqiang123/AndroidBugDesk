@@ -23,6 +23,7 @@ export const historyKinds = [
   "动态过程",
   "崩溃",
   "ANR",
+  "广告",
   "性能",
   "网络",
   "数据",

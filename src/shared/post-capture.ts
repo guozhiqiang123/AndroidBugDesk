@@ -5,6 +5,7 @@ export const captureItems = [
   { id: "screenshot", name: "当前截图" },
   { id: "ui", name: "当前界面层级" },
   { id: "app", name: "应用与进程状态" },
+  { id: "activities", name: "Activity任务栈" },
   { id: "display", name: "窗口与显示状态" },
   { id: "locale", name: "语言与字体配置" },
   { id: "crash", name: "崩溃日志" },
@@ -62,12 +63,13 @@ export function splitPostCaptureAttachmentDescription(
 }
 
 const extras: Record<Draft["kind"], CaptureItemId[]> = {
-  功能: ["ui", "app"],
-  UI: ["ui", "display"],
+  功能: ["ui", "app", "activities"],
+  UI: ["ui", "display", "activities"],
   多语言: ["ui", "locale", "display"],
-  动态过程: ["ui", "app"],
-  崩溃: ["crash", "exit", "app"],
-  ANR: ["crash", "exit", "app", "display", "memory", "bugreport"],
+  动态过程: ["ui", "app", "activities"],
+  崩溃: ["crash", "exit", "app", "activities"],
+  ANR: ["crash", "exit", "app", "activities", "display", "memory", "bugreport"],
+  广告: ["app", "activities"],
   性能: ["memory", "frames", "cpu"],
   网络: ["network"],
   数据: ["storage", "app"],

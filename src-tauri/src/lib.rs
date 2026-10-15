@@ -99,7 +99,6 @@ pub fn run() {
                 if let Some(c) = state.collector.lock().unwrap().as_ref() {
                     let _ = c.stop.send(true);
                 }
-                state.stop_page_observer();
                 diagnostics::event("app", "exit requested");
                 let _ = diagnostics::flush(std::time::Duration::from_millis(200));
                 if let Some(t) = state.token.lock().unwrap().as_mut() {

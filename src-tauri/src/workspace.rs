@@ -61,7 +61,6 @@ fn auth_result(status: &str, user: Option<UserIdentity>, message: &str) -> AuthR
     }
 }
 pub fn invalidate(state: &AppState) {
-    state.stop_page_observer();
     let mut user = state.user.lock().unwrap();
     state.auth_epoch.fetch_add(1, Ordering::SeqCst);
     *user = None;
@@ -306,6 +305,7 @@ pub fn sanitize_selections(selection: &Value, metadata: &Metadata) -> Value {
         "动态过程",
         "崩溃",
         "ANR",
+        "广告",
         "性能",
         "网络",
         "数据",

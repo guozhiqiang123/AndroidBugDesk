@@ -159,6 +159,18 @@ function replacePreviewSource(
   if (changed) editor.view.dispatch(transaction.setMeta("addToHistory", false));
 }
 
+function ensureLeadingParagraphBeforeImage(editor: Editor) {
+  const first = editor.state.doc.firstChild;
+  const paragraph = editor.schema.nodes.paragraph;
+  if (!first || first.type.name !== "image" || !paragraph) return false;
+  editor.view.dispatch(
+    editor.state.tr
+      .insert(0, paragraph.create())
+      .setMeta("addToHistory", false),
+  );
+  return true;
+}
+
 function imageFromPaste(event: ClipboardEvent) {
   const files = Array.from(event.clipboardData?.files ?? []);
   const file = files.find((candidate) => candidate.type.startsWith("image/"));
@@ -246,7 +258,11 @@ export function MarkdownEditor({
         return true;
       },
     },
+    onCreate: ({ editor: current }) => {
+      ensureLeadingParagraphBeforeImage(current);
+    },
     onUpdate: ({ editor: current }) => {
+      if (ensureLeadingParagraphBeforeImage(current)) return;
       const markdown = current.getMarkdown();
       if (markdown === emitted.current) return;
       emitted.current = markdown;
@@ -269,6 +285,7 @@ export function MarkdownEditor({
       contentType: "markdown",
       emitUpdate: false,
     });
+    ensureLeadingParagraphBeforeImage(editor);
   }, [editor, value]);
 
   useEffect(() => {

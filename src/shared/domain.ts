@@ -87,6 +87,7 @@ export const draftSchema = z.strictObject({
     "动态过程",
     "崩溃",
     "ANR",
+    "广告",
     "性能",
     "网络",
     "数据",
@@ -213,7 +214,6 @@ export interface Device {
   label: string;
 }
 export interface Snapshot {
-  bugPage?: string;
   device: Draft["device"];
   app: Partial<Draft["app"]>;
   sources: Record<string, Source>;

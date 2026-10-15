@@ -836,31 +836,16 @@ function App() {
           if (!stored) return;
           setDraft((current) => {
             if (!current || current.id !== draftId) return current;
-            const keepManualPage = current.sources.bugPage?.status === "manual";
-            const storedPageSource = stored.sources.bugPage;
-            const pageChanged =
-              !keepManualPage &&
-              (current.bugPage !== stored.bugPage ||
-                JSON.stringify(current.sources.bugPage) !==
-                  JSON.stringify(storedPageSource));
             if (
               JSON.stringify(current.attachments) ===
                 JSON.stringify(stored.attachments) &&
               JSON.stringify(current.collectionErrors) ===
-                JSON.stringify(stored.collectionErrors) &&
-              !pageChanged
+                JSON.stringify(stored.collectionErrors)
             )
               return current;
             setPreview(false);
             return {
               ...current,
-              bugPage: keepManualPage ? current.bugPage : stored.bugPage,
-              sources: keepManualPage
-                ? current.sources
-                : {
-                    ...current.sources,
-                    ...(storedPageSource ? { bugPage: storedPageSource } : {}),
-                  },
               attachments: stored.attachments,
               collectionErrors: stored.collectionErrors,
               previewConfirmed: false,
@@ -1031,7 +1016,6 @@ function App() {
           ...(observed?.app ?? snapshot.app),
         };
         merged.device = { ...(observed?.device ?? snapshot.device) };
-        merged.bugPage = observed?.bugPage ?? snapshot.bugPage ?? "";
         merged.sources = {
           ...current.sources,
           ...(observed?.sources ?? snapshot.sources),
@@ -1687,9 +1671,7 @@ function App() {
           />
         )}
         {!text.trim() && draft?.sources[path]?.status === "failed" && (
-          <small className="error-text">
-            {path === "bugPage" ? "未能自动读取当前页面" : "未能自动读取该信息"}
-          </small>
+          <small className="error-text">未能自动读取该信息</small>
         )}
         {path === "bugPage" && draft?.sources.bugPage && (
           <small className="field-source-detail">
@@ -2523,7 +2505,7 @@ function App() {
                     })}
                     {field("bugPage", "Bug所在页面（选填）", {
                       fullWidth: true,
-                      hint: "自动记录目标应用最近一次前台页面，也可人工填写",
+                      hint: "可填写问题发生时所在页面，例如登录页、广告落地页",
                     })}
                     {field("expected", "期望表现（选填）", {
                       markdown: true,
@@ -2582,6 +2564,7 @@ function App() {
                         "动态过程",
                         "崩溃",
                         "ANR",
+                        "广告",
                         "性能",
                         "网络",
                         "数据",
@@ -3060,7 +3043,7 @@ function App() {
                       <dd>{draft.title}</dd>
                       <dt>Bug所在页面</dt>
                       <dd className="preserve">
-                        {draft.bugPage || "未采集"}
+                        {draft.bugPage || "未填写"}
                         {draft.sources.bugPage && (
                           <small className="preview-source-detail">
                             {sourceStatusLabel(draft.sources.bugPage)}

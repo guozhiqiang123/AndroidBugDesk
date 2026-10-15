@@ -93,6 +93,7 @@ fn attachments_are_optional_for_all_kinds() {
         "动态过程",
         "崩溃",
         "ANR",
+        "广告",
         "性能",
         "网络",
         "数据",
@@ -1388,8 +1389,7 @@ async fn inspect_device_command_persists_snapshot_and_rejects_unauthorized_befor
     let adb = store.root.join("fake-inspect-adb");
     std::fs::write(&adb, r#"#!/bin/sh
 if [ "$1" = devices ]; then printf 'List of devices attached\nUSB-A device product:x\nUSB-B unauthorized\n'; exit 0; fi
-if [ "$4" = dumpsys ] && [ "$5" = activity ]; then printf 'mResumedActivity: ActivityRecord{u0 com.example.app/.Main t1}\n'; exit 0; fi
-if [ "$4" = dumpsys ] && [ "$5" = window ]; then printf 'mCurrentFocus=Window{u0 com.example.app/.Main}\n'; exit 0; fi
+if [ "$4" = dumpsys ] && { [ "$5" = activity ] || [ "$5" = window ]; }; then exit 91; fi
 if [ "$4" = getprop ] && [ "$5" = ro.product.model ]; then printf 'Pixel Fake\n'; exit 0; fi
 if [ "$4" = getprop ] && [ "$5" = ro.build.version.release ]; then printf '14\n'; exit 0; fi
 if [ "$4" = cat ]; then printf 'MemTotal: 1234 kB\nMemAvailable: 456 kB\n'; exit 0; fi
@@ -1409,7 +1409,8 @@ exit 0
     let snapshot = crate::commands::inspect_device(id.clone(), "USB-A".into(), app.state())
         .await
         .unwrap();
-    assert_eq!(snapshot["details"]["foregroundActivity"], ".Main");
+    assert!(snapshot["details"].get("foregroundActivity").is_none());
+    assert!(snapshot.get("bugPage").is_none());
     let saved = app
         .state::<crate::commands::AppState>()
         .store

@@ -35,6 +35,12 @@ describe("事后补采组合和重试", () => {
         "事后补采诊断；采集项：当前界面层级；时间及范围见 receipt.json",
       ),
     ).toBe("事后补采诊断；采集项：当前界面层级；时间及范围见 receipt.json");
+    expect(
+      describePostCaptureAttachment(
+        "post-capture-activities.zip",
+        "事后补采诊断；时间及范围见 receipt.json",
+      ),
+    ).toContain("采集项：Activity任务栈");
     expect(describePostCaptureAttachment("manual.png", "用户导入文件")).toBe(
       "用户导入文件",
     );
@@ -65,12 +71,16 @@ describe("事后补采组合和重试", () => {
   });
 
   it.each([
-    ["功能", ["ui", "app"]],
-    ["UI", ["ui", "display"]],
+    ["功能", ["ui", "app", "activities"]],
+    ["UI", ["ui", "display", "activities"]],
     ["多语言", ["ui", "locale", "display"]],
-    ["动态过程", ["ui", "app"]],
-    ["崩溃", ["crash", "exit", "app"]],
-    ["ANR", ["crash", "exit", "app", "display", "memory", "bugreport"]],
+    ["动态过程", ["ui", "app", "activities"]],
+    ["崩溃", ["crash", "exit", "app", "activities"]],
+    [
+      "ANR",
+      ["crash", "exit", "app", "activities", "display", "memory", "bugreport"],
+    ],
+    ["广告", ["app", "activities"]],
     ["性能", ["memory", "frames", "cpu"]],
     ["网络", ["network"]],
     ["数据", ["storage", "app"]],
@@ -129,6 +139,7 @@ describe("事后补采组合和重试", () => {
     expect(recommendedUncollectedItems("功能", [newer, older])).toEqual([
       "ui",
       "app",
+      "activities",
     ]);
   });
 });

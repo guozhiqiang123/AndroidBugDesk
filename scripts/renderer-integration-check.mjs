@@ -93,6 +93,8 @@ checks: try {
   fixture.customFields.plannedStartDate = "invalid-old-date";
   fixture.customFields.notFixReason = "stale-reason";
   fixture.customFields.legacyHidden = "旧值不应显示";
+  fixture.bugPage = "";
+  delete fixture.sources.bugPage;
   if (process.env.QA_SCOPE === "input-hints") {
     for (const [id, name, format, required, value] of [
       ["hintText", "必填说明", "text", true, "模拟说明"],
@@ -368,7 +370,6 @@ checks: try {
           if (cmd === "inspect_device") {
             if (q.failDevice) throw "模拟设备读取失败";
             const snapshot = {
-              bugPage: q.missingPage ? "" : "com.example.mock.MainActivity",
               device: {
                 model: "Pixel Mock",
                 androidVersion: "14",
@@ -383,11 +384,6 @@ checks: try {
                 versionCode: "123",
               },
               sources: {
-                bugPage: {
-                  status: q.missingPage ? "failed" : "collected",
-                  at: "2026-10-09T00:00:00Z",
-                  detail: "ADB mock page",
-                },
                 "app.packageName": {
                   status: "collected",
                   at: "2026-10-09T00:00:00Z",
@@ -400,19 +396,13 @@ checks: try {
                 },
               },
               errors: [],
-              details: { foregroundActivity: "com.example.mock/.MainActivity" },
+              details: {},
               deviceTime: "2026-10-09T00:00:00Z",
               capturedAt: "2026-10-09T00:00:00Z",
             };
             Object.assign(draft().app, snapshot.app);
             Object.assign(draft().device, snapshot.device);
-            const keepExisting =
-              draft().sources.bugPage?.status === "manual" ||
-              (!snapshot.bugPage && !!draft().bugPage);
-            if (!keepExisting) draft().bugPage = snapshot.bugPage;
-            const priorPageSource = draft().sources.bugPage;
             draft().sources = { ...draft().sources, ...snapshot.sources };
-            if (keepExisting) draft().sources.bugPage = priorPageSource;
             return clone(snapshot);
           }
           if (cmd === "start_session")
@@ -1171,7 +1161,7 @@ checks: try {
     );
     assert.equal(
       await captureDialog.getByRole("checkbox").count(),
-      14,
+      15,
       "环境快照不在补采选项中重复出现",
     );
     assert.equal(await captureDialog.getByText("设备与应用环境").count(), 0);
@@ -1182,7 +1172,11 @@ checks: try {
           .filter((node) => node.checked)
           .map((node) => node.parentElement.textContent.trim()),
       );
-    assert.deepEqual(checked, ["当前界面层级", "应用与进程状态"]);
+    assert.deepEqual(checked, [
+      "当前界面层级",
+      "应用与进程状态",
+      "Activity任务栈",
+    ]);
     assert.equal(
       await captureDialog.locator("section.post-capture-result").count(),
       1,
@@ -1380,7 +1374,7 @@ checks: try {
     await page
       .locator("#field-actual")
       .screenshot({ path: path.join(output, "empty-actual.png") });
-    await input("actual").fill(saved.actual);
+    await input("actual").fill("");
     await input("actual").evaluate((node) => {
       const clipboard = new DataTransfer();
       clipboard.items.add(
@@ -1406,6 +1400,23 @@ checks: try {
     assert.equal(pasteCall.args.field, "actual");
     assert.equal(pasteCall.args.name, "clipboard.png");
     assert.ok(pasteCall.args.dataBase64);
+    const leadingImageParagraph = page.locator(
+      "#field-actual .markdown-editor-content > p:first-child",
+    );
+    const leadingImage = page.locator(
+      "#field-actual .markdown-editor-content > p:first-child + .react-renderer .markdown-image-node",
+    );
+    await leadingImage.waitFor();
+    const [paragraphBox, imageBox] = await Promise.all([
+      leadingImageParagraph.boundingBox(),
+      leadingImage.boundingBox(),
+    ]);
+    assert.ok(paragraphBox && imageBox);
+    assert.ok(paragraphBox.height >= 16);
+    assert.ok(paragraphBox.y < imageBox.y);
+    await input("actual").press("ArrowUp");
+    await input("actual").pressSequentially("图片前说明");
+    assert.equal(await leadingImageParagraph.textContent(), "图片前说明");
     const removePastedImage = page.getByRole("button", {
       name: "移除图片 clipboard.png",
     });
@@ -1433,7 +1444,7 @@ checks: try {
     await page
       .locator("#field-actual .markdown-editor-content img")
       .waitFor({ state: "detached" });
-    assert.equal(await inputValue("actual"), saved.actual);
+    assert.equal(await inputValue("actual"), "图片前说明");
     await input("actual").fill(saved.actual);
     await input("steps").fill("3331111\n444\n555\n666");
     assert.equal(await messages("steps").count(), 0);
@@ -1573,6 +1584,7 @@ checks: try {
           scenarios: [
             "required and optional problem inputs use hints without duplicate empty prompts and only required values block preview",
             "clipboard image paste inserts an inline Markdown image without a file-picker workflow",
+            "an image pasted as the first content keeps a clickable text line before it, and typing there stays before the image",
             "pasted image exposes a close control that removes only that image from editable Markdown while read-only preview has no removal action",
             "dynamic required text uses an input hint",
             "nonblank reproduction steps do not use a subjective per-line length gate",
@@ -2322,7 +2334,7 @@ checks: try {
       await page.getByRole("checkbox", { name: /事后补采/ }).count(),
       0,
     );
-    for (const name of ["功能", "UI", "多语言", "动态过程"]) {
+    for (const name of ["功能", "UI", "多语言", "动态过程", "广告"]) {
       await emptyKind.click();
       await page.getByRole("option", { name, exact: true }).click();
       assert.equal(
@@ -2613,8 +2625,9 @@ checks: try {
   const previewText = await previewDialog.locator(".preview").innerText();
   assert.match(previewText, /Jenkins包地址/);
   assert.match(previewText, /Bug所在页面/);
-  assert.match(previewText, /com\.example\.mock\.MainActivity/);
-  assert.match(previewText, /自动采集/);
+  assert.match(previewText, /未填写/);
+  assert.doesNotMatch(previewText, /com\.example\.mock\.MainActivity/);
+  assert.match(previewText, /来源未记录/);
   assert.match(
     previewText,
     /https:\/\/jenkins\.example\.test\/job\/android\/128\/artifact\/app\.apk/,
@@ -2643,9 +2656,10 @@ checks: try {
     () => document.activeElement?.textContent?.trim() === "进入提交预览",
   );
   const bugPageField = page.locator('[id="field-bugPage"]');
-  assert.match(
-    await bugPageField.locator(".field-source-detail").innerText(),
-    /ADB mock page/,
+  assert.equal(await bugPageField.locator(".field-source-detail").count(), 0);
+  assert.equal(
+    await bugPageField.locator("input").getAttribute("placeholder"),
+    "可填写问题发生时所在页面，例如登录页、广告落地页",
   );
   await bugPageField.locator("input").fill("人工确认的页面");
   await page.getByRole("button", { name: "保存草稿", exact: true }).click();
@@ -3269,7 +3283,7 @@ checks: try {
           "settings package mapping synchronizes the hidden collected package identity",
           "title and actual behavior are required while Jenkins package address and the remaining problem fields are optional; manual time inputs are absent",
           "title, actual behavior, and Jenkins package address each span a full row across three viewport sizes",
-          "Bug page shows source details and manual values or manual clearing survive device refresh",
+          "Bug page is manual-only and manual values or manual clearing survive device refresh",
           "blank problem fields block preview and navigate to the corresponding field",
           "field errors use Chinese navigation labels without summary duplication",
           "frequency errors navigate locally and late capture does not require attachments",
@@ -3279,7 +3293,7 @@ checks: try {
           "device read failure stays below device selector and clears after retry",
           "login errors render below the PAT input",
           "nickname from mock user",
-          "device discovery reads foreground activity and merged app/device fields",
+          "device discovery reads merged app/device fields without collecting foreground activity",
           "bound session disables device refresh",
           "homepage removes versions selector and retains sprint selector",
           "settings page owns organization and logout controls",

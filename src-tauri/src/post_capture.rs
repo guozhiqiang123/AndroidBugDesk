@@ -14,6 +14,7 @@ pub const ITEMS: &[&str] = &[
     "screenshot",
     "ui",
     "app",
+    "activities",
     "display",
     "locale",
     "crash",
@@ -33,6 +34,7 @@ fn item_name(item: &str) -> &'static str {
         "screenshot" => "当前截图",
         "ui" => "当前界面层级",
         "app" => "应用与进程状态",
+        "activities" => "Activity任务栈",
         "display" => "窗口与显示状态",
         "locale" => "语言与字体配置",
         "crash" => "崩溃日志",
@@ -182,7 +184,6 @@ pub async fn start_post_capture(
 ) -> Result<Value> {
     let job = prepare(&state, &id, &serial, items, retry_of).await?;
     let job_id = string(&job, "id");
-    let observer_paused = state.stop_page_observer_for_draft(&id);
     tauri::async_runtime::spawn(async move {
         let worker_app = app.clone();
         let worker_job_id = job_id.clone();
@@ -198,16 +199,6 @@ pub async fn start_post_capture(
         if let Some(error) = failure {
             let state = app.state::<AppState>();
             let _ = interrupted(&state, &job_id, &error);
-        }
-        if observer_paused {
-            let state = app.state::<AppState>();
-            if let Err(error) = resume_page_observer(&state, &job_id) {
-                crate::diagnostics::debug_event(
-                    "page_observer",
-                    "resume_skipped",
-                    json!({"reason":error}),
-                );
-            }
         }
     });
     Ok(job)
@@ -233,40 +224,6 @@ pub async fn post_capture_status(state: State<'_, AppState>, id: String) -> Resu
         })
         .collect();
     Ok(json!({"draft":state.store.draft(&id)?,"jobs":jobs}))
-}
-fn resume_page_observer(state: &AppState, job_id: &str) -> Result<()> {
-    let job: Value = state
-        .store
-        .get("capture", job_id)?
-        .ok_or("补采任务不存在")?;
-    binding(state, &job)?;
-    let path = state.adb_path()?;
-    let draft_id = string(&job, "draftId");
-    let serial = string(&job, "serial");
-    let package = string(&job, "targetPackage");
-    let scope = string(&job, "scope");
-    let mut current = state.page_observer.lock().unwrap();
-    if current.is_some() {
-        return Ok(());
-    }
-    let observer_generation = state
-        .page_observer_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
-    *current = Some(adb::start_page_observer(
-        path,
-        serial,
-        adb::PageObservationTarget {
-            store: state.store.clone(),
-            draft_id,
-            scope,
-            package,
-        },
-        state.page_observer_generation.clone(),
-        observer_generation,
-    ));
-    crate::diagnostics::event("page_observer", "resumed after post capture");
-    Ok(())
 }
 fn interrupted(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let _write = state.store.writes.lock().unwrap();
@@ -376,6 +333,10 @@ fn commands(item: &str, package: &str, target_uid: Option<u32>) -> Vec<Vec<Strin
         "app" if !package.is_empty() => vec![
             app(&["shell", "dumpsys", "package"]),
             app(&["shell", "dumpsys", "activity", "processes"]),
+        ],
+        "activities" if !package.is_empty() => vec![
+            cmd(&["shell", "dumpsys", "activity", "-p", package, "activities"]),
+            cmd(&["shell", "dumpsys", "activity", "-p", package, "recents"]),
         ],
         "exit" if !package.is_empty() => vec![app(&["shell", "dumpsys", "activity", "exit-info"])],
         "memory" if !package.is_empty() => vec![app(&["shell", "dumpsys", "meminfo"])],
@@ -610,6 +571,10 @@ async fn collect(
     let serial = string(job, "serial");
     let package = string(job, "targetPackage");
     let mut receipt = json!({"status":"running","startedAt":now(),"serial":serial,"targetPackage":package,"bugOccurredAt":job["bugOccurredAt"],"timeSemantics":job["timeSemantics"],"commands":[],"attachments":[]});
+    if item == "activities" {
+        receipt["activityStackSemantics"] =
+            json!("目标应用当前仍保留的 Activity 任务栈与最近任务；不是永久操作历史，系统回收或任务清除后可能缺失");
+    }
     if item == "bugreport" {
         operation.progress(json!({"phase":"command","commandIndex":1,"commandCount":1}));
         let mut captured = adb::bugreport(
@@ -1030,10 +995,17 @@ async fn collect(
             &files,
             &receipt,
         )?;
-        attachment.source = format!(
-            "事后补采诊断；采集项：{}；时间及范围见 receipt.json",
-            item_name(item)
-        );
+        attachment.source = if item == "activities" {
+            format!(
+                "事后补采诊断；采集项：{}；设备当前仍保留的任务栈与最近任务，不代表完整操作历史；时间及范围见 receipt.json",
+                item_name(item)
+            )
+        } else {
+            format!(
+                "事后补采诊断；采集项：{}；时间及范围见 receipt.json",
+                item_name(item)
+            )
+        };
         Some(attachment)
     } else {
         None

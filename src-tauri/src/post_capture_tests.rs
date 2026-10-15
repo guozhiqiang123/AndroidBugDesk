@@ -151,7 +151,7 @@ fn receipt(a: &Attachment) -> Value {
 }
 
 #[tokio::test]
-async fn environment_snapshot_finishes_while_status_and_page_updates_are_concurrent() {
+async fn environment_snapshot_finishes_while_status_reads_are_concurrent() {
     let temp = tempfile::tempdir().unwrap();
     let (app, original) = app(temp.path(), fake_adb(temp.path()));
     let state = app.state::<AppState>();
@@ -160,12 +160,6 @@ async fn environment_snapshot_finishes_while_status_and_page_updates_are_concurr
         .await
         .unwrap();
     let job_id = string(&job, "id");
-    let observation_target = adb::PageObservationTarget {
-        store: state.store.clone(),
-        draft_id: id.clone(),
-        scope: "alice:test-org:test-project:".into(),
-        package: "com.example.test".into(),
-    };
 
     let capture = execute(&state, &job_id);
     let status_polling = async {
@@ -175,29 +169,15 @@ async fn environment_snapshot_finishes_while_status_and_page_updates_are_concurr
         }
         Ok::<(), String>(())
     };
-    let page_updates = async {
-        for revision in 0..100 {
-            adb::record_observed_page(
-                &observation_target,
-                &format!("com.example.test/.Observed{revision}"),
-                "test",
-                &now(),
-                None,
-            )?;
-            tokio::task::yield_now().await;
-        }
-        Ok::<(), String>(())
-    };
 
-    let (capture_result, polling_result, page_result) =
+    let (capture_result, polling_result) =
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(capture, status_polling, page_updates)
+            tokio::join!(capture, status_polling)
         })
         .await
         .expect("environment snapshot concurrency timed out");
     capture_result.unwrap();
     polling_result.unwrap();
-    page_result.unwrap();
 
     let snapshot = post_capture_status(app.state(), id).await.unwrap();
     assert_eq!(snapshot["jobs"][0]["status"], "complete");
@@ -205,46 +185,6 @@ async fn environment_snapshot_finishes_while_status_and_page_updates_are_concurr
         .unwrap()
         .iter()
         .any(|attachment| attachment.name.starts_with("device-environment-snapshot-")));
-}
-
-#[tokio::test]
-async fn capture_lifecycle_pauses_and_then_resumes_the_same_draft_observer() {
-    let temp = tempfile::tempdir().unwrap();
-    let adb_path = fake_adb(temp.path());
-    let (app, original) = app(temp.path(), adb_path.clone());
-    let state = app.state::<AppState>();
-    let id = string(&original, "id");
-    let generation = state
-        .page_observer_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
-    *state.page_observer.lock().unwrap() = Some(adb::start_page_observer(
-        adb_path,
-        "USB-A".into(),
-        adb::PageObservationTarget {
-            store: state.store.clone(),
-            draft_id: id.clone(),
-            scope: "alice:test-org:test-project:".into(),
-            package: "com.example.test".into(),
-        },
-        state.page_observer_generation.clone(),
-        generation,
-    ));
-
-    let job = prepare(&state, &id, "USB-A", selected(&["environment"]), None)
-        .await
-        .unwrap();
-    assert!(state.stop_page_observer_for_draft(&id));
-    assert!(state.page_observer.lock().unwrap().is_none());
-    execute(&state, &string(&job, "id")).await.unwrap();
-    resume_page_observer(&state, &string(&job, "id")).unwrap();
-    assert!(state
-        .page_observer
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|observer| observer.draft_id == id));
-    state.stop_page_observer();
 }
 
 #[tokio::test]
@@ -303,6 +243,7 @@ async fn all_items_keep_original_identity_time_and_manual_inputs_with_complete_r
         ("screenshot", "当前截图"),
         ("ui", "当前界面层级"),
         ("app", "应用与进程状态"),
+        ("activities", "Activity任务栈"),
         ("display", "窗口与显示状态"),
         ("locale", "语言与字体配置"),
         ("crash", "崩溃日志"),
@@ -368,6 +309,25 @@ async fn all_items_keep_original_identity_time_and_manual_inputs_with_complete_r
     let log_argv = log["commands"][0]["argv"].as_array().unwrap();
     assert!(log_argv.iter().any(|arg| arg == "--uid=10123"));
     assert!(!log_argv.iter().any(|arg| arg == "crash"));
+    let activities = files
+        .iter()
+        .find(|a| a.name == "post-capture-activities.zip")
+        .unwrap();
+    let activities_receipt = receipt(activities);
+    assert_eq!(activities_receipt["commands"].as_array().unwrap().len(), 2);
+    for (index, command) in activities_receipt["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let argv = command["argv"].as_array().unwrap();
+        assert_eq!(argv[3], "dumpsys");
+        assert_eq!(argv[4], "activity");
+        assert_eq!(argv[5], "-p");
+        assert_eq!(argv[6], "com.example.test");
+        assert_eq!(argv[7], if index == 0 { "activities" } else { "recents" });
+    }
     assert!(files
         .iter()
         .find(|a| a.name == "bugreport-fake.zip")
