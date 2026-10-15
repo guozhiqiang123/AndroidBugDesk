@@ -665,13 +665,7 @@ pub fn report(d: &Value, p: &Profile) -> String {
         }
     }
     out.push_str("## 复现步骤\n\n");
-    for (i, s) in string(d, "steps")
-        .lines()
-        .filter(|s| !s.trim().is_empty())
-        .enumerate()
-    {
-        out.push_str(&format!("{}. {}\n", i + 1, md(s)));
-    }
+    out.push_str(&md(&string(d, "steps")));
     out.push_str(&format!("\n## 复现频率\n\n{}\n\n## 问题时间\n\n事件：{}\n原始标记：{}\n来源：{}\n依据：{}\n\n## 应用与设备\n\n应用：{}\n\n设备：{}\n",if bool_at(d,"frequency.firstDiscovery"){ "首次发现、尚未重复".into() }else{format!("{} 次尝试，{} 次发生",string(d,"frequency.attempts"),string(d,"frequency.occurrences"))},md(&string(d,"event.occurredAt")),md(&string(d,"event.originalAt")),md(&string(d,"event.source")),md(&string(d,"event.sourceNote")),md(&app.to_string()),md(&d["device"].to_string())));
     let gaps = d["collectionErrors"]
         .as_array()
@@ -768,6 +762,17 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
     let id = uuid();
     let dir = store.root.join("evidence").join(&id);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let markdown_assets = crate::markdown_assets::snapshot(&store.root, d)?;
+    let mut markdown_files = Vec::new();
+    if !markdown_assets.is_empty() {
+        fs::create_dir_all(dir.join("markdown-images")).map_err(|e| e.to_string())?;
+    }
+    for asset in &markdown_assets {
+        let name = crate::markdown_assets::local_file_name(asset)?;
+        let relative = format!("markdown-images/{name}");
+        fs::copy(&asset.path, dir.join(&relative)).map_err(|e| e.to_string())?;
+        markdown_files.push((asset, relative));
+    }
     let mut files = Vec::new();
     for mut a in attachments(d)? {
         verify_attachment(&a)?;
@@ -788,7 +793,8 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
         "scope":{"organizationId":p.organization_id,"projectId":p.project_id,"versions":d["versions"],"sprint":d["sprint"],"multicaParentTaskId":null},
         "installedArtifact":{"identity":d["app"]},
         "problem":{"jenkinsPackageUrl":d["jenkinsPackageUrl"],"kind":d["kind"],"title":d["title"],"bugPage":effective_bug_page(d),"preconditions":d["preconditions"],"steps":d["steps"],"expected":d["expected"],"actual":d["actual"],"frequency":d["frequency"],"event":d["event"],"network":d["network"],"data":d["data"]},"device":{"effective":d["device"],"snapshot":snapshot},"collection":d["sources"],"gaps":d["collectionErrors"],
-        "files":files.iter().map(|a|json!({"id":a.id,"relativePath":Path::new(&a.path).strip_prefix(&dir).unwrap().to_string_lossy(),"mime":a.mime,"size":a.size,"sha256":a.sha256,"role":a.role,"source":a.source,"derivedFrom":a.derived_from,"includedInZip":include_media || !["image","video"].contains(&a.role.as_str()),"coverage":{"start":a.coverage_start,"end":a.coverage_end}})).collect::<Vec<_>>()});
+        "files":files.iter().map(|a|json!({"id":a.id,"relativePath":Path::new(&a.path).strip_prefix(&dir).unwrap().to_string_lossy(),"mime":a.mime,"size":a.size,"sha256":a.sha256,"role":a.role,"source":a.source,"derivedFrom":a.derived_from,"includedInZip":include_media || !["image","video"].contains(&a.role.as_str()),"coverage":{"start":a.coverage_start,"end":a.coverage_end}})).collect::<Vec<_>>(),
+        "markdownAssets":markdown_files.iter().map(|(asset,relative)|json!({"id":asset.id,"field":asset.field,"relativePath":relative,"mime":asset.mime,"size":asset.size,"sha256":asset.sha256,"width":asset.width,"height":asset.height})).collect::<Vec<_>>()});
     for (name, value) in [
         ("manifest.json", manifest),
         (
@@ -801,7 +807,8 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
         fs::write(dir.join(name), serde_json::to_vec_pretty(&value).unwrap())
             .map_err(|e| e.to_string())?;
     }
-    fs::write(dir.join("report.md"), report(d, p)).map_err(|e| e.to_string())?;
+    let local_report = crate::markdown_assets::render_local(&report(d, p), &markdown_assets)?;
+    fs::write(dir.join("report.md"), local_report).map_err(|e| e.to_string())?;
     let zip_path = dir.with_extension("zip");
     let f = File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(f);
@@ -832,6 +839,15 @@ pub fn build(store: &Store, d: &Value, p: &Profile, include_media: bool) -> Resu
             .map_err(|e| e.to_string())?;
         std::io::copy(
             &mut File::open(&a.path).map_err(|e| e.to_string())?,
+            &mut zip,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for (_, relative) in &markdown_files {
+        zip.start_file(format!("{id}/{relative}"), opts)
+            .map_err(|e| e.to_string())?;
+        std::io::copy(
+            &mut File::open(dir.join(relative)).map_err(|e| e.to_string())?,
             &mut zip,
         )
         .map_err(|e| e.to_string())?;

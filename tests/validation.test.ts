@@ -59,23 +59,19 @@ describe("提交门槛", () => {
     Object.assign(v.app, { obfuscation: "已混淆" });
     expect(draftSchema.safeParse(v).success).toBe(false);
   });
+  it.each(["title", "workitemTypeId", "assignedTo", "actual"])(
+    "缺少 %s 阻止提交",
+    (path) => {
+      const v = d();
+      const parts = path.split(".");
+      let obj = v as unknown as Record<string, unknown>;
+      for (const key of parts.slice(0, -1))
+        obj = obj[key] as Record<string, unknown>;
+      obj[parts.at(-1)!] = "";
+      expect(check(v).length).toBeGreaterThan(0);
+    },
+  );
   it.each([
-    "jenkinsPackageUrl",
-    "title",
-    "workitemTypeId",
-    "assignedTo",
-    "actual",
-  ])("缺少 %s 阻止提交", (path) => {
-    const v = d();
-    const parts = path.split(".");
-    let obj = v as unknown as Record<string, unknown>;
-    for (const key of parts.slice(0, -1))
-      obj = obj[key] as Record<string, unknown>;
-    obj[parts.at(-1)!] = "";
-    expect(check(v).length).toBeGreaterThan(0);
-  });
-  it.each([
-    ["jenkinsPackageUrl", "Jenkins包地址"],
     ["title", "问题标题"],
     ["actual", "问题表现"],
   ] as const)("%s 只有空白时在线与离线核对均阻止提交", (path, label) => {
@@ -90,6 +86,16 @@ describe("提交门槛", () => {
       ).toBe(true);
     }
   });
+  it.each(["", " \n\t ", "未知"])(
+    "Jenkins 包地址为选填内容 %j 时不阻止核对",
+    (value) => {
+      const v = d();
+      v.jenkinsPackageUrl = value;
+      for (const online of [true, false]) {
+        expect(validateDraft(v, m().profile, m(), true, online)).toEqual([]);
+      }
+    },
+  );
   it.each(["", "2026-10-09T08:00:00", "旧时间记录"])(
     "移除人工时间输入后内部时间 %j 及空依据不阻止核对",
     (occurredAt) => {

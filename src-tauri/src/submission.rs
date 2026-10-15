@@ -36,6 +36,7 @@ impl Submitter {
         for a in &attachments(&d)? {
             evidence::verify_attachment(a)?;
         }
+        let markdown_assets = crate::markdown_assets::snapshot(&self.store.root, &d)?;
         let evidence = evidence::build(&self.store, &d, &api.profile, false)?;
         let mut files = evidence.files.clone();
         let (size, _) = evidence::hash_file(Path::new(&evidence.zip_path))?;
@@ -77,6 +78,7 @@ impl Submitter {
             identifier: None,
             url: None,
             uploads,
+            markdown_assets,
             error: None,
             intended_at: now(),
             updated_at: now(),
@@ -126,6 +128,91 @@ impl Submitter {
         });
         Ok(files)
     }
+    fn markdown_attachment(asset: &MarkdownAsset) -> Attachment {
+        Attachment {
+            id: asset.id.clone(),
+            name: asset.name.clone(),
+            path: asset.path.clone(),
+            mime: asset.mime.clone(),
+            size: asset.size,
+            sha256: asset.sha256.clone(),
+            role: "image".into(),
+            source: "Markdown 编辑器粘贴".into(),
+            coverage_start: String::new(),
+            coverage_end: String::new(),
+            confirmed: true,
+            derived_from: None,
+        }
+    }
+    async fn upload_markdown_assets(
+        &self,
+        api: &Api,
+        workitem_id: &str,
+        submission: &mut Submission,
+    ) -> Result<()> {
+        for index in 0..submission.markdown_assets.len() {
+            let current = submission.markdown_assets[index].clone();
+            if current.state == "uploaded" {
+                continue;
+            }
+            if ["uploading", "unknown"].contains(&current.state.as_str()) {
+                return Err(format!(
+                    "正文图片 {} 上次上传结果不确定；为避免重复写入，请先在云效核对",
+                    current.name
+                ));
+            }
+            crate::markdown_assets::verify_integrity(
+                &self.store.root,
+                &submission.draft_id,
+                &current,
+            )?;
+            let attachment = Self::markdown_attachment(&current);
+            let remote_name = format!(
+                "inline-{}-{}",
+                current.id,
+                evidence::safe_name(&current.name)
+            );
+            submission.state = "uploading".into();
+            submission.markdown_assets[index].state = "uploading".into();
+            submission.markdown_assets[index].error.clear();
+            self.save(submission)?;
+            match api.upload(workitem_id, &attachment, &remote_name).await {
+                Ok(remote) => {
+                    let embed_markdown = if !remote.embed_markdown.trim().is_empty() {
+                        remote.embed_markdown.trim().to_owned()
+                    } else if !remote.embed_url.trim().is_empty() {
+                        let alt = current.name.replace(']', "\\]");
+                        format!("![{alt}]({})", remote.embed_url.trim())
+                    } else {
+                        submission.markdown_assets[index].state = "unknown".into();
+                        submission.markdown_assets[index].remote_id = Some(remote.id);
+                        submission.markdown_assets[index].error =
+                            "云效附件响应缺少正文嵌入地址".into();
+                        self.save(submission)?;
+                        return Err("云效附件响应缺少正文嵌入地址，停止覆盖描述".into());
+                    };
+                    submission.markdown_assets[index].remote_id = Some(remote.id);
+                    submission.markdown_assets[index].embed_markdown = embed_markdown;
+                    submission.markdown_assets[index].embed_url = remote.embed_url;
+                    submission.markdown_assets[index].state = "uploaded".into();
+                    submission.markdown_assets[index].error.clear();
+                    self.save(submission)?;
+                }
+                Err(error) => {
+                    submission.markdown_assets[index].state = if error.starts_with("[未写入]") {
+                        "local"
+                    } else {
+                        "unknown"
+                    }
+                    .into();
+                    submission.markdown_assets[index].error = error.clone();
+                    self.save(submission)?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
     async fn finish(&self, api: &Api, s: &mut Submission) -> Result<Submission> {
         let result = self.finish_inner(api, s).await;
         if let Err(e) = result {
@@ -140,6 +227,7 @@ impl Submitter {
             .workitem_id
             .clone()
             .ok_or("缺少真实工作项 ID，不能补传或重新创建")?;
+        self.upload_markdown_assets(api, &id, s).await?;
         let files = Self::upload_files(s)?;
         for (i, a) in files.iter().enumerate() {
             evidence::verify_attachment(a)?;
@@ -175,7 +263,7 @@ impl Submitter {
             self.save(s)?;
             match api.upload(&id, a, &s.uploads[i].name).await {
                 Ok(remote) => {
-                    s.uploads[i].remote_id = Some(remote);
+                    s.uploads[i].remote_id = Some(remote.id);
                     s.uploads[i].state = "unknown".into();
                     self.save(s)?;
                 }
@@ -217,6 +305,7 @@ impl Submitter {
             &s.uploads,
             true,
         )?;
+        let description = crate::markdown_assets::render_remote(&description, &s.markdown_assets)?;
         // A second read detects edits while attachments were being reconciled. API offers no cross-request CAS.
         let latest = api.get(&id).await?;
         if latest["description"] != remote["description"] {
@@ -241,7 +330,7 @@ impl Submitter {
         s.state = "submitted".into();
         s.error = None;
         self.save(s)?;
-        std::fs::write(Path::new(&s.evidence.directory).with_extension("receipt.json"),serde_json::to_vec_pretty(&json!({"organizationId":s.profile.organization_id,"projectId":s.profile.project_id,"workitemId":s.workitem_id,"identifier":s.identifier,"url":s.url,"attachments":s.uploads,"evidenceSha256":s.evidence.sha256,"submittedAt":now(),"state":s.state})).unwrap()).map_err(|e|e.to_string())?;
+        std::fs::write(Path::new(&s.evidence.directory).with_extension("receipt.json"),serde_json::to_vec_pretty(&json!({"organizationId":s.profile.organization_id,"projectId":s.profile.project_id,"workitemId":s.workitem_id,"identifier":s.identifier,"url":s.url,"attachments":s.uploads,"markdownAssets":s.markdown_assets,"evidenceSha256":s.evidence.sha256,"submittedAt":now(),"state":s.state})).unwrap()).map_err(|e|e.to_string())?;
         Ok(())
     }
     pub async fn reconcile(

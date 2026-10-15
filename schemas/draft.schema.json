@@ -201,6 +201,70 @@
         "additionalProperties": false
       }
     },
+    "markdownAssets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "field": {
+            "type": "string",
+            "enum": ["actual", "expected", "preconditions", "steps"]
+          },
+          "name": { "type": "string", "maxLength": 50000 },
+          "path": { "type": "string", "maxLength": 50000 },
+          "mime": { "type": "string", "enum": ["image/png", "image/jpeg"] },
+          "size": { "type": "number", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "width": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "height": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "staged",
+              "unreferenced",
+              "local",
+              "uploading",
+              "uploaded",
+              "failed"
+            ]
+          },
+          "remoteId": { "type": ["string", "null"] },
+          "embedMarkdown": { "type": "string", "maxLength": 50000 },
+          "embedUrl": { "type": "string", "maxLength": 50000 },
+          "error": { "type": "string", "maxLength": 50000 }
+        },
+        "required": [
+          "id",
+          "field",
+          "name",
+          "path",
+          "mime",
+          "size",
+          "sha256",
+          "width",
+          "height",
+          "state",
+          "remoteId",
+          "embedMarkdown",
+          "embedUrl",
+          "error"
+        ],
+        "additionalProperties": false
+      }
+    },
     "previewConfirmed": { "type": "boolean" },
     "createdAt": { "type": "string", "maxLength": 50000 },
     "updatedAt": { "type": "string", "maxLength": 50000 }
@@ -229,6 +293,7 @@
     "sources",
     "collectionErrors",
     "attachments",
+    "markdownAssets",
     "previewConfirmed",
     "createdAt",
     "updatedAt"

@@ -16,6 +16,7 @@
     "device",
     "collection",
     "files",
+    "markdownAssets",
     "gaps"
   ],
   "properties": {
@@ -190,6 +191,41 @@
               }
             }
           }
+        }
+      }
+    },
+    "markdownAssets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "field",
+          "relativePath",
+          "mime",
+          "size",
+          "sha256",
+          "width",
+          "height"
+        ],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "field": {
+            "enum": ["actual", "expected", "preconditions", "steps"]
+          },
+          "relativePath": {
+            "type": "string",
+            "pattern": "^markdown-images/[^\\\\]+$"
+          },
+          "mime": { "enum": ["image/png", "image/jpeg"] },
+          "size": { "type": "integer", "minimum": 1 },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "width": { "type": "integer", "minimum": 1 },
+          "height": { "type": "integer", "minimum": 1 }
         }
       }
     },

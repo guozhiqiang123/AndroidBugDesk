@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { type CSSProperties, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -51,6 +51,12 @@ import { LoginCard, LoginRestoring } from "./login-card";
 import { CustomSelect } from "./custom-select";
 import { NotificationToast, useTransientNotice } from "./notification-toast";
 import { AppDialog } from "./app-dialog";
+import {
+  MarkdownEditor,
+  MarkdownPreview,
+  markdownImageFilePayload,
+  type MarkdownImageImportResult,
+} from "./markdown-editor";
 import {
   attachmentIssueKey,
   groupIssuesByNavigationTarget,
@@ -245,6 +251,9 @@ function App() {
   const selectedSerialRef = useRef("");
   const homeDeviceRefreshKey = useRef("");
   const previewTriggerRef = useRef<HTMLButtonElement>(null);
+  const [submitReviewDockElement, setSubmitReviewDockElement] =
+    useState<HTMLElement | null>(null);
+  const [submitReviewDockHeight, setSubmitReviewDockHeight] = useState(0);
   const activeDraftRef = useRef<Draft | null>(null);
   const memoryWrite = useRef<Promise<unknown>>(Promise.resolve());
   const busyGate = useRef(false);
@@ -280,6 +289,23 @@ function App() {
   useEffect(() => {
     activeDraftRef.current = draft;
   }, [draft]);
+  useEffect(() => {
+    const dock = submitReviewDockElement;
+    if (tab !== "new" || !dock) {
+      setSubmitReviewDockHeight(0);
+      return;
+    }
+    const updateHeight = () =>
+      setSubmitReviewDockHeight(Math.ceil(dock.getBoundingClientRect().height));
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(dock);
+    window.addEventListener("resize", updateHeight);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateHeight);
+    };
+  }, [tab, submitReviewDockElement]);
   const run = async (
     name: string,
     work: () => Promise<unknown>,
@@ -868,26 +894,44 @@ function App() {
     setDraftsToDelete(null);
   }, [draft?.id, organizationId]);
   const update = (path: string, value: unknown) => {
-    if (!draft) return;
-    setBackendIssues([]);
+    setBackendIssues((current) =>
+      current.filter((issue) => {
+        if (issue.field === path) return false;
+        if (!issue.field.startsWith("customFields.")) return true;
+        const id = issue.field.slice("customFields.".length);
+        const field = boot?.metadata?.fields.find((item) => item.id === id);
+        const target = field && boot ? nativeTarget(field, boot.profile) : null;
+        const nativePath =
+          target === "subject"
+            ? "title"
+            : target === "description"
+              ? "actual"
+              : target;
+        return nativePath !== path;
+      }),
+    );
     setActiveIssueTarget("");
-    const next = structuredClone(draft);
-    const parts = path.split(".");
-    let obj: Record<string, unknown> = next as unknown as Record<
-      string,
-      unknown
-    >;
-    for (const p of parts.slice(0, -1)) obj = obj[p] as Record<string, unknown>;
-    obj[parts.at(-1)!] = value;
-    if (path === "bugPage") {
-      next.sources.bugPage = {
-        status: "manual",
-        at: new Date().toISOString(),
-        detail: "人工输入",
-      };
-    }
-    if (path !== "previewConfirmed") next.previewConfirmed = false;
-    setDraft(next);
+    setDraft((current) => {
+      if (!current) return current;
+      const next = structuredClone(current);
+      const parts = path.split(".");
+      let obj: Record<string, unknown> = next as unknown as Record<
+        string,
+        unknown
+      >;
+      for (const p of parts.slice(0, -1))
+        obj = obj[p] as Record<string, unknown>;
+      obj[parts.at(-1)!] = value;
+      if (path === "bugPage") {
+        next.sources.bugPage = {
+          status: "manual",
+          at: new Date().toISOString(),
+          detail: "人工输入",
+        };
+      }
+      if (path !== "previewConfirmed") next.previewConfirmed = false;
+      return next;
+    });
     setDirty(true);
     setPreview(false);
   };
@@ -1527,6 +1571,7 @@ function App() {
       aliases?: string[];
       required?: boolean;
       fullWidth?: boolean;
+      markdown?: boolean;
     } = {},
   ) => {
     const text = String(value(path));
@@ -1543,6 +1588,73 @@ function App() {
       (messages.some(missingInput)
         ? `请填写${label.replace(/（必填）$/, "")}`
         : undefined);
+    const messagesView = messages
+      .filter((message) => text.trim() || !missingInput(message))
+      .map((message) => (
+        <small className="error-text" key={message}>
+          {message}
+        </small>
+      ));
+    if (opts.markdown) {
+      return (
+        <div
+          className={`field markdown-field${opts.fullWidth ? " wide" : ""}`}
+          id={`field-${path}`}
+          key={path}
+        >
+          <span>
+            {label}
+            {draft?.sources[path] && (
+              <small className={`source ${draft.sources[path].status}`}>
+                {sourceStatusLabel(draft.sources[path])}
+              </small>
+            )}
+          </span>
+          <MarkdownEditor
+            value={text}
+            placeholder={hint ?? "请输入 Markdown 内容"}
+            disabled={frozen || !!busy}
+            required={opts.required}
+            onChange={(nextValue) => update(path, nextValue)}
+            onPasteImage={async (file) => {
+              if (!draft) throw new Error("请先创建草稿");
+              const payload = await markdownImageFilePayload(file);
+              const result = await invoke<MarkdownImageImportResult>(
+                "import_markdown_image",
+                {
+                  id: draft.id,
+                  field: path,
+                  ...payload,
+                },
+              );
+              setDraft((current) =>
+                current?.id === result.draft.id
+                  ? {
+                      ...current,
+                      markdownAssets: result.draft.markdownAssets,
+                      previewConfirmed: false,
+                    }
+                  : current,
+              );
+              setDirty(true);
+              setPreview(false);
+              return result;
+            }}
+            onReadAsset={(assetId) => {
+              if (!draft) return Promise.reject("请先创建草稿");
+              return invoke<string>("read_markdown_asset", {
+                id: draft.id,
+                assetId,
+              });
+            }}
+          />
+          {opts.warning && (
+            <small className="warning-text">{opts.warning}</small>
+          )}
+          {messagesView}
+        </div>
+      );
+    }
     return (
       <label
         className={`field${opts.fullWidth ? " wide" : ""}`}
@@ -1588,13 +1700,7 @@ function App() {
           </small>
         )}
         {opts.warning && <small className="warning-text">{opts.warning}</small>}
-        {messages
-          .filter((message) => text.trim() || !missingInput(message))
-          .map((message) => (
-            <small className="error-text" key={message}>
-              {message}
-            </small>
-          ))}
+        {messagesView}
       </label>
     );
   };
@@ -1874,10 +1980,17 @@ function App() {
       <main
         className={
           tab === "new"
-            ? "home-main"
+            ? `home-main ${draft && mainPackageReady ? "has-submit-review-dock" : ""}`
             : tab === "history"
               ? "history-main"
               : undefined
+        }
+        style={
+          tab === "new" && draft && mainPackageReady
+            ? ({
+                "--submit-review-dock-height": `${submitReviewDockHeight}px`,
+              } as CSSProperties)
+            : undefined
         }
       >
         {boot.authorized && tab === "new" && (
@@ -2392,36 +2505,36 @@ function App() {
                     </button>
                   </div>
                   <div className="grid problem-fields-grid">
-                    {field("jenkinsPackageUrl", "Jenkins包地址（必填）", {
-                      required: true,
-                      fullWidth: true,
-                      hint: "请填写 Jenkins 包地址",
-                    })}
                     {field("title", "问题标题（必填）", {
                       aliases: ["customFields.subject"],
                       required: true,
                       fullWidth: true,
                     })}
                     {field("actual", "问题表现（必填）", {
-                      multi: true,
+                      markdown: true,
                       required: true,
+                      fullWidth: true,
                       hint: "描述实际发生的问题表现",
                       aliases: ["customFields.description"],
+                    })}
+                    {field("jenkinsPackageUrl", "Jenkins包地址（选填）", {
+                      fullWidth: true,
+                      hint: "崩溃、ANR、多语言乱码等问题建议填写，便于开发快速定位对应构建并排查",
                     })}
                     {field("bugPage", "Bug所在页面（选填）", {
                       fullWidth: true,
                       hint: "自动记录目标应用最近一次前台页面，也可人工填写",
                     })}
                     {field("expected", "期望表现（选填）", {
-                      multi: true,
+                      markdown: true,
                       hint: "需要描述清楚应该是什么表现，越清楚越好",
                     })}
                     {field("preconditions", "复现条件（选填）", {
-                      multi: true,
+                      markdown: true,
                       hint: "补充安装方式、账号（如有）、网络情况、涉及的云控（如有）",
                     })}
                     {field("steps", "复现步骤（选填）", {
-                      multi: true,
+                      markdown: true,
                       hint: "每行填写一步，描述可执行的操作",
                     })}
                   </div>
@@ -2787,8 +2900,51 @@ function App() {
                   />
                 ))}
               </section>
-              <section className="card">
-                <h2>提交前核对</h2>
+              <section
+                className="card submit-review-dock"
+                ref={setSubmitReviewDockElement}
+                aria-label="提交前核对"
+              >
+                <div className="submit-review-heading">
+                  <h2>提交前核对</h2>
+                  {issueNavigationGroups.length > 0 ? (
+                    <div className="missing-list">
+                      {issueNavigationGroups.map((group) => (
+                        <button
+                          key={group.target}
+                          className={
+                            activeIssueTarget === group.target ? "active" : ""
+                          }
+                          aria-current={
+                            activeIssueTarget === group.target
+                              ? "true"
+                              : undefined
+                          }
+                          onClick={() => {
+                            setActiveIssueTarget(group.target);
+                            if (group.field === "app.packageName") {
+                              setPreview(false);
+                              setTab("settings");
+                              return;
+                            }
+                            document
+                              .getElementById(group.target)
+                              ?.scrollIntoView({
+                                behavior: "smooth",
+                                block: "center",
+                              });
+                          }}
+                        >
+                          {issueNavigationLabel(group.field)}（1项）
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="success-text">
+                      基础信息已齐全，可以进入预览。
+                    </p>
+                  )}
+                </div>
                 {[...new Set(fallbackIssues.map((item) => item.field))].map(
                   (path) => (
                     <div
@@ -2809,41 +2965,6 @@ function App() {
                       ))}
                     </div>
                   ),
-                )}
-                {issueNavigationGroups.length > 0 ? (
-                  <div className="missing-list">
-                    {issueNavigationGroups.map((group) => (
-                      <button
-                        key={group.target}
-                        className={
-                          activeIssueTarget === group.target ? "active" : ""
-                        }
-                        aria-current={
-                          activeIssueTarget === group.target
-                            ? "true"
-                            : undefined
-                        }
-                        onClick={() => {
-                          setActiveIssueTarget(group.target);
-                          if (group.field === "app.packageName") {
-                            setPreview(false);
-                            setTab("settings");
-                            return;
-                          }
-                          document
-                            .getElementById(group.target)
-                            ?.scrollIntoView({
-                              behavior: "smooth",
-                              block: "center",
-                            });
-                        }}
-                      >
-                        {issueNavigationLabel(group.field)}（1项）
-                      </button>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="success-text">基础信息已齐全，可以进入预览。</p>
                 )}
                 {draft.collectionErrors.length > 0 && (
                   <details>
@@ -2958,14 +3079,50 @@ function App() {
                         )}
                       </dd>
                       <dt>复现条件</dt>
-                      <dd>{draft.preconditions}</dd>
+                      <dd>
+                        <MarkdownPreview
+                          value={draft.preconditions}
+                          onReadAsset={(assetId) =>
+                            invoke("read_markdown_asset", {
+                              id: draft.id,
+                              assetId,
+                            })
+                          }
+                        />
+                      </dd>
                       <dt>复现步骤</dt>
-                      <dd className="preserve">{draft.steps}</dd>
+                      <dd>
+                        <MarkdownPreview
+                          value={draft.steps}
+                          onReadAsset={(assetId) =>
+                            invoke("read_markdown_asset", {
+                              id: draft.id,
+                              assetId,
+                            })
+                          }
+                        />
+                      </dd>
                       <dt>期望表现 / 问题表现</dt>
                       <dd>
-                        {draft.expected}
+                        <MarkdownPreview
+                          value={draft.expected}
+                          onReadAsset={(assetId) =>
+                            invoke("read_markdown_asset", {
+                              id: draft.id,
+                              assetId,
+                            })
+                          }
+                        />
                         <hr />
-                        {draft.actual}
+                        <MarkdownPreview
+                          value={draft.actual}
+                          onReadAsset={(assetId) =>
+                            invoke("read_markdown_asset", {
+                              id: draft.id,
+                              assetId,
+                            })
+                          }
+                        />
                       </dd>
                       <dt>设备 / 应用 / 时间</dt>
                       <dd className="preserve">

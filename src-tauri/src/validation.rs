@@ -135,7 +135,6 @@ pub fn validate(
     {
         add!("project", "请重新读取当前项目和缺陷类型配置");
     }
-    req!("jenkinsPackageUrl", "Jenkins包地址");
     req!("title", "问题标题");
     req!("app.packageName", "当前项目的 Android 包名配置");
     req!("actual", "问题表现");

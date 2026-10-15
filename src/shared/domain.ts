@@ -50,6 +50,30 @@ export const attachmentSchema = z.object({
   derivedFrom: z.string().nullable().default(null),
 });
 export type Attachment = z.infer<typeof attachmentSchema>;
+export const markdownAssetSchema = z.strictObject({
+  id: z.uuid(),
+  field: z.enum(["actual", "expected", "preconditions", "steps"]),
+  name: text,
+  path: text,
+  mime: z.enum(["image/png", "image/jpeg"]),
+  size: z.number().nonnegative(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  state: z.enum([
+    "staged",
+    "unreferenced",
+    "local",
+    "uploading",
+    "uploaded",
+    "failed",
+  ]),
+  remoteId: z.string().nullable(),
+  embedMarkdown: text,
+  embedUrl: text,
+  error: text,
+});
+export type MarkdownAsset = z.infer<typeof markdownAssetSchema>;
 export const draftSchema = z.strictObject({
   id: z.uuid(),
   sessionId: z.uuid().nullable(),
@@ -110,6 +134,7 @@ export const draftSchema = z.strictObject({
   sources: z.record(z.string(), sourceSchema),
   collectionErrors: z.array(text),
   attachments: z.array(attachmentSchema),
+  markdownAssets: z.array(markdownAssetSchema),
   previewConfirmed: z.boolean(),
   createdAt: text,
   updatedAt: text,
@@ -177,6 +202,7 @@ export interface Submission {
   identifier?: string;
   url?: string;
   uploads: UploadRecord[];
+  markdownAssets?: MarkdownAsset[];
   error?: string;
   intendedAt: string;
   updatedAt: string;
@@ -248,6 +274,7 @@ export function emptyDraft(id: string, now = new Date().toISOString()): Draft {
     sources: {},
     collectionErrors: [],
     attachments: [],
+    markdownAssets: [],
     previewConfirmed: false,
     createdAt: now,
     updatedAt: now,

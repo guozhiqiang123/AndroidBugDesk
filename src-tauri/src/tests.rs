@@ -691,13 +691,7 @@ fn report_omits_all_removed_submission_fields() {
 #[test]
 fn every_base_missing_field_is_blocked() {
     let m = metadata();
-    for path in [
-        "jenkinsPackageUrl",
-        "title",
-        "workitemTypeId",
-        "assignedTo",
-        "actual",
-    ] {
+    for path in ["title", "workitemTypeId", "assignedTo", "actual"] {
         let mut d = fixture();
         let keys: Vec<_> = path.split('.').collect();
         if keys.len() == 2 {
@@ -722,7 +716,7 @@ fn optional_reproduction_steps_accept_short_multiline_content() {
 #[test]
 fn optional_problem_fields_accept_blank_whitespace_and_placeholder_content() {
     let m = metadata();
-    for path in ["preconditions", "steps", "expected"] {
+    for path in ["jenkinsPackageUrl", "preconditions", "steps", "expected"] {
         for value in ["", " \n\t ", "未知"] {
             let mut d = fixture();
             d[path] = json!(value);
@@ -735,11 +729,7 @@ fn optional_problem_fields_accept_blank_whitespace_and_placeholder_content() {
 #[test]
 fn required_problem_fields_and_manual_time_submission_gate() {
     let m = metadata();
-    for (path, label) in [
-        ("jenkinsPackageUrl", "Jenkins包地址"),
-        ("title", "问题标题"),
-        ("actual", "问题表现"),
-    ] {
+    for (path, label) in [("title", "问题标题"), ("actual", "问题表现")] {
         let mut d = fixture();
         d[path] = json!(" \n\t ");
         for online in [true, false] {
@@ -1060,12 +1050,17 @@ impl Respond for Simulator {
             let id = format!("attachment-{}", state.files.len() + 1);
             state
                 .files
-                .push((id.clone(), name, body[start..end].to_vec()));
+                .push((id.clone(), name.clone(), body[start..end].to_vec()));
             if state.lose_upload {
                 state.lose_upload = false;
                 return ResponseTemplate::new(500);
             }
-            return ResponseTemplate::new(200).set_body_json(json!({"id":id}));
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "id":id,
+                "embedMarkdown":format!("![{}](https://example.test/embedded/{})", name, id),
+                "embedHtml":format!("<img src=\"https://example.test/embedded/{id}\" />"),
+                "embedUrl":format!("https://example.test/embedded/{id}")
+            }));
         }
         if path.ends_with("/workitems/real-id") && method == "PUT" {
             state.updates += 1;
@@ -1137,6 +1132,78 @@ async fn mock_complete_upload_reads_all_pages_and_hashes() {
         .contains(&format!("## Bug所在页面\n\n{}", string(&d, "bugPage"))));
     assert!(!string(&r.body, "description").contains("## 采集缺口"));
     assert!(!string(&r.body, "description").contains("<!-- android-bug-desk:"));
+}
+
+#[tokio::test]
+async fn markdown_image_is_embedded_in_cloud_description_and_local_evidence() {
+    let (_server, remote, api) = mock(Remote::default()).await;
+    let (_temp, store, mut draft) = setup();
+    let draft_id = string(&draft, "id");
+    let asset_id = uuid();
+    let directory = store
+        .root
+        .join("markdown-assets")
+        .join(&draft_id)
+        .join(&asset_id);
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("image.png");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/evidence.png"),
+        &path,
+    )
+    .unwrap();
+    let (size, sha256) = evidence::hash_file(&path).unwrap();
+    let asset = MarkdownAsset {
+        id: asset_id.clone(),
+        field: "actual".into(),
+        name: "复现截图.png".into(),
+        path: path.to_string_lossy().into_owned(),
+        mime: "image/png".into(),
+        size,
+        sha256,
+        width: 1,
+        height: 1,
+        state: "local".into(),
+        remote_id: None,
+        embed_markdown: String::new(),
+        embed_url: String::new(),
+        error: String::new(),
+    };
+    draft["actual"] = json!(format!(
+        "打开页面后崩溃\n\n![复现截图](abd-asset://{asset_id})"
+    ));
+    draft["markdownAssets"] = json!([asset]);
+    store.put("draft", &draft_id, &draft).unwrap();
+
+    let submission = Submitter {
+        store: store.clone(),
+    }
+    .submit(&draft_id, &api)
+    .await
+    .unwrap();
+    assert_eq!(submission.state, "submitted");
+    assert_eq!(submission.markdown_assets.len(), 1);
+    assert_eq!(submission.markdown_assets[0].state, "uploaded");
+    let state = remote.lock().unwrap();
+    let description = string(&state.body, "description");
+    assert!(description.contains("https://example.test/embedded/attachment-1"));
+    assert!(!description.contains("abd-asset://"));
+    assert_eq!(state.uploads, 3);
+    drop(state);
+
+    let report =
+        std::fs::read_to_string(Path::new(&submission.evidence.directory).join("report.md"))
+            .unwrap();
+    assert!(report.contains("markdown-images/"));
+    assert!(!report.contains("abd-asset://"));
+    let zip_file = std::fs::File::open(&submission.evidence.zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+    assert!((0..archive.len()).any(|index| {
+        archive
+            .by_index(index)
+            .map(|entry| entry.name().contains("/markdown-images/"))
+            .unwrap_or(false)
+    }));
 }
 #[tokio::test]
 async fn missing_fields_and_new_unsupported_field_make_zero_create_calls() {
@@ -1234,6 +1301,7 @@ fn persistent_recovery_keeps_uncertain_intents() {
         identifier: None,
         url: None,
         uploads: vec![],
+        markdown_assets: vec![],
         error: None,
         intended_at: now(),
         updated_at: now(),

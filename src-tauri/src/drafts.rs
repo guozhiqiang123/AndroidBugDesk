@@ -76,6 +76,13 @@ pub(crate) fn delete_many_for_state(state: &AppState, ids: &[String]) -> Result<
         &capture_records,
         &state.store.list("draft")?,
     )?;
+    let markdown_asset_directories = ids
+        .iter()
+        .map(|id| crate::markdown_assets::draft_directory(&state.store.root, id))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let mut objects: Vec<(&str, &str)> = ids
         .iter()
         .flat_map(|id| {
@@ -90,7 +97,9 @@ pub(crate) fn delete_many_for_state(state: &AppState, ids: &[String]) -> Result<
     // Exported evidence, imported attachments, and session files are intentionally retained.
     // Only post-capture attachments recorded by the two collection actions are removed.
     state.store.remove_many(&objects)?;
-    remove_generated_attachment_directories(&generated_attachment_directories)
+    remove_generated_attachment_directories(&generated_attachment_directories)?;
+    crate::markdown_assets::remove_directories(&markdown_asset_directories);
+    Ok(())
 }
 
 fn capture_attachment_ids(task: &Value) -> HashSet<String> {
@@ -271,6 +280,9 @@ mod tests {
     #[test]
     fn deletion_is_persistent_and_only_removes_related_local_records() {
         let (dir, state, id) = state();
+        let markdown_directory = dir.path().join("markdown-assets").join(&id).join(uuid());
+        std::fs::create_dir_all(&markdown_directory).unwrap();
+        std::fs::write(markdown_directory.join("image.png"), b"image").unwrap();
         state.store.put("snapshot", &id, &json!({})).unwrap();
         state
             .store
@@ -298,6 +310,7 @@ mod tests {
         assert!(reopened.get::<Value>("capture", "own").unwrap().is_none());
         assert!(reopened.get::<Value>("capture", "other").unwrap().is_some());
         assert_eq!(std::fs::read(exported).unwrap(), b"immutable evidence");
+        assert!(!dir.path().join("markdown-assets").join(&id).exists());
     }
 
     #[test]

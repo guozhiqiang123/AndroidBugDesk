@@ -125,6 +125,28 @@ pub fn attachments(d: &Value) -> Result<Vec<Attachment>> {
     serde_json::from_value(d["attachments"].clone()).map_err(|_| "附件数据格式错误".into())
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MarkdownAsset {
+    pub id: String,
+    pub field: String,
+    pub name: String,
+    pub path: String,
+    pub mime: String,
+    pub size: u64,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    pub state: String,
+    pub remote_id: Option<String>,
+    pub embed_markdown: String,
+    pub embed_url: String,
+    pub error: String,
+}
+pub fn markdown_assets(d: &Value) -> Result<Vec<MarkdownAsset>> {
+    serde_json::from_value(d["markdownAssets"].clone())
+        .map_err(|_| "Markdown 图片资源数据错误".into())
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Issue {
     pub field: String,
     pub message: String,
@@ -158,6 +180,8 @@ pub struct Submission {
     pub identifier: Option<String>,
     pub url: Option<String>,
     pub uploads: Vec<Upload>,
+    #[serde(default)]
+    pub markdown_assets: Vec<MarkdownAsset>,
     pub error: Option<String>,
     pub intended_at: String,
     pub updated_at: String,

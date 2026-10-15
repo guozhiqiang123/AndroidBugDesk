@@ -547,6 +547,162 @@ textarea {
   resize: vertical;
   line-height: 1.6;
 }
+.markdown-editor {
+  overflow: hidden;
+  border: 1px solid #d7deea;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+.markdown-editor:focus-within {
+  border-color: #4e7ed4;
+  box-shadow: 0 0 0 2px #b2caff;
+}
+.markdown-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 4px;
+  min-height: 36px;
+  overflow: hidden;
+  padding: 5px 7px;
+  border-bottom: 1px solid #e1e6ef;
+  background: #f5f8fc;
+}
+.markdown-toolbar button {
+  flex: 0 0 auto;
+  min-height: 27px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #4d5f79;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.markdown-toolbar button:hover,
+.markdown-toolbar button.active {
+  background: #e5edff;
+  color: #245ec8;
+}
+.markdown-toolbar button:disabled {
+  opacity: 0.45;
+}
+.markdown-editor-content {
+  min-height: 144px;
+  max-height: 360px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 10px 12px;
+  color: #223047;
+  font-size: 13px;
+  line-height: 1.65;
+}
+.markdown-editor-content:focus {
+  outline: 0;
+}
+.markdown-editor-content p,
+.markdown-editor-content ul,
+.markdown-editor-content ol,
+.markdown-editor-content blockquote,
+.markdown-editor-content pre {
+  margin: 0 0 8px;
+}
+.markdown-editor-content p:last-child,
+.markdown-editor-content ul:last-child,
+.markdown-editor-content ol:last-child,
+.markdown-editor-content blockquote:last-child,
+.markdown-editor-content pre:last-child {
+  margin-bottom: 0;
+}
+.markdown-editor-content ul,
+.markdown-editor-content ol {
+  padding-left: 24px;
+}
+.markdown-editor-content blockquote {
+  padding-left: 10px;
+  border-left: 3px solid #b8c7df;
+  color: #65748a;
+}
+.markdown-editor-content code {
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: #edf1f7;
+}
+.markdown-editor-content pre {
+  overflow: auto;
+  border-radius: 6px;
+  padding: 9px 11px;
+  background: #1e2b40;
+  color: #edf3ff;
+}
+.markdown-editor-content pre code {
+  padding: 0;
+  background: transparent;
+}
+.markdown-image-node {
+  position: relative;
+  display: block;
+  width: fit-content;
+  min-width: 42px;
+  min-height: 42px;
+  max-width: min(100%, 760px);
+  margin: 10px 0;
+}
+.markdown-image-node img {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  margin: 0;
+  border: 1px solid #dce3ef;
+  border-radius: 7px;
+  object-fit: contain;
+}
+.markdown-image-node.selected img {
+  outline: 3px solid #88aaff;
+}
+.markdown-image-remove {
+  position: absolute;
+  z-index: 1;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  width: 26px;
+  height: 26px;
+  min-height: 0;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgb(255 255 255 / 75%);
+  border-radius: 50%;
+  background: rgb(25 36 54 / 82%);
+  box-shadow: 0 2px 7px rgb(15 23 42 / 25%);
+  color: #fff;
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 1;
+}
+.markdown-image-remove:hover,
+.markdown-image-remove:focus-visible {
+  border-color: #fff;
+  background: #c84d3a;
+  color: #fff;
+}
+.markdown-editor-content[contenteditable="false"] .markdown-image-remove {
+  display: none;
+}
+.markdown-editor-content p.is-editor-empty:first-child::before {
+  float: left;
+  height: 0;
+  color: #a5afbd;
+  content: attr(data-placeholder);
+  pointer-events: none;
+}
+.markdown-editor > .error-text {
+  display: block;
+  padding: 0 12px 9px;
+}
+fieldset:disabled .markdown-editor {
+  background: #f2f4f8;
+}
 .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -556,6 +712,13 @@ textarea {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 @media (max-width: 1100px) {
+  .markdown-toolbar {
+    gap: 1px;
+  }
+  .markdown-toolbar button {
+    padding-inline: 3px;
+    font-size: 10px;
+  }
   .issue-select-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1309,6 +1472,45 @@ fieldset {
   border-color: #b44936;
   box-shadow: 0 0 0 3px rgb(180 73 54 / 15%);
 }
+.home-main.has-submit-review-dock {
+  padding-bottom: calc(var(--submit-review-dock-height, 0px) + 20px);
+}
+.submit-review-dock {
+  position: fixed;
+  z-index: 24;
+  left: 180px;
+  right: 0;
+  bottom: 0;
+  max-height: min(46vh, 420px);
+  margin: 0;
+  padding: 12px 32px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 0;
+  border-top: 1px solid #d7deea;
+  border-radius: 0;
+  box-shadow: none;
+}
+.submit-review-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+.submit-review-heading h2,
+.submit-review-heading .missing-list,
+.submit-review-heading .success-text {
+  margin: 0;
+}
+.submit-review-heading .missing-list {
+  gap: 6px;
+}
+.submit-review-heading .missing-list button {
+  padding: 5px 9px;
+}
+.submit-review-dock > .actions {
+  margin-top: 8px;
+}
 .validation-target-error > span:first-child,
 .validation-target-error > label > span:first-child {
   color: #b44936;
@@ -1317,6 +1519,7 @@ fieldset {
 .validation-target-error > textarea,
 .validation-target-error .custom-select-trigger,
 .validation-target-error .attachment-tools,
+.validation-target-error .markdown-editor,
 .validation-target-error.action-item > button {
   border-color: #d46a55;
   background: #fff6f3;
@@ -1345,6 +1548,21 @@ details {
 .preview dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+.markdown-preview-content > :first-child {
+  margin-top: 0;
+}
+.markdown-preview-content > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview-content img {
+  display: block;
+  max-width: min(100%, 720px);
+  max-height: 420px;
+  margin: 10px 0;
+  border: 1px solid #dce4f0;
+  border-radius: 8px;
+  object-fit: contain;
 }
 .preview-source-detail {
   display: block;
@@ -1551,6 +1769,11 @@ details {
   }
   .home-main {
     padding-top: 0;
+  }
+  .submit-review-dock {
+    left: 180px;
+    right: 0;
+    padding-inline: 25px;
   }
   .brand {
     font-size: 13px;

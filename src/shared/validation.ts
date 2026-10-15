@@ -108,7 +108,6 @@ export function validateDraft(
       metadata.typeId !== d.workitemTypeId)
   )
     add("project", "请重新读取当前项目和缺陷类型配置");
-  req("jenkinsPackageUrl", d.jenkinsPackageUrl, "Jenkins包地址");
   req("title", d.title, "问题标题");
   req("app.packageName", d.app.packageName, "当前项目的 Android 包名配置");
   req("actual", d.actual, "问题表现");

@@ -149,6 +149,104 @@ fn receipt(a: &Attachment) -> Value {
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
+
+#[tokio::test]
+async fn environment_snapshot_finishes_while_status_and_page_updates_are_concurrent() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, original) = app(temp.path(), fake_adb(temp.path()));
+    let state = app.state::<AppState>();
+    let id = string(&original, "id");
+    let job = prepare(&state, &id, "USB-A", selected(&["environment"]), None)
+        .await
+        .unwrap();
+    let job_id = string(&job, "id");
+    let observation_target = adb::PageObservationTarget {
+        store: state.store.clone(),
+        draft_id: id.clone(),
+        scope: "alice:test-org:test-project:".into(),
+        package: "com.example.test".into(),
+    };
+
+    let capture = execute(&state, &job_id);
+    let status_polling = async {
+        for _ in 0..100 {
+            post_capture_status(app.state(), id.clone()).await?;
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), String>(())
+    };
+    let page_updates = async {
+        for revision in 0..100 {
+            adb::record_observed_page(
+                &observation_target,
+                &format!("com.example.test/.Observed{revision}"),
+                "test",
+                &now(),
+                None,
+            )?;
+            tokio::task::yield_now().await;
+        }
+        Ok::<(), String>(())
+    };
+
+    let (capture_result, polling_result, page_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(capture, status_polling, page_updates)
+        })
+        .await
+        .expect("environment snapshot concurrency timed out");
+    capture_result.unwrap();
+    polling_result.unwrap();
+    page_result.unwrap();
+
+    let snapshot = post_capture_status(app.state(), id).await.unwrap();
+    assert_eq!(snapshot["jobs"][0]["status"], "complete");
+    assert!(attachments(&snapshot["draft"])
+        .unwrap()
+        .iter()
+        .any(|attachment| attachment.name.starts_with("device-environment-snapshot-")));
+}
+
+#[tokio::test]
+async fn capture_lifecycle_pauses_and_then_resumes_the_same_draft_observer() {
+    let temp = tempfile::tempdir().unwrap();
+    let adb_path = fake_adb(temp.path());
+    let (app, original) = app(temp.path(), adb_path.clone());
+    let state = app.state::<AppState>();
+    let id = string(&original, "id");
+    let generation = state
+        .page_observer_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    *state.page_observer.lock().unwrap() = Some(adb::start_page_observer(
+        adb_path,
+        "USB-A".into(),
+        adb::PageObservationTarget {
+            store: state.store.clone(),
+            draft_id: id.clone(),
+            scope: "alice:test-org:test-project:".into(),
+            package: "com.example.test".into(),
+        },
+        state.page_observer_generation.clone(),
+        generation,
+    ));
+
+    let job = prepare(&state, &id, "USB-A", selected(&["environment"]), None)
+        .await
+        .unwrap();
+    assert!(state.stop_page_observer_for_draft(&id));
+    assert!(state.page_observer.lock().unwrap().is_none());
+    execute(&state, &string(&job, "id")).await.unwrap();
+    resume_page_observer(&state, &string(&job, "id")).unwrap();
+    assert!(state
+        .page_observer
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|observer| observer.draft_id == id));
+    state.stop_page_observer();
+}
+
 #[tokio::test]
 async fn all_items_keep_original_identity_time_and_manual_inputs_with_complete_receipts() {
     let temp = tempfile::tempdir().unwrap();
@@ -160,7 +258,7 @@ async fn all_items_keep_original_identity_time_and_manual_inputs_with_complete_r
         .unwrap();
     assert!(crate::capture::pending(&state.store, &id).unwrap());
     execute(&state, &string(&job, "id")).await.unwrap();
-    let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
+    let snapshot = post_capture_status(app.state(), id.clone()).await.unwrap();
     assert_eq!(snapshot["jobs"][0]["status"], "complete");
     let screenshot_result = &snapshot["jobs"][0]["items"]["screenshot"];
     assert_eq!(screenshot_result["compression"]["format"], "PNG");
@@ -382,7 +480,7 @@ async fn partial_diagnostics_keep_successes_and_only_retry_the_incomplete_item()
     .await
     .unwrap();
     execute(&state, &string(&job, "id")).await.unwrap();
-    let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
+    let snapshot = post_capture_status(app.state(), id.clone()).await.unwrap();
     let done = &snapshot["jobs"][0];
     assert_eq!(done["status"], "partial");
     assert_eq!(done["items"]["memory"]["status"], "unavailable");
@@ -547,7 +645,7 @@ async fn repeated_collection_keeps_only_latest_item_files_and_one_regular_summar
             .count(),
         1
     );
-    let compact = post_capture_status(app.state(), id).unwrap();
+    let compact = post_capture_status(app.state(), id).await.unwrap();
     assert_eq!(compact["jobs"].as_array().unwrap().len(), 2);
     assert!(compact["jobs"]
         .as_array()
@@ -571,7 +669,7 @@ async fn absent_history_does_not_claim_coverage_and_missing_mapping_blocks_all_c
         .await
         .unwrap();
     execute(&state, &string(&job, "id")).await.unwrap();
-    let done = post_capture_status(app.state(), id.clone()).unwrap();
+    let done = post_capture_status(app.state(), id.clone()).await.unwrap();
     assert_eq!(done["jobs"][0]["status"], "failed");
     for item in ["logs", "exit"] {
         assert_eq!(done["jobs"][0]["items"][item]["status"], "unavailable");
@@ -617,7 +715,7 @@ async fn unsupported_uid_logcat_safely_falls_back_to_current_package_pids() {
         .unwrap();
     execute(&state, &string(&job, "id")).await.unwrap();
 
-    let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
+    let snapshot = post_capture_status(app.state(), id.clone()).await.unwrap();
     assert_eq!(snapshot["jobs"][0]["status"], "complete");
     for item in ["logs", "crash"] {
         assert_eq!(snapshot["jobs"][0]["items"][item]["status"], "complete");
@@ -902,7 +1000,7 @@ async fn invalid_media_is_not_attached_and_other_items_continue() {
     .await
     .unwrap();
     execute(&state, &string(&job, "id")).await.unwrap();
-    let done = post_capture_status(app.state(), id.clone()).unwrap();
+    let done = post_capture_status(app.state(), id.clone()).await.unwrap();
     assert_eq!(done["jobs"][0]["items"]["screenshot"]["status"], "failed");
     assert_eq!(done["jobs"][0]["items"]["logs"]["status"], "complete");
     assert_eq!(done["jobs"][0]["status"], "partial");
@@ -945,7 +1043,7 @@ async fn real_device_post_capture() {
         interrupted(&state, &string(&job, "id"), &error).unwrap();
         panic!("real device: {error}");
     }
-    let snapshot = post_capture_status(app.state(), id.clone()).unwrap();
+    let snapshot = post_capture_status(app.state(), id.clone()).await.unwrap();
     let files = attachments(&snapshot["draft"]).unwrap();
     for file in &files {
         evidence::verify_attachment(file).unwrap();
@@ -1004,7 +1102,7 @@ async fn real_device_environment_snapshot() {
         .await
         .unwrap();
     execute(&state, &string(&job, "id")).await.unwrap();
-    let snapshot = post_capture_status(app.state(), id).unwrap();
+    let snapshot = post_capture_status(app.state(), id).await.unwrap();
     let item = &snapshot["jobs"][0]["items"]["environment"];
     assert!(["complete", "partial"].contains(&string(item, "status").as_str()));
     let files = attachments(&snapshot["draft"]).unwrap();

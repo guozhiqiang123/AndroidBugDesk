@@ -182,6 +182,7 @@ pub async fn start_post_capture(
 ) -> Result<Value> {
     let job = prepare(&state, &id, &serial, items, retry_of).await?;
     let job_id = string(&job, "id");
+    let observer_paused = state.stop_page_observer_for_draft(&id);
     tauri::async_runtime::spawn(async move {
         let worker_app = app.clone();
         let worker_job_id = job_id.clone();
@@ -198,11 +199,21 @@ pub async fn start_post_capture(
             let state = app.state::<AppState>();
             let _ = interrupted(&state, &job_id, &error);
         }
+        if observer_paused {
+            let state = app.state::<AppState>();
+            if let Err(error) = resume_page_observer(&state, &job_id) {
+                crate::diagnostics::debug_event(
+                    "page_observer",
+                    "resume_skipped",
+                    json!({"reason":error}),
+                );
+            }
+        }
     });
     Ok(job)
 }
 #[tauri::command]
-pub fn post_capture_status(state: State<AppState>, id: String) -> Result<Value> {
+pub async fn post_capture_status(state: State<'_, AppState>, id: String) -> Result<Value> {
     let current_scope = scope(&state, &id)?;
     let mut seen_items = HashSet::new();
     let jobs: Vec<Value> = state
@@ -222,6 +233,40 @@ pub fn post_capture_status(state: State<AppState>, id: String) -> Result<Value> 
         })
         .collect();
     Ok(json!({"draft":state.store.draft(&id)?,"jobs":jobs}))
+}
+fn resume_page_observer(state: &AppState, job_id: &str) -> Result<()> {
+    let job: Value = state
+        .store
+        .get("capture", job_id)?
+        .ok_or("补采任务不存在")?;
+    binding(state, &job)?;
+    let path = state.adb_path()?;
+    let draft_id = string(&job, "draftId");
+    let serial = string(&job, "serial");
+    let package = string(&job, "targetPackage");
+    let scope = string(&job, "scope");
+    let mut current = state.page_observer.lock().unwrap();
+    if current.is_some() {
+        return Ok(());
+    }
+    let observer_generation = state
+        .page_observer_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    *current = Some(adb::start_page_observer(
+        path,
+        serial,
+        adb::PageObservationTarget {
+            store: state.store.clone(),
+            draft_id,
+            scope,
+            package,
+        },
+        state.page_observer_generation.clone(),
+        observer_generation,
+    ));
+    crate::diagnostics::event("page_observer", "resumed after post capture");
+    Ok(())
 }
 fn interrupted(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let _write = state.store.writes.lock().unwrap();
@@ -560,11 +605,13 @@ async fn collect(
     job: &Value,
     item: &str,
     path: &Path,
+    operation: &crate::diagnostics::OperationGuard,
 ) -> Result<(Value, Option<Attachment>)> {
     let serial = string(job, "serial");
     let package = string(job, "targetPackage");
     let mut receipt = json!({"status":"running","startedAt":now(),"serial":serial,"targetPackage":package,"bugOccurredAt":job["bugOccurredAt"],"timeSemantics":job["timeSemantics"],"commands":[],"attachments":[]});
     if item == "bugreport" {
+        operation.progress(json!({"phase":"command","commandIndex":1,"commandCount":1}));
         let mut captured = adb::bugreport(
             path,
             &serial,
@@ -597,6 +644,7 @@ async fn collect(
         return Ok((receipt, attachment));
     }
     if item == "screenshot" {
+        operation.progress(json!({"phase":"command","commandIndex":1,"commandCount":1}));
         let destination = state
             .store
             .root
@@ -662,6 +710,11 @@ async fn collect(
     let mut missed = false;
     let mut interrupted = None;
     for (index, args) in plans.iter().enumerate() {
+        operation.progress(json!({
+            "phase":"command",
+            "commandIndex":index + 1,
+            "commandCount":plans.len()
+        }));
         if let Err(error) = binding(state, job) {
             interrupted = Some(error);
             break;
@@ -919,6 +972,7 @@ async fn collect(
             "未获取到有效诊断内容，见逐项命令结果"
         });
     }
+    operation.progress(json!({"phase":"attachment","commandCount":plans.len()}));
     let attachment = if item == "environment" && !files.is_empty() {
         let mut document = format!(
             "Android 设备环境快照\n目标设备: {serial}\n项目配置包名: {package}\n开始时间: {}\n结束时间: {}\n说明: 当前设备状态，仅供事后诊断；不代表问题发生时状态。\n",
@@ -1097,16 +1151,36 @@ pub(crate) async fn execute(state: &AppState, job_id: &str) -> Result<()> {
             job["items"][item]["startedAt"] = json!(now());
             state.store.put("capture", job_id, &job)?;
         }
-        match collect(state, &job, item, &path).await {
-            Ok((receipt, attachment)) => persist_item(state, job_id, item, receipt, attachment)?,
+        let operation = crate::diagnostics::OperationGuard::begin(
+            "post_capture",
+            "collect_item",
+            adb::BUGREPORT_TIMEOUT_SECONDS + 30,
+            json!({"item":item}),
+        );
+        let collected = collect(state, &job, item, &path, &operation).await;
+        let collection_succeeded = collected.is_ok();
+        operation.progress(json!({"phase":"persist"}));
+        let persisted = match collected {
+            Ok((receipt, attachment)) => persist_item(state, job_id, item, receipt, attachment),
             Err(error) => persist_item(
                 state,
                 job_id,
                 item,
                 json!({"status":"failed","error":error,"startedAt":job["items"][item]["startedAt"],"finishedAt":now(),"commands":[],"attachments":[]}),
                 None,
-            )?,
-        }
+            ),
+        };
+        operation.finish(
+            if persisted.is_err() {
+                "persistence_failed"
+            } else if collection_succeeded {
+                "complete"
+            } else {
+                "collection_failed"
+            },
+            json!({"item":item}),
+        );
+        persisted?;
     }
     let _write = state.store.writes.lock().unwrap();
     let mut job: Value = state

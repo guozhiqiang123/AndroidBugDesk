@@ -81,6 +81,27 @@ impl AppState {
             adb::stop_page_observer(observer);
         }
     }
+    pub(crate) fn stop_page_observer_for_draft(&self, draft_id: &str) -> bool {
+        let observer = {
+            let mut current = self.page_observer.lock().unwrap();
+            if current
+                .as_ref()
+                .is_some_and(|observer| observer.draft_id == draft_id)
+            {
+                self.page_observer_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                current.take()
+            } else {
+                None
+            }
+        };
+        if let Some(observer) = observer {
+            adb::stop_page_observer(observer);
+            true
+        } else {
+            false
+        }
+    }
     pub fn api(&self) -> Result<Api> {
         if self.user.lock().unwrap().is_none() {
             return Err("请先验证登录令牌".into());
@@ -435,11 +456,14 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     let incoming_page = string(&draft, "bugPage");
     let incoming_page_source = draft["sources"]["bugPage"].clone();
     crate::project_settings::apply_current_package(&state, &mut draft)?;
-    validation::check_shape(&draft)?;
     let id = string(&draft, "id");
     state.editable(&id)?;
     let old = state.store.draft(&id)?;
     draft["attachments"] = old["attachments"].clone();
+    draft["markdownAssets"] = old["markdownAssets"].clone();
+    let removed_markdown_assets =
+        crate::markdown_assets::prune_unreferenced(&state.store.root, &mut draft)?;
+    validation::check_shape(&draft)?;
     draft["createdAt"] = old["createdAt"].clone();
     draft["sessionId"] = old["sessionId"].clone();
     draft["collectionErrors"] = old["collectionErrors"].clone();
@@ -503,6 +527,7 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     draft["updatedAt"] = json!(now());
     state.assert_no_token(&draft)?;
     state.store.put("draft", &id, &draft)?;
+    crate::markdown_assets::remove_directories(&removed_markdown_assets);
     Ok(draft)
 }
 #[tauri::command]

@@ -6,15 +6,21 @@ use std::path::{Path, PathBuf};
 pub struct Store {
     pub root: PathBuf,
     pub writes: std::sync::Arc<std::sync::Mutex<()>>,
+    connection: std::sync::Arc<std::sync::Mutex<Connection>>,
 }
 impl Store {
     pub fn new(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+        let connection = Connection::open(root.join("state.sqlite")).map_err(|e| e.to_string())?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS objects(kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id));").map_err(|e| e.to_string())?;
         let store = Self {
             root: root.into(),
             writes: Default::default(),
+            connection: std::sync::Arc::new(std::sync::Mutex::new(connection)),
         };
-        store.connect()?.execute_batch("CREATE TABLE IF NOT EXISTS objects(kind TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(kind,id));").map_err(|e| e.to_string())?;
         store.migrate_removed_fields()?;
         #[cfg(unix)]
         {
@@ -25,7 +31,7 @@ impl Store {
         Ok(store)
     }
     fn migrate_removed_fields(&self) -> Result<()> {
-        let mut c = self.connect()?;
+        let mut c = self.connection()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         let rows = {
             let mut stmt = tx
@@ -63,6 +69,10 @@ impl Store {
                     }
                     if !object.contains_key("jenkinsPackageUrl") {
                         object.insert("jenkinsPackageUrl".into(), Value::String(String::new()));
+                        changed = true;
+                    }
+                    if !object.contains_key("markdownAssets") {
+                        object.insert("markdownAssets".into(), Value::Array(Vec::new()));
                         changed = true;
                     }
                     if let Some(app) = object.get_mut("app").and_then(Value::as_object_mut) {
@@ -128,22 +138,19 @@ impl Store {
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
-    fn connect(&self) -> Result<Connection> {
-        let c = Connection::open(self.root.join("state.sqlite")).map_err(|e| e.to_string())?;
-        c.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| e.to_string())?;
-        c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-            .map_err(|e| e.to_string())?;
-        Ok(c)
+    fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| "本地数据库连接锁已损坏".into())
     }
     pub fn put<T: serde::Serialize>(&self, kind: &str, id: &str, data: &T) -> Result<()> {
-        let mut c = self.connect()?;
+        let mut c = self.connection()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO objects(kind,id,data) VALUES(?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data", params![kind,id,serde_json::to_string(data).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn put_many(&self, objects: &[(&str, &str, &Value)]) -> Result<()> {
-        let mut c = self.connect()?;
+        let mut c = self.connection()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         for (kind, id, value) in objects {
             tx.execute("INSERT INTO objects(kind,id,data) VALUES(?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data", params![kind,id,serde_json::to_string(value).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
@@ -151,8 +158,8 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn get<T: serde::de::DeserializeOwned>(&self, kind: &str, id: &str) -> Result<Option<T>> {
-        let raw: Option<String> = self
-            .connect()?
+        let c = self.connection()?;
+        let raw: Option<String> = c
             .query_row(
                 "SELECT data FROM objects WHERE kind=?1 AND id=?2",
                 params![kind, id],
@@ -164,7 +171,7 @@ impl Store {
             .transpose()
     }
     pub(crate) fn remove_many(&self, objects: &[(&str, &str)]) -> Result<()> {
-        let mut c = self.connect()?;
+        let mut c = self.connection()?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         for (kind, id) in objects {
             tx.execute(
@@ -176,7 +183,7 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn list(&self, kind: &str) -> Result<Vec<Value>> {
-        let c = self.connect()?;
+        let c = self.connection()?;
         let mut stmt = c
             .prepare("SELECT data FROM objects WHERE kind=?1 ORDER BY rowid DESC")
             .map_err(|e| e.to_string())?;
@@ -209,6 +216,12 @@ impl Store {
             for a in &mut s.uploads {
                 if a.state == "uploading" {
                     a.state = "unknown".into();
+                }
+            }
+            for asset in &mut s.markdown_assets {
+                if asset.state == "uploading" {
+                    asset.state = "unknown".into();
+                    asset.error = "正文图片上传时客户端退出，需在云效核对后再处理".into();
                 }
             }
             self.put("submission", &s.draft_id, &s)?;
@@ -308,5 +321,66 @@ mod migration_tests {
         let selection: Value = migrated.get("selection", "selection-a").unwrap().unwrap();
         assert!(selection.get("business").is_none());
         migrated.recover().unwrap();
+    }
+
+    #[test]
+    fn concurrent_reads_and_serialized_writes_finish_with_wal_enabled() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path()).unwrap();
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        store
+            .put("draft", "draft-a", &json!({"revision":0}))
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..4 {
+            let worker_store = store.clone();
+            let worker_barrier = barrier.clone();
+            let worker_sender = sender.clone();
+            std::thread::spawn(move || {
+                worker_barrier.wait();
+                let result = (|| -> Result<()> {
+                    for _ in 0..20 {
+                        let _: Option<Value> = worker_store.get("draft", "draft-a")?;
+                        let _ = worker_store.list("draft")?;
+                    }
+                    Ok(())
+                })();
+                let _ = worker_sender.send(result);
+            });
+        }
+        let writer_store = store.clone();
+        let writer_sender = sender.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let result = (|| -> Result<()> {
+                for revision in 1..=20 {
+                    let _write = writer_store.writes.lock().unwrap();
+                    writer_store.put("draft", "draft-a", &json!({"revision":revision}))?;
+                }
+                Ok(())
+            })();
+            let _ = writer_sender.send(result);
+        });
+        drop(sender);
+
+        for _ in 0..5 {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("concurrent database worker timed out")
+                .unwrap();
+        }
+        assert_eq!(
+            store.get::<Value>("draft", "draft-a").unwrap().unwrap()["revision"],
+            20
+        );
     }
 }

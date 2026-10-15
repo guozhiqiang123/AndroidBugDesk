@@ -6,6 +6,14 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+#[derive(Clone, Debug)]
+pub struct UploadedAttachment {
+    pub id: String,
+    pub embed_markdown: String,
+    pub embed_url: String,
+}
+
 pub struct Api {
     client: Client,
     pub profile: Profile,
@@ -414,7 +422,7 @@ impl Api {
         self.list(&format!("/workitems/{}/attachments", encode_id(id)?), false)
             .await
     }
-    pub async fn upload(&self, id: &str, a: &Attachment, name: &str) -> Result<String> {
+    pub async fn upload(&self, id: &str, a: &Attachment, name: &str) -> Result<UploadedAttachment> {
         let part = reqwest::multipart::Part::file(&a.path)
             .await
             .map_err(|_| "无法读取附件")?
@@ -444,11 +452,15 @@ impl Api {
             .json()
             .await
             .map_err(|_| "附件响应丢失，需回读核对")?;
-        let id = string(&data, "id");
-        if id.is_empty() {
+        let remote_id = string(&data, "id");
+        if remote_id.is_empty() {
             Err("附件响应缺少 ID，需核对".into())
         } else {
-            Ok(id)
+            Ok(UploadedAttachment {
+                id: remote_id,
+                embed_markdown: string(&data, "embedMarkdown"),
+                embed_url: string(&data, "embedUrl"),
+            })
         }
     }
     pub async fn matches_download(&self, row: &Value, a: &Attachment) -> Result<bool> {

@@ -8,6 +8,7 @@ pub mod history;
 #[cfg(test)]
 mod inspection_tests;
 pub mod login_memory;
+pub mod markdown_assets;
 pub mod model;
 pub mod oauth;
 pub mod post_capture;
@@ -71,6 +72,8 @@ pub fn run() {
             post_capture::post_capture_status,
             commands::redact_log,
             commands::import_attachment,
+            markdown_assets::import_markdown_image,
+            markdown_assets::read_markdown_asset,
             commands::preview_attachment,
             commands::save_attachment_coverage,
             commands::remove_attachment,

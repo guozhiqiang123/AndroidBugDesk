@@ -449,6 +449,33 @@ checks: try {
               },
             });
           if (cmd === "remember_selections") return;
+          if (cmd === "import_markdown_image") {
+            const asset = {
+              id: crypto.randomUUID(),
+              field: args.field,
+              name: args.name || "pasted-image.png",
+              path: "/mock/markdown-image.png",
+              mime: "image/png",
+              size: 68,
+              sha256: "a".repeat(64),
+              width: 1,
+              height: 1,
+              state: "local",
+              remoteId: null,
+              embedMarkdown: "",
+              embedUrl: "",
+              error: "",
+            };
+            draft().markdownAssets.push(asset);
+            return clone({
+              draft: draft(),
+              asset,
+              previewDataUrl:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            });
+          }
+          if (cmd === "read_markdown_asset")
+            return "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
           if (cmd === "save_draft") {
             const changedPage = args.draft.bugPage !== draft().bugPage;
             q.drafts[0] = {
@@ -1307,7 +1334,16 @@ checks: try {
   }
   if (process.env.QA_SCOPE === "input-hints") {
     const input = (id) =>
-      page.locator(`[id="field-${id}"]`).locator("input, textarea");
+      page
+        .locator(`[id="field-${id}"]`)
+        .locator('input, textarea, [contenteditable="true"]');
+    const inputValue = (id) =>
+      input(id).evaluate((node) =>
+        "value" in node ? node.value : (node.textContent ?? ""),
+      );
+    const inputPlaceholder = async (id) =>
+      (await input(id).getAttribute("placeholder")) ??
+      (await input(id).getAttribute("aria-placeholder"));
     const messages = (id) => page.locator(`[id="field-${id}"] > small`);
     const previewButton = page.getByRole("button", {
       name: "进入提交预览",
@@ -1330,17 +1366,74 @@ checks: try {
       ["expected", "需要描述清楚应该是什么表现，越清楚越好"],
       ["customFields.hintText", "请填写必填说明"],
     ]) {
-      saved[id] = await input(id).inputValue();
+      saved[id] = await inputValue(id);
       await input(id).fill(" \t ");
-      assert.equal(await input(id).getAttribute("placeholder"), hint);
+      assert.equal(await inputPlaceholder(id), hint);
       assert.equal(await messages(id).count(), 0);
-      assert.equal(await previewButton.isDisabled(), true);
+      assert.equal(
+        await previewButton.isDisabled(),
+        ["title", "actual", "customFields.hintText"].includes(id),
+      );
       await input(id).fill(saved[id]);
     }
     await input("actual").fill("");
     await page
       .locator("#field-actual")
       .screenshot({ path: path.join(output, "empty-actual.png") });
+    await input("actual").fill(saved.actual);
+    await input("actual").evaluate((node) => {
+      const clipboard = new DataTransfer();
+      clipboard.items.add(
+        new File([new Uint8Array([137, 80, 78, 71])], "clipboard.png", {
+          type: "image/png",
+        }),
+      );
+      node.dispatchEvent(
+        new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: clipboard,
+        }),
+      );
+    });
+    await page.waitForFunction(() =>
+      window.__qa.calls.some((call) => call.cmd === "import_markdown_image"),
+    );
+    await page.locator("#field-actual .markdown-editor-content img").waitFor();
+    const pasteCall = await page.evaluate(() =>
+      window.__qa.calls.find((call) => call.cmd === "import_markdown_image"),
+    );
+    assert.equal(pasteCall.args.field, "actual");
+    assert.equal(pasteCall.args.name, "clipboard.png");
+    assert.ok(pasteCall.args.dataBase64);
+    const removePastedImage = page.getByRole("button", {
+      name: "移除图片 clipboard.png",
+    });
+    await removePastedImage.waitFor();
+    await page.locator("#field-actual .markdown-editor").screenshot({
+      path: path.join(output, "markdown-image-remove-control.png"),
+    });
+    await page.getByRole("button", { name: "保存草稿", exact: true }).click();
+    await page
+      .getByRole("button", { name: "进入提交预览", exact: true })
+      .click();
+    const markdownPreview = page.getByRole("dialog", {
+      name: "提交预览",
+      exact: true,
+    });
+    await markdownPreview.locator(".markdown-preview-content img").waitFor();
+    assert.equal(
+      await markdownPreview.getByRole("button", { name: /移除图片/ }).count(),
+      0,
+    );
+    await markdownPreview
+      .getByRole("button", { name: "关闭提交预览", exact: true })
+      .click();
+    await removePastedImage.click();
+    await page
+      .locator("#field-actual .markdown-editor-content img")
+      .waitFor({ state: "detached" });
+    assert.equal(await inputValue("actual"), saved.actual);
     await input("actual").fill(saved.actual);
     await input("steps").fill("3331111\n444\n555\n666");
     assert.equal(await messages("steps").count(), 0);
@@ -1478,7 +1571,9 @@ checks: try {
           passed: true,
           mode: "Actual React input hints with mocked IPC; no real cloud/USB",
           scenarios: [
-            "six required problem inputs use hints without duplicate empty prompts and keep preview blocked",
+            "required and optional problem inputs use hints without duplicate empty prompts and only required values block preview",
+            "clipboard image paste inserts an inline Markdown image without a file-picker workflow",
+            "pasted image exposes a close control that removes only that image from editable Markdown while read-only preview has no removal action",
             "dynamic required text uses an input hint",
             "nonblank reproduction steps do not use a subjective per-line length gate",
             "dynamic int/float/dateTime retain local format errors",
@@ -1495,7 +1590,7 @@ checks: try {
         2,
       ) + "\n",
     );
-    console.log("11 input-hint scenarios passed; no real cloud/USB.");
+    console.log("13 input-hint scenarios passed; no real cloud/USB.");
     break checks;
   }
   if (process.env.QA_SCOPE === "frequency-row") {
@@ -1806,24 +1901,120 @@ checks: try {
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.evaluate(() => window.scrollTo(0, 0));
+  const dockTitleInput = page.locator("#field-title input");
+  const dockSavedTitle = await dockTitleInput.inputValue();
+  await dockTitleInput.fill("");
+  await page
+    .locator(".submit-review-heading .missing-list button")
+    .first()
+    .waitFor();
+  for (const size of [
+    { width: 1440, height: 900 },
+    { width: 1280, height: 900 },
+    { width: 980, height: 700 },
+  ]) {
+    await page.setViewportSize(size);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForFunction(() => {
+      const dock = document.querySelector(".submit-review-dock");
+      const main = document.querySelector("main");
+      if (!dock || !main) return false;
+      return (
+        Number.parseFloat(getComputedStyle(main).paddingBottom) + 1 >=
+        dock.getBoundingClientRect().height + 16
+      );
+    });
+    const initialDock = await page
+      .locator(".submit-review-dock")
+      .evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        const aside = document.querySelector("aside")?.getBoundingClientRect();
+        const main = document.querySelector("main");
+        const heading = node.querySelector(".submit-review-heading");
+        const headingTitle = heading?.querySelector("h2");
+        const firstTag = heading?.querySelector(".missing-list button");
+        const style = getComputedStyle(node);
+        const titleRect = headingTitle?.getBoundingClientRect();
+        const tagRect = firstTag?.getBoundingClientRect();
+        return {
+          top: rect.top,
+          bottom: rect.bottom,
+          height: rect.height,
+          position: style.position,
+          bottomGap: innerHeight - rect.bottom,
+          sidebarGap: rect.left - (aside?.right ?? 0),
+          rightGap: innerWidth - rect.right,
+          borderTopWidth: Number.parseFloat(style.borderTopWidth),
+          borderRadius: Number.parseFloat(style.borderTopLeftRadius),
+          boxShadow: style.boxShadow,
+          headingDisplay: heading ? getComputedStyle(heading).display : "",
+          headingCenterGap:
+            titleRect && tagRect
+              ? Math.abs(
+                  titleRect.top +
+                    titleRect.height / 2 -
+                    (tagRect.top + tagRect.height / 2),
+                )
+              : Number.POSITIVE_INFINITY,
+          pageBottomPadding: Number.parseFloat(
+            getComputedStyle(main).paddingBottom,
+          ),
+        };
+      });
+    assert.equal(initialDock.position, "fixed");
+    assert.ok(Math.abs(initialDock.bottomGap) <= 1);
+    assert.ok(Math.abs(initialDock.sidebarGap) <= 1);
+    assert.ok(Math.abs(initialDock.rightGap) <= 1);
+    assert.ok(initialDock.borderTopWidth >= 1);
+    assert.equal(initialDock.borderRadius, 0);
+    assert.equal(initialDock.boxShadow, "none");
+    assert.equal(initialDock.headingDisplay, "flex");
+    assert.ok(initialDock.headingCenterGap <= 1.5);
+    assert.ok(initialDock.pageBottomPadding + 1 >= initialDock.height + 16);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(150);
+    const scrolledDock = await page
+      .locator(".submit-review-dock")
+      .evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return { top: rect.top, bottom: rect.bottom };
+      });
+    assert.ok(Math.abs(scrolledDock.top - initialDock.top) <= 1);
+    assert.ok(Math.abs(scrolledDock.bottom - initialDock.bottom) <= 1);
+    await page.screenshot({
+      path: path.join(output, `submit-review-dock-${size.width}.png`),
+      fullPage: false,
+    });
+  }
+  await dockTitleInput.fill(dockSavedTitle);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.evaluate(() => window.scrollTo(0, 0));
   const problemFields = [
-    ["jenkinsPackageUrl", "Jenkins包地址（必填）"],
     ["title", "问题标题（必填）"],
     ["actual", "问题表现（必填）"],
+    ["jenkinsPackageUrl", "Jenkins包地址（选填）"],
     ["bugPage", "Bug所在页面（选填）"],
     ["preconditions", "复现条件（选填）"],
     ["steps", "复现步骤（选填）"],
     ["expected", "期望表现（选填）"],
   ];
   const problemInput = (id) =>
-    page.locator(`#field-${id} input, #field-${id} textarea`);
+    page.locator(
+      `#field-${id} input, #field-${id} textarea, #field-${id} [contenteditable="true"]`,
+    );
+  const problemInputValue = (id) =>
+    problemInput(id).evaluate((node) =>
+      "value" in node ? node.value : (node.textContent ?? ""),
+    );
   for (const [id, label] of problemFields) {
     assert.ok(
       (await page.locator(`#field-${id} > span`).innerText()).startsWith(label),
     );
+    const nativeRequired = await problemInput(id).getAttribute("required");
+    const ariaRequired = await problemInput(id).getAttribute("aria-required");
     assert.equal(
-      await problemInput(id).getAttribute("required"),
-      ["jenkinsPackageUrl", "title", "actual"].includes(id) ? "" : null,
+      nativeRequired === "" || ariaRequired === "true",
+      ["title", "actual"].includes(id),
     );
   }
   assert.equal(
@@ -1838,15 +2029,23 @@ checks: try {
   );
   assert.equal(
     await problemInput("jenkinsPackageUrl").getAttribute("placeholder"),
-    "请填写 Jenkins 包地址",
+    "崩溃、ANR、多语言乱码等问题建议填写，便于开发快速定位对应构建并排查",
   );
   assert.equal(
-    await problemInput("preconditions").getAttribute("placeholder"),
+    await problemInput("preconditions").getAttribute("aria-placeholder"),
     "补充安装方式、账号（如有）、网络情况、涉及的云控（如有）",
   );
   assert.equal(
-    await problemInput("expected").getAttribute("placeholder"),
+    await problemInput("expected").getAttribute("aria-placeholder"),
     "需要描述清楚应该是什么表现，越清楚越好",
+  );
+  assert.equal(
+    await page.getByRole("button", { name: "代码块", exact: true }).count(),
+    0,
+  );
+  assert.equal(
+    await page.getByText("Markdown · 可直接粘贴图片", { exact: true }).count(),
+    0,
   );
   for (const size of [
     { width: 1440, height: 900 },
@@ -1870,11 +2069,12 @@ checks: try {
         return {
           jenkinsWidth: jenkins.width,
           titleWidth: title.width,
+          actualWidth: actual.width,
           gridWidth: grid.width,
           orderedFullRows:
-            title.top >= jenkins.bottom &&
             actual.top >= title.bottom &&
-            bugPage.top >= actual.bottom &&
+            jenkins.top >= actual.bottom &&
+            bugPage.top >= jenkins.bottom &&
             conditions.top >= bugPage.bottom,
           rowsAligned:
             Math.abs(expected.top - conditions.top) <= 1 &&
@@ -1884,9 +2084,36 @@ checks: try {
       });
     assert.ok(Math.abs(layout.jenkinsWidth - layout.gridWidth) <= 1);
     assert.ok(Math.abs(layout.titleWidth - layout.gridWidth) <= 1);
+    assert.ok(Math.abs(layout.actualWidth - layout.gridWidth) <= 1);
     assert.equal(layout.orderedFullRows, true);
     assert.equal(layout.rowsAligned, true);
     assert.equal(layout.noOverflow, true);
+    const markdownEditors = await page
+      .locator(".markdown-editor")
+      .evaluateAll((nodes) =>
+        nodes.map((node) => {
+          const toolbar = node.querySelector(".markdown-toolbar");
+          const content = node.querySelector(".markdown-editor-content");
+          const buttonRows = new Set(
+            [...toolbar.querySelectorAll("button")].map((button) =>
+              Math.round(button.getBoundingClientRect().top),
+            ),
+          );
+          return {
+            toolbarHeight: toolbar.getBoundingClientRect().height,
+            buttonRows: buttonRows.size,
+            contentMinHeight: Number.parseFloat(
+              getComputedStyle(content).minHeight,
+            ),
+          };
+        }),
+      );
+    assert.equal(markdownEditors.length, 4);
+    for (const editorLayout of markdownEditors) {
+      assert.equal(editorLayout.buttonRows, 1);
+      assert.ok(editorLayout.toolbarHeight <= 38);
+      assert.ok(editorLayout.contentMinHeight >= 144);
+    }
     await page.locator(".issue-details-card").screenshot({
       path: path.join(output, `problem-fields-${size.width}.png`),
     });
@@ -2188,10 +2415,10 @@ checks: try {
   );
   await titleField.locator("input").fill(savedTitle);
   for (const [id, label] of problemFields.filter(([id]) =>
-    ["jenkinsPackageUrl", "title", "actual"].includes(id),
+    ["title", "actual"].includes(id),
   )) {
     const input = problemInput(id);
-    const saved = await input.inputValue();
+    const saved = await problemInputValue(id);
     await input.fill(" \t ");
     assert.equal(
       await page
@@ -2210,6 +2437,23 @@ checks: try {
     }
     await input.fill(saved);
   }
+  const jenkinsInput = problemInput("jenkinsPackageUrl");
+  const savedJenkinsPackageUrl = await jenkinsInput.inputValue();
+  await jenkinsInput.fill(" \t ");
+  assert.equal(
+    await page
+      .getByRole("button", { name: "进入提交预览", exact: true })
+      .isDisabled(),
+    false,
+  );
+  assert.equal(
+    await page
+      .locator(".missing-list button")
+      .filter({ hasText: "Jenkins包地址" })
+      .count(),
+    0,
+  );
+  await jenkinsInput.fill(savedJenkinsPackageUrl);
   const firstDiscovery = page.getByRole("checkbox", {
     name: "首次发现，尚未重复",
   });
@@ -2281,7 +2525,13 @@ checks: try {
       required: false,
       options: [],
     });
-    q.backendIssues = [
+  });
+  await page.getByRole("button", { name: "刷新云效配置", exact: true }).click();
+  await page
+    .getByRole("button", { name: "刷新云效配置", exact: true })
+    .waitFor({ state: "visible" });
+  await page.evaluate(() => {
+    window.__qa.backendIssues = [
       { field: "customFields.server-subject", message: "模拟主进程标题错误" },
     ];
   });
@@ -3003,6 +3253,8 @@ checks: try {
           "removed legacy fields are absent while actual preview retains range data",
           "removed required field shows configuration error and blocks preview",
           "homepage header stays fixed while wide and narrow pages scroll",
+          "submission review card stays fixed above the window bottom at three viewport sizes without covering page content",
+          "submission review dock has no outer gap or shadow, uses a top border, and keeps its title and validation tags in one row",
           "history and settings hide homepage header and new-draft action",
           "fixed header preserves missing-field error navigation",
           "all attachment previews request the system application using only draft and attachment ids",
@@ -3015,8 +3267,8 @@ checks: try {
           "compact project settings rows fit narrow viewport",
           "fresh empty settings keep project selection and draft creation gated until one project is enabled",
           "settings package mapping synchronizes the hidden collected package identity",
-          "Jenkins package address, title, and actual behavior are required while the remaining problem fields are optional; manual time inputs are absent",
-          "Jenkins package address and title each span a full row across three viewport sizes",
+          "title and actual behavior are required while Jenkins package address and the remaining problem fields are optional; manual time inputs are absent",
+          "title, actual behavior, and Jenkins package address each span a full row across three viewport sizes",
           "Bug page shows source details and manual values or manual clearing survive device refresh",
           "blank problem fields block preview and navigate to the corresponding field",
           "field errors use Chinese navigation labels without summary duplication",
