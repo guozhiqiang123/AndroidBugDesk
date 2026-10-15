@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "android-bug-desk"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arboard",
  "base64 0.22.1",
