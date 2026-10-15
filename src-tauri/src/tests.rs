@@ -74,6 +74,61 @@ fn developer_options_are_persisted_outside_login_state() {
 }
 
 #[test]
+fn shortcut_settings_are_persisted_and_reject_conflicts_or_editing_keys() {
+    use tauri::Manager;
+
+    let root = tempfile::tempdir().unwrap();
+    let state = crate::commands::AppState::new(root.path().to_path_buf()).unwrap();
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let saved = crate::commands::set_shortcut_settings(
+        ShortcutSettings {
+            version: 1,
+            overrides: [("newIssue".into(), "Primary+Shift+1".into())]
+                .into_iter()
+                .collect(),
+        },
+        app.state(),
+    )
+    .unwrap();
+    assert_eq!(saved.overrides["newIssue"], "Primary+Shift+1");
+    assert_eq!(
+        crate::commands::bootstrap(app.state()).unwrap()["shortcutSettings"]["overrides"]
+            ["newIssue"],
+        "Primary+Shift+1"
+    );
+
+    for overrides in [
+        [("newIssue".into(), "Primary+e".into())]
+            .into_iter()
+            .collect(),
+        [
+            ("newIssue".into(), "Primary+Shift+e".into()),
+            ("postCapture".into(), "Primary+Shift+e".into()),
+        ]
+        .into_iter()
+        .collect(),
+        [("newIssue".into(), "Primary+Shift+v".into())]
+            .into_iter()
+            .collect(),
+        [("unknown".into(), "Primary+Shift+n".into())]
+            .into_iter()
+            .collect(),
+    ] {
+        assert!(crate::commands::set_shortcut_settings(
+            ShortcutSettings {
+                version: 1,
+                overrides,
+            },
+            app.state(),
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn late_capture_field_is_removed_from_draft_and_report() {
     let mut d = fixture();
     assert!(d["event"].get("lateCapture").is_none());

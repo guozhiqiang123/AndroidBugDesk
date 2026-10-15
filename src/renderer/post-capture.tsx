@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Draft } from "../shared/domain";
+import type { ShortcutPresentation } from "../shared/shortcuts";
 import {
   captureItems,
   captureStatusLabels,
@@ -13,6 +14,7 @@ import {
   type PostCaptureSnapshot,
 } from "../shared/post-capture";
 import { AppDialog } from "./app-dialog";
+import { ShortcutBadge } from "./shortcut-badge";
 import "./post-capture.css";
 
 export function PostCaptureEntry({
@@ -22,6 +24,7 @@ export function PostCaptureEntry({
   onPrepare,
   onUpdate,
   onComplete,
+  shortcut,
 }: {
   draft: Draft;
   serial: string;
@@ -29,6 +32,7 @@ export function PostCaptureEntry({
   onPrepare: () => Promise<unknown>;
   onUpdate: (snapshot: PostCaptureSnapshot) => void;
   onComplete: () => void;
+  shortcut: ShortcutPresentation;
 }) {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<CaptureItemId[]>(() =>
@@ -157,6 +161,8 @@ export function PostCaptureEntry({
     <div className="action-item post-capture-entry" id="field-postCapture">
       <button
         className="post-capture-trigger"
+        data-shortcut-action={shortcut.action}
+        aria-keyshortcuts={shortcut.aria}
         disabled={disabled || starting || !serial}
         onClick={() => void show()}
         title="补采结果可在附件列表查看"
@@ -165,6 +171,7 @@ export function PostCaptureEntry({
         <span className="post-capture-info-badge" aria-hidden="true">
           i
         </span>
+        <ShortcutBadge shortcut={shortcut} />
       </button>
       {running && <small role="status">正在补采，成功文件会加入附件</small>}
       {!open && error && (
@@ -314,6 +321,7 @@ export function EnvironmentSnapshotEntry({
   onPrepare,
   onUpdate,
   onComplete,
+  shortcut,
 }: {
   draft: Draft;
   serial: string;
@@ -321,6 +329,7 @@ export function EnvironmentSnapshotEntry({
   onPrepare: () => Promise<unknown>;
   onUpdate: (snapshot: PostCaptureSnapshot) => void;
   onComplete: () => void;
+  shortcut: ShortcutPresentation;
 }) {
   const [jobId, setJobId] = useState("");
   const [starting, setStarting] = useState(false);
@@ -404,10 +413,13 @@ export function EnvironmentSnapshotEntry({
   return (
     <div className="action-item" id="field-environmentSnapshot">
       <button
+        data-shortcut-action={shortcut.action}
+        aria-keyshortcuts={shortcut.aria}
         disabled={disabled || starting || Boolean(jobId) || !serial}
         onClick={() => void begin()}
       >
         设备环境快照
+        <ShortcutBadge shortcut={shortcut} />
       </button>
       {(starting || jobId) && <small role="status">正在读取设备环境…</small>}
       {error && (

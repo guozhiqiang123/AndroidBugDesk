@@ -16,6 +16,7 @@ import {
   enabledProjects,
   normalizeProjectSettings,
   packageMismatch,
+  projectsWithEnabledFirst,
 } from "../src/renderer/project-settings";
 
 describe("登录和工作区门禁", () => {
@@ -303,5 +304,43 @@ describe("登录和工作区门禁", () => {
     );
     expect(packageMismatch(projects[0], settings, "")).toBe("");
     expect(packageMismatch(projects[1], settings, "com.actual")).toBe("");
+  });
+
+  it("项目配置只按已保存的勾选状态排序，保存后才更新顺序", () => {
+    const projects = [
+      { id: "p1", name: "项目一" },
+      { id: "p2", name: "项目二" },
+      { id: "p3", name: "项目三" },
+      { id: "p4", name: "项目四" },
+    ];
+    const savedSettings = {
+      entries: [
+        { projectId: "p1", enabled: false, packageName: "" },
+        { projectId: "p2", enabled: true, packageName: "" },
+        { projectId: "p3", enabled: false, packageName: "" },
+        { projectId: "p4", enabled: true, packageName: "" },
+      ],
+    };
+    const editingSettings = {
+      entries: savedSettings.entries.map((entry) => ({
+        ...entry,
+        enabled:
+          entry.projectId === "p1"
+            ? true
+            : entry.projectId === "p2"
+              ? false
+              : entry.enabled,
+      })),
+    };
+
+    expect(
+      projectsWithEnabledFirst(projects, savedSettings).map((item) => item.id),
+    ).toEqual(["p2", "p4", "p1", "p3"]);
+    expect(
+      projectsWithEnabledFirst(projects, editingSettings).map(
+        (item) => item.id,
+      ),
+    ).toEqual(["p1", "p4", "p2", "p3"]);
+    expect(projects.map((item) => item.id)).toEqual(["p1", "p2", "p3", "p4"]);
   });
 });

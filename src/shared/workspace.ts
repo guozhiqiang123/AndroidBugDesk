@@ -1,4 +1,5 @@
 import type { Draft, Option, Profile } from "./domain";
+import type { ShortcutSettings } from "./shortcuts";
 
 export interface UserIdentity {
   id: string;
@@ -88,6 +89,7 @@ export interface WorkspaceCommands {
   load_project_settings: ProjectSettings;
   save_project_settings: ProjectSettings;
   set_developer_options: DeveloperOptions;
+  set_shortcut_settings: ShortcutSettings;
   load_selection_memory: Partial<SelectionMemory>;
   remember_selections: void;
   list_remote_history: HistoryPage;

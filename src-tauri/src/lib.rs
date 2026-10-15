@@ -38,6 +38,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
             commands::set_developer_options,
+            commands::set_shortcut_settings,
             commands::record_renderer_event,
             commands::check_auth,
             commands::login,

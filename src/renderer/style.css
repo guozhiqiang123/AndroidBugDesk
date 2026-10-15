@@ -299,6 +299,25 @@ header {
   margin-top: 22px;
   white-space: nowrap;
 }
+.shortcut-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 18px;
+  margin-left: 7px;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  opacity: 0.68;
+  vertical-align: middle;
+  white-space: nowrap;
+}
 .modal .delete-draft-dialog {
   max-width: 440px;
 }
@@ -958,6 +977,64 @@ code {
 .developer-options-card .card-title p {
   margin: 6px 0 0;
 }
+.shortcut-settings-card .card-title {
+  align-items: flex-start;
+}
+.shortcut-settings-card .card-title > div {
+  min-width: 0;
+}
+.shortcut-settings-card .card-title p {
+  margin: 6px 0 0;
+}
+.shortcut-settings-list {
+  display: grid;
+  border-top: 1px solid #e7ebf2;
+}
+.shortcut-setting-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(105px, auto) auto auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid #e7ebf2;
+}
+.shortcut-setting-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.shortcut-setting-copy strong {
+  font-size: 13px;
+}
+.shortcut-setting-copy span {
+  color: #8290a6;
+  font-size: 11px;
+}
+.shortcut-setting-value {
+  justify-self: start;
+  min-width: 82px;
+  padding: 5px 8px;
+  border: 1px solid #d7deea;
+  border-radius: 6px;
+  background: #f7f9fc;
+  color: #3f5069;
+  font-family: inherit;
+  font-size: 11px;
+  text-align: center;
+  white-space: nowrap;
+}
+.shortcut-setting-row > button {
+  min-width: 82px;
+  padding: 7px 10px;
+}
+.shortcut-setting-row > .error-text {
+  grid-column: 1 / -1;
+  margin: -2px 0 0;
+}
+.shortcut-recording-note {
+  margin: 10px 0 0;
+}
 .switch-control {
   position: relative;
   display: inline-flex;
@@ -1318,9 +1395,10 @@ code {
   align-items: flex-start;
 }
 .attachment-actions > .action-item {
-  width: 160px;
+  width: 176px;
 }
 .attachment-actions > .action-item > button {
+  height: 40px;
   min-height: 40px;
 }
 .session-live {
@@ -1786,6 +1864,21 @@ details {
   }
   .login-page .login-card {
     padding: 36px;
+  }
+  .shortcut-setting-row {
+    grid-template-columns: minmax(140px, 1fr) minmax(96px, auto) auto auto;
+  }
+}
+@media (max-width: 760px) {
+  .shortcut-settings-card .card-title {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .shortcut-setting-row {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+  .shortcut-setting-copy {
+    grid-column: 1 / -1;
   }
 }
 

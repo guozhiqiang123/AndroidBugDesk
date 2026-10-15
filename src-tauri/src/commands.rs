@@ -138,8 +138,13 @@ pub fn bootstrap(state: State<AppState>) -> Result<Value> {
     let drafts = state.store.list("draft")?;
     let draft_scopes = crate::project_settings::draft_scopes_for_state(&state, &drafts)?;
     let submissions = crate::workitem_links::history_with_urls(state.store.list("submission")?);
+    let shortcut_settings = state
+        .store
+        .get::<ShortcutSettings>("settings", "keyboard_shortcuts")?
+        .filter(|settings| settings.validate().is_ok())
+        .unwrap_or_default();
     Ok(
-        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"rememberLogin":remember_login,"loginMethod":state.store.get::<String>("settings", "login_method")?.unwrap_or_else(|| if remember_login { "pat".into() } else { "oauth".into() }),"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"developerOptions":state.store.get::<DeveloperOptions>("settings", "developer_options")?.unwrap_or_default(),"drafts":drafts,"draftScopes":draft_scopes,"submissions":submissions,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
+        json!({"profile":state.profile.lock().unwrap().clone(),"authorized":authorized,"rememberLogin":remember_login,"loginMethod":state.store.get::<String>("settings", "login_method")?.unwrap_or_else(|| if remember_login { "pat".into() } else { "oauth".into() }),"user":user,"metadata":state.metadata.lock().unwrap().clone(),"adbPath":state.adb.lock().unwrap().as_ref().map(|v|v.to_string_lossy()),"developerOptions":state.store.get::<DeveloperOptions>("settings", "developer_options")?.unwrap_or_default(),"shortcutSettings":shortcut_settings,"drafts":drafts,"draftScopes":draft_scopes,"submissions":submissions,"sessions":state.store.list("session")?,"captures":state.store.list("capture")?}),
     )
 }
 #[tauri::command]
@@ -150,6 +155,18 @@ pub fn set_developer_options(
     state.store.put("settings", "developer_options", &options)?;
     crate::diagnostics::set_debug_enabled(options.debug_enabled);
     Ok(options)
+}
+
+#[tauri::command]
+pub fn set_shortcut_settings(
+    settings: ShortcutSettings,
+    state: State<AppState>,
+) -> Result<ShortcutSettings> {
+    settings.validate()?;
+    state
+        .store
+        .put("settings", "keyboard_shortcuts", &settings)?;
+    Ok(settings)
 }
 #[tauri::command]
 pub fn record_renderer_event(

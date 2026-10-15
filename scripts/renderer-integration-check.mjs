@@ -146,6 +146,7 @@ checks: try {
           ],
         },
         developerOptions: { debugEnabled: false },
+        shortcutSettings: { version: 1, overrides: {} },
         settingsByOrg: {
           "test-org": {
             entries: [
@@ -235,6 +236,10 @@ checks: try {
           if (cmd === "set_developer_options") {
             q.developerOptions = clone(args.options);
             return clone(q.developerOptions);
+          }
+          if (cmd === "set_shortcut_settings") {
+            q.shortcutSettings = clone(args.settings);
+            return clone(q.shortcutSettings);
           }
           if (cmd === "login") {
             if (q.failLogin)
@@ -779,6 +784,195 @@ checks: try {
     await page.locator('[id="field-title"] input').count(),
     "draft loaded after project selection",
   );
+  if (process.env.QA_SCOPE === "shortcuts") {
+    const actions = [
+      "newIssue",
+      "environmentSnapshot",
+      "postCapture",
+      "importAttachments",
+      "saveDraft",
+      "exportEvidence",
+      "submissionPreview",
+    ];
+    for (const action of actions) {
+      const button = page.locator(`[data-shortcut-action="${action}"]`);
+      assert.equal(await button.count(), 1, `${action} has one shortcut owner`);
+      const defaultAriaShortcut =
+        await button.getAttribute("aria-keyshortcuts");
+      assert.ok(defaultAriaShortcut);
+      assert.ok(
+        !defaultAriaShortcut.includes("Shift"),
+        `${action} default shortcut does not require Shift`,
+      );
+      assert.equal(await button.locator(".shortcut-hint").count(), 1);
+    }
+    assert.match(
+      await page
+        .locator('[data-shortcut-action="importAttachments"]')
+        .getAttribute("aria-keyshortcuts"),
+      /\+O$/u,
+      "attachment import uses the open-file mnemonic without occupying italic formatting",
+    );
+    await page.locator("#field-attachments").screenshot({
+      path: path.join(output, "shortcut-evidence-actions.png"),
+    });
+    await page.locator(".submit-review-dock").screenshot({
+      path: path.join(output, "shortcut-submit-actions.png"),
+    });
+    const saveButton = page.locator('[data-shortcut-action="saveDraft"]');
+    const defaultShortcut = await saveButton.getAttribute("aria-keyshortcuts");
+    assert.ok(defaultShortcut);
+    const saveCalls = () =>
+      page.evaluate(
+        () =>
+          window.__qa.calls.filter((call) => call.cmd === "save_draft").length,
+      );
+    const titleInput = page.locator("#field-title input");
+    await titleInput.focus();
+    const initialSaves = await saveCalls();
+    const primary = defaultShortcut.startsWith("Meta+") ? "Meta" : "Control";
+    await titleInput.press(`${primary}+C`);
+    await titleInput.press(`${primary}+V`);
+    assert.equal(
+      await saveCalls(),
+      initialSaves,
+      "copy and paste do not dispatch app actions",
+    );
+    const environmentShortcut = await page
+      .locator('[data-shortcut-action="environmentSnapshot"]')
+      .getAttribute("aria-keyshortcuts");
+    assert.ok(environmentShortcut);
+    const captureCalls = await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "start_post_capture")
+          .length,
+    );
+    await titleInput.press(environmentShortcut);
+    assert.equal(
+      await page.evaluate(
+        () =>
+          window.__qa.calls.filter((call) => call.cmd === "start_post_capture")
+            .length,
+      ),
+      captureCalls,
+      "disabled action does not dispatch",
+    );
+    await titleInput.press(defaultShortcut);
+    await page.waitForFunction(
+      (count) =>
+        window.__qa.calls.filter((call) => call.cmd === "save_draft").length >
+        count,
+      initialSaves,
+    );
+    const afterDefaultSave = await saveCalls();
+    await page.evaluate(() => {
+      const dialog = document.createElement("section");
+      dialog.id = "shortcut-modal-fixture";
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      document.body.append(dialog);
+    });
+    await page.keyboard.press(defaultShortcut);
+    assert.equal(
+      await saveCalls(),
+      afterDefaultSave,
+      "page actions pause while a modal dialog is open",
+    );
+    await page.evaluate(() =>
+      document.querySelector("#shortcut-modal-fixture")?.remove(),
+    );
+    await page.locator("nav button").filter({ hasText: "设置" }).click();
+    const shortcutCard = page.locator(".shortcut-settings-card");
+    await shortcutCard.waitFor();
+    await shortcutCard
+      .getByRole("button", { name: "录制“保存草稿”快捷键", exact: true })
+      .click();
+    const shortcutSavesBeforeProtectedKey = await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "set_shortcut_settings")
+          .length,
+    );
+    await page.keyboard.press(`${primary}+V`);
+    await shortcutCard.getByText(/常用编辑快捷键/).waitFor();
+    assert.equal(
+      await page.evaluate(
+        () =>
+          window.__qa.calls.filter(
+            (call) => call.cmd === "set_shortcut_settings",
+          ).length,
+      ),
+      shortcutSavesBeforeProtectedKey,
+    );
+    await page.keyboard.press(`${primary}+Shift+1`);
+    await page.waitForFunction(() =>
+      window.__qa.calls.some(
+        (call) =>
+          call.cmd === "set_shortcut_settings" &&
+          call.args.settings.overrides.saveDraft === "Primary+Shift+1",
+      ),
+    );
+    assert.match(
+      await shortcutCard
+        .locator(".shortcut-setting-row")
+        .filter({ hasText: "保存草稿" })
+        .locator(".shortcut-setting-value")
+        .innerText(),
+      /1$/,
+    );
+    await shortcutCard.screenshot({
+      path: path.join(output, "shortcut-settings.png"),
+    });
+    await page.locator("nav button").filter({ hasText: "新建提交" }).click();
+    const customizedButton = page.locator('[data-shortcut-action="saveDraft"]');
+    assert.equal(
+      await customizedButton.getAttribute("aria-keyshortcuts"),
+      `${primary}+Shift+1`,
+    );
+    const beforeOldBinding = await saveCalls();
+    await titleInput.press(defaultShortcut);
+    assert.equal(await saveCalls(), beforeOldBinding);
+    await titleInput.press(`${primary}+Shift+1`);
+    await page.waitForFunction(
+      (count) =>
+        window.__qa.calls.filter((call) => call.cmd === "save_draft").length >
+        count,
+      beforeOldBinding,
+    );
+    await page.locator("nav button").filter({ hasText: "设置" }).click();
+    await shortcutCard
+      .locator(".shortcut-setting-row")
+      .filter({ hasText: "保存草稿" })
+      .getByRole("button", { name: "恢复默认", exact: true })
+      .click();
+    await page.waitForFunction(
+      () => window.__qa.shortcutSettings.overrides.saveDraft === undefined,
+    );
+    assert.deepEqual(errors, []);
+    await server.verifySource();
+    fs.writeFileSync(
+      path.join(output, "result.json"),
+      JSON.stringify(
+        {
+          passed: true,
+          mode: "Actual React shortcut settings and mocked persistence",
+          scenarios: [
+            "seven new-submission actions expose visible and accessible shortcuts",
+            "copy and paste remain available inside text input",
+            "disabled actions are not dispatched or forced through their guards",
+            "page actions pause while a modal dialog is open",
+            "default shortcut dispatches the existing button action",
+            "protected editing combinations are rejected during recording",
+            "recorded custom shortcut persists and immediately replaces the default",
+            "single-action reset restores the default binding",
+          ],
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    console.log("8 shortcut scenarios passed; common editing keys preserved.");
+    break checks;
+  }
   if (process.env.QA_SCOPE === "device-connection-row") {
     const connection = page.locator(
       "#field-attachments .evidence-device-connection",
@@ -2648,12 +2842,16 @@ checks: try {
   await page.keyboard.press("Escape");
   await previewDialog.waitFor({ state: "detached" });
   await page.waitForFunction(
-    () => document.activeElement?.textContent?.trim() === "进入提交预览",
+    () =>
+      document.activeElement?.getAttribute("data-shortcut-action") ===
+      "submissionPreview",
   );
   await previewButton.click();
   await page.getByRole("button", { name: "关闭提交预览", exact: true }).click();
   await page.waitForFunction(
-    () => document.activeElement?.textContent?.trim() === "进入提交预览",
+    () =>
+      document.activeElement?.getAttribute("data-shortcut-action") ===
+      "submissionPreview",
   );
   const bugPageField = page.locator('[id="field-bugPage"]');
   assert.equal(await bugPageField.locator(".field-source-detail").count(), 0);

@@ -706,3 +706,15 @@ DMG：`artifacts/local-dialog-refresh-macos-arm64-20261010/Android Bug Desk_0.1.
 - 功能、UI、动态过程、崩溃和 ANR 默认勾选 Activity任务栈；多语言、性能、网络和数据保留各自专项默认项，不额外扩大采集范围。
 - 打开页面、刷新设备和等待补采期间均不再持续调用 ADB 读取前台 Activity。“Bug所在页面”可以人工填写或清空，并在设备刷新后保持用户选择。
 - 自动化通过 191 项前端测试、184 项 Rust 测试（3 项外部环境测试按设计忽略）、类型检查、生产构建、Rust 格式、严格 Clippy 和 55 个完整 React/mock IPC 场景；浏览器结果位于 `artifacts/activity-stack-advertising-full-20261015-r3/`。未调用真实云效或 USB，本轮未打包安装。
+
+## 新建提交快捷键验收（2026-10-15）
+
+- 七个目标按钮显示当前平台快捷键，并提供对应的 `aria-keyshortcuts`；键盘触发复用鼠标点击处理，不复制或绕过原业务逻辑。
+- 七个默认组合均不包含 Shift；新建问题、环境快照、补采证据、导入附件、保存草稿、导出本地证据和提交预览分别使用 Command/Ctrl+N、E、G、O、S、D、Enter。
+- 设置页可录制单段 `Primary`／`Primary+Shift` 组合，自定义后即时更新按钮提示并持久化；单项恢复和全部恢复默认有效。
+- 复制、粘贴、剪切、全选、撤销、重做、查找及常见文本格式组合不能保存为动作快捷键；输入框内实际按下复制、粘贴不会触发应用动作。
+- 弹窗打开、按钮禁用、离开新建提交页、输入法组合、按键长按或事件已被组件处理时，不消费按键也不触发动作。
+- 类型检查、198 项前端测试、188 项 Rust 测试（3 项外部环境测试按设计忽略）、生产构建、严格 Clippy、10 项流程测试、55 个完整 React/mock IPC 场景和 8 个快捷键专项场景通过。专项截图和结果位于 `artifacts/shortcuts-browser-final-6/`，完整回归位于 `artifacts/shortcuts-full-browser-4/`；未调用真实云效或 USB。
+- 无 Shift 默认组合回归继续通过 198 项前端测试、188 项 Rust 测试（3 项外部环境测试按设计忽略）、生产构建、严格 Clippy 和 8 个快捷键专项场景；专项结果位于 `artifacts/shortcuts-no-shift-browser-20261015/`。
+- 用户授权后，固定本机入口从首次 release 构建即使用 ad hoc 签名，约 179 秒一次完成应用、DMG、签名、架构和包内文件校验。直接覆盖 `/Applications/Android Bug Desk.app` 后，原生窗口确认按钮快捷键提示和设置页快捷键卡片均已加载；唯一安装路径进程持续运行至少 187 秒，未新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-macos-arm64-20261015/`，DMG SHA-256 为 `9d4cd98b3ab0471a463b982180bb6ce04119aae619401e8f0c53fb436c2a0573`。
+- 无 Shift 默认组合版本使用固定本机入口重新完整构建，约 178 秒一次通过应用与 DMG 签名、ARM64 架构、DMG 完整性和逐文件核对。覆盖 `/Applications/Android Bug Desk.app` 后，安装文件与产物一致，原生设置页显示 ⌘N、⌘E、⌘G、⌘O、⌘S、⌘D、⌘Enter；应用持续运行超过 90 秒且没有新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-no-shift-macos-arm64-20261015/`，DMG SHA-256 为 `95e1c64426a4782732e4bd145e35c65687cd988ea6982876dd576b78943d8faa`。

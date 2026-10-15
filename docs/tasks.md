@@ -544,3 +544,14 @@ Jenkins 包地址不再参与前端即时核对或 Rust 主进程提交门槛，
 - [x] 广告默认选择现存日志、当前截图、应用与进程状态、Activity任务栈；同时审查其他问题类型，功能、UI、动态过程、崩溃和 ANR 默认选择任务栈。
 - [x] “Bug所在页面”改为纯人工选填，刷新设备不会写入或覆盖；移除启动、刷新和补采期间的持续前台 Activity ADB 观察器。
 - [x] 通过 191 项前端测试、184 项 Rust 测试（3 项外部环境测试按设计忽略）、类型检查、生产构建、Rust 格式、严格 Clippy 和 55 个完整 React/mock IPC 场景。浏览器结果位于 `artifacts/activity-stack-advertising-full-20261015-r3/`；未调用真实云效或 USB，本轮未打包安装。
+
+## 新建提交快捷键（2026-10-15）
+
+- [x] 先形成 [`keyboard-shortcuts-plan.md`](keyboard-shortcuts-plan.md)，按固定动作 ID、单一窗口监听器、按钮复用和本机覆盖配置实施。
+- [x] 为新建问题、设备环境快照、补采证据、导入附件、保存草稿、导出本地证据和进入提交预览提供跨平台默认快捷键及按钮提示；默认组合只使用 Command/Ctrl，不要求 Shift。
+- [x] 设置页支持逐项录制、逐项恢复和全部恢复默认；配置独立于云效登录持久化，前后端共同拒绝非法、重复、编辑保留和系统窗口组合。
+- [x] 只在新建提交页触发，并重新使用按钮当前的显示、禁用和业务处理状态；弹窗、长按、输入法组合和不可用按钮不会绕过原门槛。
+- [x] 通过类型检查、198 项前端测试、188 项 Rust 测试（3 项外部环境测试按设计忽略）、生产构建、严格 Clippy、10 项流程测试、55 个完整 React/mock IPC 场景和 8 个快捷键专项场景。专项结果位于 `artifacts/shortcuts-browser-final-6/`，完整回归位于 `artifacts/shortcuts-full-browser-4/`；未调用真实云效或 USB。
+- [x] 按体验反馈移除七个默认组合中的 Shift；导入附件使用 Command/Ctrl+O，继续保留 Command/Ctrl+I 给 Markdown 斜体。新增默认映射断言，8 个快捷键浏览器场景结果位于 `artifacts/shortcuts-no-shift-browser-20261015/`。
+- [x] 用户授权后，固定本机入口从首次 release 构建即使用 ad hoc 签名，约 179 秒一次完成应用、DMG、签名、架构和包内文件校验。直接覆盖 `/Applications/Android Bug Desk.app` 后，原生窗口确认按钮快捷键提示和设置页快捷键卡片均已加载；唯一安装路径进程持续运行至少 187 秒，未新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-macos-arm64-20261015/`，DMG SHA-256 为 `9d4cd98b3ab0471a463b982180bb6ce04119aae619401e8f0c53fb436c2a0573`。
+- [x] 默认组合移除 Shift 后，固定本机入口重新完成 release 编译、ad hoc 签名、ARM64、DMG 和包内文件校验，耗时约 178 秒；直接覆盖安装并启动，设置页实际显示 ⌘N、⌘E、⌘G、⌘O、⌘S、⌘D、⌘Enter，进程持续运行超过 90 秒且没有新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-no-shift-macos-arm64-20261015/`，DMG SHA-256 为 `95e1c64426a4782732e4bd145e35c65687cd988ea6982876dd576b78943d8faa`。

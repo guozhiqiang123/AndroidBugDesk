@@ -30,6 +30,26 @@ export function enabledProjects(
   return projects.filter((project) => enabled.has(project.id));
 }
 
+export function projectsWithEnabledFirst(
+  projects: Option[],
+  settings: ProjectSettings | null | undefined,
+): Option[] {
+  const enabled = new Set(
+    (settings?.entries ?? [])
+      .filter((item) => item.enabled)
+      .map((item) => item.projectId),
+  );
+  return projects
+    .map((project, index) => ({ project, index }))
+    .sort((left, right) => {
+      const enabledDifference =
+        Number(enabled.has(right.project.id)) -
+        Number(enabled.has(left.project.id));
+      return enabledDifference || left.index - right.index;
+    })
+    .map(({ project }) => project);
+}
+
 export function configuredProjectPackage(
   settings: ProjectSettings | null | undefined,
   projectId: string,

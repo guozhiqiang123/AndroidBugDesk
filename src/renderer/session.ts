@@ -59,6 +59,7 @@ export function initialWorkspace() {
     metadata: null as Metadata | null,
     adbPath: null as string | null,
     developerOptions: { debugEnabled: false },
+    shortcutSettings: { version: 1 as const, overrides: {} },
     drafts: [] as Draft[],
     submissions: [] as Submission[],
     sessions: [] as Session[],

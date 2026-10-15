@@ -26,6 +26,95 @@ pub fn uuid() -> String {
 pub struct DeveloperOptions {
     pub debug_enabled: bool,
 }
+
+pub const SHORTCUT_ACTIONS: [&str; 7] = [
+    "newIssue",
+    "environmentSnapshot",
+    "postCapture",
+    "importAttachments",
+    "saveDraft",
+    "exportEvidence",
+    "submissionPreview",
+];
+
+const DEFAULT_SHORTCUTS: [(&str, &str); 7] = [
+    ("newIssue", "Primary+n"),
+    ("environmentSnapshot", "Primary+e"),
+    ("postCapture", "Primary+g"),
+    ("importAttachments", "Primary+o"),
+    ("saveDraft", "Primary+s"),
+    ("exportEvidence", "Primary+d"),
+    ("submissionPreview", "Primary+Enter"),
+];
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShortcutSettings {
+    pub version: u8,
+    pub overrides: HashMap<String, String>,
+}
+
+impl Default for ShortcutSettings {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            overrides: HashMap::new(),
+        }
+    }
+}
+
+impl ShortcutSettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1 || self.overrides.len() > SHORTCUT_ACTIONS.len() {
+            return Err("快捷键配置版本或数量不正确".into());
+        }
+        for (action, binding) in &self.overrides {
+            if !SHORTCUT_ACTIONS.contains(&action.as_str()) {
+                return Err("快捷键动作不受支持".into());
+            }
+            let Some((shift, key)) = parse_shortcut(binding) else {
+                return Err("快捷键格式不正确".into());
+            };
+            if ["a", "c", "v", "x", "y", "z", "f"].contains(&key.as_str())
+                || (!shift && ["b", "i", "u"].contains(&key.as_str()))
+                || ["q", "w", "h", "m"].contains(&key.as_str())
+            {
+                return Err("快捷键占用了编辑或系统保留组合".into());
+            }
+        }
+        let mut effective_bindings = Vec::new();
+        for (action, default_binding) in DEFAULT_SHORTCUTS {
+            let binding = self
+                .overrides
+                .get(action)
+                .map(String::as_str)
+                .unwrap_or(default_binding);
+            if effective_bindings.contains(&binding) {
+                return Err("快捷键不能重复".into());
+            }
+            effective_bindings.push(binding);
+        }
+        Ok(())
+    }
+}
+
+fn parse_shortcut(binding: &str) -> Option<(bool, String)> {
+    let value = binding.strip_prefix("Primary+")?;
+    let (shift, key) = match value.strip_prefix("Shift+") {
+        Some(key) => (true, key),
+        None => (false, value),
+    };
+    if key == "Enter"
+        || (key.len() == 1
+            && key
+                .chars()
+                .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit()))
+    {
+        Some((shift, key.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Profile {

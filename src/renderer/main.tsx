@@ -1,4 +1,10 @@
-import React, { type CSSProperties, useEffect, useRef, useState } from "react";
+import React, {
+  type CSSProperties,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -25,6 +31,19 @@ import type {
   UpdateProgress,
   DeveloperOptions,
 } from "../shared/workspace";
+import {
+  defaultShortcutSettings,
+  resolveShortcutBindings,
+  settingsWithBinding,
+  settingsWithoutBindingOverride,
+  shortcutDefinitions,
+  shortcutFromKeyboardEvent,
+  shortcutPlatform,
+  shortcutPresentation,
+  shortcutValidationError,
+  type ShortcutAction,
+  type ShortcutSettings,
+} from "../shared/shortcuts";
 import appPackage from "../../package.json";
 import {
   nativeTarget,
@@ -66,7 +85,9 @@ import {
   configuredProjectPackage,
   enabledProjects,
   normalizeProjectSettings,
+  projectsWithEnabledFirst,
 } from "./project-settings";
+import { ShortcutBadge } from "./shortcut-badge";
 
 interface CaptureStatus {
   id: string;
@@ -94,6 +115,7 @@ interface Bootstrap {
   metadata: Metadata | null;
   adbPath: string | null;
   developerOptions: DeveloperOptions;
+  shortcutSettings: ShortcutSettings;
   drafts: Draft[];
   submissions: Submission[];
   sessions: Session[];
@@ -234,6 +256,11 @@ function App() {
   const [settingsEnabledOnly, setSettingsEnabledOnly] = useState(false);
   const [settingsPackageOnly, setSettingsPackageOnly] = useState(false);
   const [settingsExpanded, setSettingsExpanded] = useState(false);
+  const [recordingShortcut, setRecordingShortcut] =
+    useState<ShortcutAction | null>(null);
+  const [shortcutErrors, setShortcutErrors] = useState<
+    Partial<Record<ShortcutAction, string>>
+  >({});
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckState>({
     status: "idle",
     result: null,
@@ -259,6 +286,7 @@ function App() {
   const busyGate = useRef(false);
   const workspaceEpoch = useRef(0);
   const startupUpdateChecked = useRef(false);
+  const currentShortcutPlatform = useRef(shortcutPlatform()).current;
   useEffect(() => {
     const onError = () =>
       recordRendererEvent("window_error", "window", "observed");
@@ -347,6 +375,118 @@ function App() {
       setBusy("");
     }
   };
+  const currentShortcutSettings = useMemo(
+    () => boot?.shortcutSettings ?? defaultShortcutSettings(),
+    [boot?.shortcutSettings],
+  );
+  const shortcutBindings = useMemo(
+    () => resolveShortcutBindings(currentShortcutSettings),
+    [currentShortcutSettings],
+  );
+  const shortcut = (action: ShortcutAction) =>
+    shortcutPresentation(action, shortcutBindings, currentShortcutPlatform);
+  const persistShortcutSettings = async (settings: ShortcutSettings) => {
+    const saved = await invoke<ShortcutSettings>("set_shortcut_settings", {
+      settings,
+    });
+    setBoot((current) =>
+      current ? { ...current, shortcutSettings: saved } : current,
+    );
+    return saved;
+  };
+  useEffect(() => {
+    if (tab !== "settings") setRecordingShortcut(null);
+  }, [tab]);
+  useEffect(() => {
+    const modifierKeys = new Set([
+      "Alt",
+      "AltGraph",
+      "Control",
+      "Meta",
+      "Shift",
+    ]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (recordingShortcut) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          setRecordingShortcut(null);
+          setShortcutErrors((current) => ({
+            ...current,
+            [recordingShortcut]: "",
+          }));
+          return;
+        }
+        if (modifierKeys.has(event.key)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const binding = shortcutFromKeyboardEvent(
+          event,
+          currentShortcutPlatform,
+        );
+        if (!binding) {
+          setShortcutErrors((current) => ({
+            ...current,
+            [recordingShortcut]:
+              "请按 Ctrl/Command，可额外按 Shift，再按一个字母、数字或 Enter。",
+          }));
+          return;
+        }
+        const validation = shortcutValidationError(
+          binding,
+          recordingShortcut,
+          shortcutBindings,
+        );
+        if (validation) {
+          setShortcutErrors((current) => ({
+            ...current,
+            [recordingShortcut]: validation,
+          }));
+          return;
+        }
+        const action = recordingShortcut;
+        void run("保存快捷键", async () => {
+          await persistShortcutSettings(
+            settingsWithBinding(currentShortcutSettings, action, binding),
+          );
+          setRecordingShortcut(null);
+          setShortcutErrors((current) => ({ ...current, [action]: "" }));
+          setNotice("快捷键已保存。", "success");
+        });
+        return;
+      }
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        tab !== "new" ||
+        document.querySelector('[role="dialog"][aria-modal="true"]')
+      )
+        return;
+      const binding = shortcutFromKeyboardEvent(event, currentShortcutPlatform);
+      if (!binding) return;
+      const action = shortcutDefinitions.find(
+        (item) => shortcutBindings[item.id] === binding,
+      )?.id;
+      if (!action) return;
+      const button = document.querySelector<HTMLButtonElement>(
+        `[data-shortcut-action="${action}"]`,
+      );
+      if (!button || button.disabled || button.getClientRects().length === 0)
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      button.click();
+    };
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [
+    currentShortcutPlatform,
+    currentShortcutSettings,
+    recordingShortcut,
+    shortcutBindings,
+    tab,
+  ]);
   const checkForUpdates = async (showStartupPrompt = false) => {
     if (updateCheck.status === "checking") return;
     setUpdateCheck((current) => ({
@@ -1414,7 +1554,10 @@ function App() {
     !enabledProjects(projects, appliedProjectSettings).length,
   );
   const normalizedSettingsQuery = settingsQuery.trim().toLocaleLowerCase();
-  const visibleSettingsProjects = projects.filter((project) => {
+  const visibleSettingsProjects = projectsWithEnabledFirst(
+    projects,
+    appliedProjectSettings,
+  ).filter((project) => {
     const setting = projectSettings.entries.find(
       (item) => item.projectId === project.id,
     );
@@ -2062,6 +2205,8 @@ function App() {
               </label>
               <button
                 className="header-action-button primary"
+                data-shortcut-action="newIssue"
+                aria-keyshortcuts={shortcut("newIssue").aria}
                 disabled={
                   !profileConfigured(boot.profile) || !projectId || !!busy
                 }
@@ -2069,6 +2214,7 @@ function App() {
                 onClick={() => void run("创建草稿", newDraft)}
               >
                 ＋ 新建问题
+                <ShortcutBadge shortcut={shortcut("newIssue")} />
               </button>
             </div>
           </header>
@@ -2317,6 +2463,107 @@ function App() {
                     </div>
                   )}
                 </div>
+              )}
+            </section>
+            <section className="card settings-card shortcut-settings-card">
+              <div className="card-title">
+                <div>
+                  <h2>快捷键</h2>
+                  <p className="muted-text">
+                    仅在“新建提交”页生效。macOS 使用 Command，Windows/Linux 使用
+                    Ctrl；复制、粘贴等常用编辑组合不会被占用。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={
+                    !!busy ||
+                    Object.keys(currentShortcutSettings.overrides).length === 0
+                  }
+                  onClick={() =>
+                    void run("恢复默认快捷键", async () => {
+                      await persistShortcutSettings(defaultShortcutSettings());
+                      setRecordingShortcut(null);
+                      setShortcutErrors({});
+                      setNotice("快捷键已全部恢复默认。", "success");
+                    })
+                  }
+                >
+                  全部恢复默认
+                </button>
+              </div>
+              <div className="shortcut-settings-list">
+                {shortcutDefinitions.map((item) => {
+                  const presentation = shortcut(item.id);
+                  const recording = recordingShortcut === item.id;
+                  const modified = Boolean(
+                    currentShortcutSettings.overrides[item.id],
+                  );
+                  return (
+                    <div className="shortcut-setting-row" key={item.id}>
+                      <div className="shortcut-setting-copy">
+                        <strong>{item.title}</strong>
+                        <span>新建提交页</span>
+                      </div>
+                      <kbd className="shortcut-setting-value">
+                        {presentation.display}
+                      </kbd>
+                      <button
+                        type="button"
+                        className={recording ? "primary" : ""}
+                        aria-label={`录制“${item.title}”快捷键`}
+                        aria-pressed={recording}
+                        disabled={!!busy}
+                        onClick={() => {
+                          setRecordingShortcut(recording ? null : item.id);
+                          setShortcutErrors((current) => ({
+                            ...current,
+                            [item.id]: "",
+                          }));
+                          setNotice("");
+                        }}
+                      >
+                        {recording ? "请按快捷键…" : "录制"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!!busy || !modified}
+                        onClick={() =>
+                          void run("恢复默认快捷键", async () => {
+                            await persistShortcutSettings(
+                              settingsWithoutBindingOverride(
+                                currentShortcutSettings,
+                                item.id,
+                              ),
+                            );
+                            setRecordingShortcut(null);
+                            setShortcutErrors((current) => ({
+                              ...current,
+                              [item.id]: "",
+                            }));
+                            setNotice(`“${item.title}”已恢复默认快捷键。`);
+                          })
+                        }
+                      >
+                        恢复默认
+                      </button>
+                      {shortcutErrors[item.id] && (
+                        <small className="error-text" role="alert">
+                          {shortcutErrors[item.id]}
+                        </small>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {recordingShortcut && (
+                <p className="muted-text shortcut-recording-note" role="status">
+                  正在录制“
+                  {shortcutDefinitions.find(
+                    (item) => item.id === recordingShortcut,
+                  )?.title ?? recordingShortcut}
+                  ”：按下新组合，或按 Escape 取消。
+                </p>
               )}
             </section>
             <section
@@ -2723,6 +2970,7 @@ function App() {
                     onComplete={() =>
                       setNotice("设备环境快照已获取，文本已加入附件")
                     }
+                    shortcut={shortcut("environmentSnapshot")}
                   />
                   <PostCaptureEntry
                     key={`post-capture:${organizationId}:${projectId}:${draft.id}`}
@@ -2738,9 +2986,12 @@ function App() {
                     onPrepare={() => save()}
                     onUpdate={updatePostCapture}
                     onComplete={() => setNotice("补采完成")}
+                    shortcut={shortcut("postCapture")}
                   />
                   <div className="action-item" id="field-attachment-import">
                     <button
+                      data-shortcut-action="importAttachments"
+                      aria-keyshortcuts={shortcut("importAttachments").aria}
                       disabled={frozen || !!busy}
                       onClick={() =>
                         void run(
@@ -2751,6 +3002,7 @@ function App() {
                       }
                     >
                       导入附件
+                      <ShortcutBadge shortcut={shortcut("importAttachments")} />
                     </button>
                     {fieldError("attachment-import")}
                     {routedMessages("attachment-import").map((message) => (
@@ -2963,6 +3215,8 @@ function App() {
                 )}
                 <div className="actions">
                   <button
+                    data-shortcut-action="saveDraft"
+                    aria-keyshortcuts={shortcut("saveDraft").aria}
                     disabled={frozen || !!busy}
                     onClick={() =>
                       void run("保存草稿", async () => {
@@ -2972,8 +3226,11 @@ function App() {
                     }
                   >
                     保存草稿
+                    <ShortcutBadge shortcut={shortcut("saveDraft")} />
                   </button>
                   <button
+                    data-shortcut-action="exportEvidence"
+                    aria-keyshortcuts={shortcut("exportEvidence").aria}
                     disabled={!!busy}
                     onClick={() =>
                       void run("导出证据包", async () => {
@@ -2987,10 +3244,13 @@ function App() {
                     }
                   >
                     导出本地证据
+                    <ShortcutBadge shortcut={shortcut("exportEvidence")} />
                   </button>
                   <button
                     ref={previewTriggerRef}
                     className="primary"
+                    data-shortcut-action="submissionPreview"
+                    aria-keyshortcuts={shortcut("submissionPreview").aria}
                     disabled={
                       frozen ||
                       !!busy ||
@@ -3013,6 +3273,7 @@ function App() {
                     }
                   >
                     进入提交预览
+                    <ShortcutBadge shortcut={shortcut("submissionPreview")} />
                   </button>
                 </div>
               </section>
