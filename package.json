@@ -1,7 +1,7 @@
 {
   "name": "android-bug-desk",
   "productName": "Android Bug Desk",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "USB Android evidence collection and personal Yunxiao bug submission",
   "author": "Android QA Team",
