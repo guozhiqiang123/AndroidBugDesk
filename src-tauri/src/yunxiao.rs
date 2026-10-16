@@ -565,6 +565,51 @@ impl Api {
         self.list(&format!("/workitems/{}/activities", encode_id(id)?), false)
             .await
     }
+    pub(crate) async fn download_attachment_bytes(
+        &self,
+        row: &Value,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let url = string(row, "url");
+        let parsed = reqwest::Url::parse(&url).map_err(|_| "附件缺少可用下载地址")?;
+        let local_test = self.base.starts_with("http://127.0.0.1:")
+            && parsed.scheme() == "http"
+            && parsed.host_str() == Some("127.0.0.1");
+        if parsed.scheme() != "https" && !local_test {
+            return Err("附件下载必须使用 HTTPS".into());
+        }
+        // Signed attachment hosts must never receive the Yunxiao token.
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "附件下载客户端初始化失败")?;
+        let mut response = client
+            .get(parsed)
+            .send()
+            .await
+            .map_err(|_| "附件下载失败，请重新打开详情后重试")?;
+        if !response.status().is_success() {
+            return Err("附件临时下载地址已失效，请重新打开详情后重试".into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            return Err("附件超过 100 MB，不能在客户端预览".into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "附件下载中断")? {
+            if bytes.len() as u64 + chunk.len() as u64 > max_bytes {
+                return Err("附件超过 100 MB，不能在客户端预览".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err("附件内容为空，不能预览".into());
+        }
+        Ok(bytes)
+    }
     pub async fn upload(&self, id: &str, a: &Attachment, name: &str) -> Result<UploadedAttachment> {
         let part = reqwest::multipart::Part::file(&a.path)
             .await

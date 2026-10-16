@@ -111,6 +111,13 @@ export interface ProjectBugDetail extends ProjectBugItem {
   sectionWarnings: ProjectBugSectionWarning[];
 }
 
+export interface ProjectBugAttachmentPreview {
+  kind: "image" | "text" | "system";
+  name: string;
+  mime: string;
+  data: string;
+}
+
 export function emptyProjectBugFilters(): ProjectBugFilters {
   return {
     keyword: "",

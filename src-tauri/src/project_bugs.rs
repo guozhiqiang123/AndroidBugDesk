@@ -3,10 +3,17 @@ use crate::{
     model::{string, Metadata, OptionItem, Result},
     yunxiao::{WorkitemSearchPage, WorkitemSearchQuery},
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    time::{Duration, SystemTime},
+};
 use tauri::State;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
@@ -242,6 +249,15 @@ pub struct ProjectBugDetail {
     pub comments: Vec<ProjectBugComment>,
     pub activities: Vec<ProjectBugActivity>,
     pub section_warnings: Vec<ProjectBugSectionWarning>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugAttachmentPreview {
+    pub kind: &'static str,
+    pub name: String,
+    pub mime: String,
+    pub data: String,
 }
 
 fn option_at(value: &Value, path: &str) -> Result<Option<OptionItem>> {
@@ -550,6 +566,263 @@ async fn detail_for_state(
     crate::workspace::observed_error(state, result)
 }
 
+const REMOTE_ATTACHMENT_LIMIT: u64 = 100 * 1024 * 1024;
+const INLINE_IMAGE_LIMIT: usize = 12 * 1024 * 1024;
+const INLINE_TEXT_LIMIT: usize = 2 * 1024 * 1024;
+const REMOTE_PREVIEW_CACHE_LIMIT: u64 = 100 * 1024 * 1024;
+const REMOTE_PREVIEW_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn safe_attachment_name(name: &str, suffix: &str) -> String {
+    let mut safe = name
+        .chars()
+        .map(|value| {
+            if value.is_control()
+                || matches!(value, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                value
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    if safe.trim_matches(['.', ' ']).is_empty() {
+        safe = "yunxiao-attachment".into();
+    }
+    if Path::new(&safe).extension().is_none() {
+        let suffix = suffix.trim().trim_start_matches('.');
+        if !suffix.is_empty()
+            && suffix.len() <= 12
+            && suffix.chars().all(|value| value.is_ascii_alphanumeric())
+        {
+            safe.push('.');
+            safe.push_str(suffix);
+        }
+    }
+    safe
+}
+
+fn dangerous_preview(bytes: &[u8], name: &str) -> bool {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    [
+        "exe",
+        "com",
+        "bat",
+        "cmd",
+        "ps1",
+        "command",
+        "sh",
+        "desktop",
+        "app",
+        "lnk",
+        "url",
+        "msi",
+        "vbs",
+        "js",
+        "py",
+        "pyw",
+        "rb",
+        "pl",
+        "jar",
+        "hta",
+        "scpt",
+        "applescript",
+        "bash",
+        "zsh",
+        "fish",
+    ]
+    .contains(&extension.as_str())
+        || bytes.starts_with(b"MZ")
+        || bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(b"#!")
+        || [
+            b"\xfe\xed\xfa\xce".as_slice(),
+            b"\xce\xfa\xed\xfe".as_slice(),
+            b"\xfe\xed\xfa\xcf".as_slice(),
+            b"\xcf\xfa\xed\xfe".as_slice(),
+            b"\xca\xfe\xba\xbe".as_slice(),
+            b"\xbe\xba\xfe\xca".as_slice(),
+        ]
+        .iter()
+        .any(|magic| bytes.starts_with(magic))
+}
+
+fn prune_preview_cache(root: &Path, incoming: u64) -> Result<()> {
+    if incoming > REMOTE_PREVIEW_CACHE_LIMIT {
+        return Err("附件超过 100 MB，不能在客户端预览".into());
+    }
+    fs::create_dir_all(root).map_err(|_| "无法建立云效附件临时目录")?;
+    let now = SystemTime::now();
+    let mut files = fs::read_dir(root)
+        .map_err(|_| "无法读取云效附件临时目录")?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| {
+                (
+                    entry.path(),
+                    metadata.len(),
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    files.retain(|(path, _, modified)| {
+        if now.duration_since(*modified).unwrap_or_default() > REMOTE_PREVIEW_MAX_AGE {
+            let _ = fs::remove_file(path);
+            false
+        } else {
+            true
+        }
+    });
+    files.sort_by_key(|(_, _, modified)| *modified);
+    let mut total = files.iter().map(|(_, size, _)| size).sum::<u64>();
+    for (path, size, _) in files {
+        if total.saturating_add(incoming) <= REMOTE_PREVIEW_CACHE_LIMIT {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    if total.saturating_add(incoming) > REMOTE_PREVIEW_CACHE_LIMIT {
+        return Err("云效附件临时目录空间不足，请稍后重试".into());
+    }
+    Ok(())
+}
+
+fn system_preview_attachment(
+    state: &AppState,
+    scope: &str,
+    bug_id: &str,
+    attachment_id: &str,
+    metadata: &ProjectBugAttachment,
+    bytes: &[u8],
+) -> Result<crate::model::Attachment> {
+    let root = state.store.root.join("remote-previews");
+    prune_preview_cache(&root, bytes.len() as u64)?;
+    let name = safe_attachment_name(&metadata.name, &metadata.suffix);
+    let key = Sha256::digest(format!("{scope}:{bug_id}:{attachment_id}").as_bytes());
+    let path = root.join(format!("{}-{name}", hex::encode(key)));
+    fs::write(&path, bytes).map_err(|_| "无法保存云效附件临时副本")?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (role, mime) = if extension == "zip" && bytes.starts_with(b"PK\x03\x04") {
+        ("report", "application/zip")
+    } else if ["mp4", "mov", "m4v"].contains(&extension.as_str()) {
+        ("video", "video/mp4")
+    } else {
+        ("sample", "application/octet-stream")
+    };
+    Ok(crate::model::Attachment {
+        id: attachment_id.into(),
+        name,
+        path: path.to_string_lossy().into_owned(),
+        mime: mime.into(),
+        size: bytes.len() as u64,
+        sha256: hex::encode(Sha256::digest(bytes)),
+        role: role.into(),
+        source: "云效工作项附件临时预览".into(),
+        coverage_start: String::new(),
+        coverage_end: String::new(),
+        confirmed: true,
+        derived_from: None,
+    })
+}
+
+async fn attachment_preview_for_state(
+    state: &AppState,
+    id: &str,
+    attachment_id: &str,
+    project_id: Option<&str>,
+) -> Result<(
+    ProjectBugAttachmentPreview,
+    Option<crate::model::Attachment>,
+)> {
+    crate::yunxiao::encode_id(id).map_err(|_| "项目 Bug ID 不正确")?;
+    crate::yunxiao::encode_id(attachment_id).map_err(|_| "项目 Bug 附件 ID 不正确")?;
+    let request = crate::workspace::read_scope(state, project_id)?;
+    let result = async {
+        let detail = request.api.get(id).await?;
+        item(&detail, &request.api.profile.project_id)?;
+        let rows = request.api.attachments(id).await?;
+        let row = rows
+            .into_iter()
+            .find(|row| string(row, "id") == attachment_id)
+            .ok_or("云效附件不存在或已被移除")?;
+        let metadata = map_attachments(vec![row.clone()])?
+            .pop()
+            .ok_or("云效附件信息不完整")?;
+        if metadata.size > REMOTE_ATTACHMENT_LIMIT {
+            return Err("附件超过 100 MB，不能在客户端预览".into());
+        }
+        let bytes = request
+            .api
+            .download_attachment_bytes(&row, REMOTE_ATTACHMENT_LIMIT)
+            .await?;
+        let name = safe_attachment_name(&metadata.name, &metadata.suffix);
+        if dangerous_preview(&bytes, &name) {
+            return Err("此附件是程序或脚本，不能作为预览启动".into());
+        }
+        if bytes.len() <= INLINE_IMAGE_LIMIT && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Ok((
+                ProjectBugAttachmentPreview {
+                    kind: "image",
+                    name,
+                    mime: "image/png".into(),
+                    data: format!("data:image/png;base64,{}", STANDARD.encode(bytes)),
+                },
+                None,
+            ));
+        }
+        if bytes.len() <= INLINE_IMAGE_LIMIT && bytes.starts_with(b"\xff\xd8\xff") {
+            return Ok((
+                ProjectBugAttachmentPreview {
+                    kind: "image",
+                    name,
+                    mime: "image/jpeg".into(),
+                    data: format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)),
+                },
+                None,
+            ));
+        }
+        if bytes.len() <= INLINE_TEXT_LIMIT && !bytes.contains(&0) {
+            if let Ok(text) = String::from_utf8(bytes.clone()) {
+                return Ok((
+                    ProjectBugAttachmentPreview {
+                        kind: "text",
+                        name,
+                        mime: "text/plain".into(),
+                        data: text,
+                    },
+                    None,
+                ));
+            }
+        }
+        let attachment =
+            system_preview_attachment(state, &request.key, id, attachment_id, &metadata, &bytes)?;
+        Ok((
+            ProjectBugAttachmentPreview {
+                kind: "system",
+                name,
+                mime: attachment.mime.clone(),
+                data: String::new(),
+            },
+            Some(attachment),
+        ))
+    }
+    .await;
+    crate::workspace::ensure_read_scope(state, &request)?;
+    crate::workspace::observed_error(state, result)
+}
+
 async fn list_for_state(
     state: &AppState,
     query: ProjectBugQuery,
@@ -662,6 +935,41 @@ pub async fn project_bug_detail(
     state: State<'_, AppState>,
 ) -> Result<ProjectBugDetail> {
     detail_for_state(&state, &id, project_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn preview_project_bug_attachment(
+    id: String,
+    attachment_id: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectBugAttachmentPreview> {
+    let (preview, attachment) =
+        attachment_preview_for_state(&state, &id, &attachment_id, project_id.as_deref()).await?;
+    if let Some(attachment) = attachment {
+        tauri::async_runtime::spawn_blocking(move || {
+            if crate::commands::uses_macos_quick_look(&attachment) {
+                crate::evidence::verify_attachment(&attachment)?;
+                return std::process::Command::new("/usr/bin/qlmanage")
+                    .args(["-p", &attachment.path])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|_| "无法使用 macOS 快速查看预览云效附件".to_string());
+            }
+            crate::commands::open_attachment_with(
+                &attachment,
+                |path, application| match application {
+                    Some(application) => open::with(path, application),
+                    None => open::that(path),
+                },
+            )
+        })
+        .await
+        .map_err(|_| "云效附件预览启动失败".to_string())??;
+    }
+    Ok(preview)
 }
 
 #[cfg(test)]
@@ -950,5 +1258,89 @@ mod tests {
             .unwrap_err()
             .contains("范围不一致"));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_image_preview_uses_a_separate_client_without_the_pat() {
+        let server = MockServer::start().await;
+        let base = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"SKII-614","subject":"清理功能异常",
+                "categoryId":"Bug","space":{"id":"project-a"},"labels":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/attachments")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id":"attachment-a","fileId":"file-a","fileName":"screen.png",
+                "suffix":".png","size":12,"url":format!("{}/signed/screen", server.uri())
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/signed/screen"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"\x89PNG\r\n\x1a\nmock".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        let (preview, system_file) =
+            attachment_preview_for_state(&state, "bug-a", "attachment-a", Some("project-a"))
+                .await
+                .unwrap();
+        assert_eq!(preview.kind, "image");
+        assert!(preview.data.starts_with("data:image/png;base64,"));
+        assert!(system_file.is_none());
+        let requests = server.received_requests().await.unwrap();
+        let signed = requests
+            .iter()
+            .find(|request| request.url.path() == "/signed/screen")
+            .unwrap();
+        assert!(signed.headers.get("x-yunxiao-token").is_none());
+        assert!(signed.headers.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_preview_rejects_programs_and_untrusted_plain_http_urls() {
+        assert!(dangerous_preview(b"#!/bin/sh\necho unsafe", "capture.txt"));
+        assert!(dangerous_preview(b"MZmock", "capture.log"));
+        assert_eq!(safe_attachment_name("../bad:name", ".txt"), ".._bad_name");
+
+        let server = MockServer::start().await;
+        let base = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"SKII-614","subject":"清理功能异常",
+                "categoryId":"Bug","space":{"id":"project-a"},"labels":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/attachments")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id":"attachment-a","fileId":"file-a","fileName":"capture.zip",
+                "suffix":".zip","size":12,"url":"http://example.test/capture.zip"
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        assert!(
+            attachment_preview_for_state(&state, "bug-a", "attachment-a", Some("project-a"))
+                .await
+                .unwrap_err()
+                .contains("HTTPS")
+        );
     }
 }

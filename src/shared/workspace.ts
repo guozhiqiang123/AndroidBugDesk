@@ -2,6 +2,7 @@ import type { Draft, Option, Profile } from "./domain";
 import type { ShortcutSettings } from "./shortcuts";
 import type {
   ProjectBugDetail,
+  ProjectBugAttachmentPreview,
   ProjectBugFacets,
   ProjectBugPage,
 } from "./project-bugs";
@@ -101,6 +102,7 @@ export interface WorkspaceCommands {
   list_project_bugs: ProjectBugPage;
   project_bug_facets: ProjectBugFacets;
   project_bug_detail: ProjectBugDetail;
+  preview_project_bug_attachment: ProjectBugAttachmentPreview;
   check_for_updates: UpdateCheckResult;
   install_update: UpdateInstallResult;
   open_release_page: void;
