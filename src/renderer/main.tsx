@@ -3435,7 +3435,10 @@ function App() {
             profile={boot.profile}
             configured={!!projectId && profileConfigured(boot.profile)}
             busy={!!busy}
-            remoteError={(e) => handleRemoteError(e, "项目 Bug 读取失败")}
+            remoteError={(e, context = "项目 Bug 读取失败") =>
+              handleRemoteError(e, context)
+            }
+            notify={setNotice}
           />
         )}
         {tab === "history" && (

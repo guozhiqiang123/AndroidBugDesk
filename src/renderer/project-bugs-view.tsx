@@ -1,12 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile } from "../shared/domain";
+import type { Option, Profile } from "../shared/domain";
 import {
   emptyProjectBugFilters,
   projectBugDateError,
   isProjectBugDetailCacheFresh,
   projectBugQuery,
   projectBugSortOptions,
+  projectBugStatusTone,
   type ProjectBugFacets,
   type ProjectBugFilters,
   type ProjectBugDetail,
@@ -20,7 +21,8 @@ interface Props {
   profile: Profile;
   configured: boolean;
   busy: boolean;
-  remoteError: (error: unknown) => Promise<void>;
+  remoteError: (error: unknown, context?: string) => Promise<void>;
+  notify: (message: string, kind?: "success" | "warning" | "error") => void;
 }
 
 const emptyFacets: ProjectBugFacets = {
@@ -41,6 +43,7 @@ export function ProjectBugsView({
   configured,
   busy,
   remoteError,
+  notify,
 }: Props) {
   const [filters, setFilters] = useState<ProjectBugFilters>(
     emptyProjectBugFilters,
@@ -56,6 +59,12 @@ export function ProjectBugsView({
   const [facetsError, setFacetsError] = useState("");
   const [actionError, setActionError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
+  const [statusError, setStatusError] = useState("");
+  const [statusUpdating, setStatusUpdating] = useState("");
+  const [statusLoading, setStatusLoading] = useState<Set<string>>(new Set());
+  const [statusOptions, setStatusOptions] = useState<Record<string, Option[]>>(
+    {},
+  );
   const [selected, setSelected] = useState<ProjectBugItem | null>(null);
   const [detail, setDetail] = useState<ProjectBugDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -194,6 +203,83 @@ export function ProjectBugsView({
     setSelected(null);
     setDetail(null);
     setDetailError("");
+  };
+
+  const loadStatusOptions = async (item: ProjectBugItem) => {
+    if (statusOptions[item.id] || statusLoading.has(item.id)) return;
+    setStatusLoading((current) => new Set(current).add(item.id));
+    setStatusError("");
+    try {
+      const result = await invoke<Option[]>("project_bug_workflow", {
+        id: item.id,
+        projectId: profile.projectId,
+      });
+      if (!alive.current) return;
+      const options =
+        item.status && !result.some((status) => status.id === item.status?.id)
+          ? [item.status, ...result]
+          : result;
+      if (!options.length) throw new Error("当前 Bug 的工作流没有可用状态");
+      setStatusOptions((current) => ({ ...current, [item.id]: options }));
+    } catch (failure) {
+      if (!alive.current) return;
+      setStatusError(String(failure));
+      await remoteErrorRef.current(failure, "项目 Bug 状态读取失败");
+    } finally {
+      if (alive.current)
+        setStatusLoading((current) => {
+          const next = new Set(current);
+          next.delete(item.id);
+          return next;
+        });
+    }
+  };
+
+  const updateStatus = async (item: ProjectBugItem, statusId: string) => {
+    if (!statusId || statusId === item.status?.id || statusUpdating) return;
+    setStatusUpdating(item.id);
+    setStatusError("");
+    try {
+      const status = await invoke<Option>("update_project_bug_status", {
+        id: item.id,
+        statusId,
+        projectId: profile.projectId,
+      });
+      if (!alive.current) return;
+      setPage((current) =>
+        current
+          ? {
+              ...current,
+              items: current.items.map((entry) =>
+                entry.id === item.id ? { ...entry, status } : entry,
+              ),
+            }
+          : current,
+      );
+      setSelected((current) =>
+        current?.id === item.id ? { ...current, status } : current,
+      );
+      setDetail((current) =>
+        current?.id === item.id ? { ...current, status } : current,
+      );
+      const cached = detailCache.current.get(item.id);
+      if (cached)
+        detailCache.current.set(item.id, {
+          ...cached,
+          detail: { ...cached.detail, status },
+        });
+      notify(`${item.identifier || item.title} 已更新为「${status.name}」`);
+      void load(applied, page?.page ?? 1);
+    } catch (failure) {
+      if (!alive.current) return;
+      const message = String(failure);
+      setStatusError(message);
+      await remoteErrorRef.current(failure, "项目 Bug 状态更新失败");
+      if (message.includes("状态写入未获得确定响应"))
+        void load(applied, page?.page ?? 1);
+    } finally {
+      if (alive.current) setStatusUpdating("");
+    }
   };
 
   return (
@@ -369,6 +455,11 @@ export function ProjectBugsView({
             打开云效失败：{actionError}
           </p>
         )}
+        {statusError && (
+          <p className="banner error" role="alert">
+            状态操作失败：{statusError}
+          </p>
+        )}
 
         <div className="project-bug-table-wrap" aria-busy={loading}>
           <table className="project-bug-table">
@@ -401,9 +492,36 @@ export function ProjectBugsView({
                     </small>
                   </td>
                   <td>
-                    <span className="pill">
-                      {item.status?.name || "未提供"}
-                    </span>
+                    {(() => {
+                      const loaded = Object.hasOwn(statusOptions, item.id);
+                      const missing = {
+                        id: `missing-${item.id}`,
+                        name: "未提供",
+                      };
+                      const options = loaded
+                        ? statusOptions[item.id]
+                        : [item.status ?? missing];
+                      return (
+                        <CustomSelect
+                          autoSelectFirst={false}
+                          value={
+                            loaded ? (item.status?.id ?? "") : options[0].id
+                          }
+                          options={options}
+                          label={`修改 ${item.identifier || item.title} 状态`}
+                          className={`project-bug-status-select status-tone-${projectBugStatusTone(item.status)}`}
+                          loading={statusLoading.has(item.id)}
+                          loadingLabel="正在读取可用状态…"
+                          disabled={
+                            busy || loading || statusUpdating === item.id
+                          }
+                          onOpen={() => void loadStatusOptions(item)}
+                          onChange={(value) =>
+                            void updateStatus(item, value as string)
+                          }
+                        />
+                      );
+                    })()}
                   </td>
                   <td>{item.assignedTo?.name || "未分配"}</td>
                   <td>{item.creator?.name || "—"}</td>

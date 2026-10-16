@@ -1191,6 +1191,46 @@ async fn facets(
     })
 }
 
+async fn workflow_for_state(
+    state: &AppState,
+    id: &str,
+    project_id: Option<&str>,
+) -> Result<Vec<OptionItem>> {
+    let request = crate::workspace::read_scope(state, project_id)?;
+    let result = async {
+        let value = request.api.get(id).await?;
+        item(&value, &request.api.profile.project_id)?;
+        request.api.workitem_workflow(id).await
+    }
+    .await;
+    crate::workspace::ensure_read_scope(state, &request)?;
+    crate::workspace::observed_error(state, result)
+}
+
+async fn update_status_for_state(
+    state: &AppState,
+    id: &str,
+    status_id: &str,
+    project_id: Option<&str>,
+) -> Result<OptionItem> {
+    let request = crate::workspace::read_scope(state, project_id)?;
+    let result = async {
+        let value = request.api.get(id).await?;
+        item(&value, &request.api.profile.project_id)?;
+        let statuses = request.api.workitem_workflow(id).await?;
+        let target = statuses
+            .into_iter()
+            .find(|status| status.id == status_id)
+            .ok_or("目标状态不在当前 Bug 的工作流中")?;
+        crate::workspace::ensure_read_scope(state, &request)?;
+        request.api.update_status(id, status_id).await?;
+        Ok(target)
+    }
+    .await;
+    crate::workspace::ensure_read_scope(state, &request)?;
+    crate::workspace::observed_error(state, result)
+}
+
 #[tauri::command]
 pub async fn list_project_bugs(
     query: ProjectBugQuery,
@@ -1206,6 +1246,25 @@ pub async fn project_bug_facets(
     state: State<'_, AppState>,
 ) -> Result<ProjectBugFacets> {
     facets_for_state(&state, project_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn project_bug_workflow(
+    id: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<OptionItem>> {
+    workflow_for_state(&state, &id, project_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn update_project_bug_status(
+    id: String,
+    status_id: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<OptionItem> {
+    update_status_for_state(&state, &id, &status_id, project_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -1447,6 +1506,90 @@ mod tests {
         assert_eq!(result.statuses.len(), 1);
         assert_eq!(result.members[0].name, "测试人员");
         assert!(result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_update_uses_the_bug_workflow_and_writes_the_selected_status_once() {
+        let server = MockServer::start().await;
+        let item_path = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(item_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"SKII-614","subject":"清理功能异常",
+                "categoryId":"Bug","space":{"id":"project-a"},
+                "status":{"id":"todo","displayName":"待处理"}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{item_path}/workflow")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statuses":[
+                    {"id":"todo","displayName":"待处理"},
+                    {"id":"fixed","displayName":"已修复"}
+                ]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(item_path))
+            .and(body_partial_json(json!({"status":"fixed"})))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        let statuses = workflow_for_state(&state, "bug-a", Some("project-a"))
+            .await
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[1].name, "已修复");
+
+        let updated = update_status_for_state(&state, "bug-a", "fixed", Some("project-a"))
+            .await
+            .unwrap();
+        assert_eq!(updated.id, "fixed");
+        assert_eq!(updated.name, "已修复");
+    }
+
+    #[tokio::test]
+    async fn status_update_rejects_values_outside_the_bugs_current_workflow() {
+        let server = MockServer::start().await;
+        let item_path = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(item_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","categoryId":"Bug","space":{"id":"project-a"},
+                "status":{"id":"todo","displayName":"待处理"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{item_path}/workflow")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statuses":[{"id":"todo","displayName":"待处理"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(item_path))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        let error = update_status_for_state(&state, "bug-a", "closed", Some("project-a"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("不在当前 Bug 的工作流中"));
     }
 
     #[tokio::test]

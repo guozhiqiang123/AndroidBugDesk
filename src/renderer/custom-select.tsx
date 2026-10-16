@@ -44,6 +44,9 @@ export interface CustomSelectProps {
   label?: string;
   emptyLabel?: string;
   className?: string;
+  loading?: boolean;
+  loadingLabel?: string;
+  onOpen?: () => void;
   selectionIndicator?: "start" | "end";
   optionAction?: {
     label: string;
@@ -86,6 +89,9 @@ export function CustomSelect({
   label,
   emptyLabel = "未选择",
   className = "",
+  loading = false,
+  loadingLabel = "正在读取…",
+  onOpen,
   selectionIndicator = "end",
   optionAction,
   footerAction,
@@ -163,6 +169,7 @@ export function CustomSelect({
   ]);
 
   const choose = (index: number) => {
+    if (loading) return;
     if (index === options.length && footerAction) {
       if (footerAction.disabled) return;
       setOpen(false);
@@ -187,6 +194,10 @@ export function CustomSelect({
     onChange(option.id);
     button.current?.focus({ preventScroll: true });
   };
+  const showMenu = () => {
+    if (!open) onOpen?.();
+    setOpen(true);
+  };
   const move = (delta: number) => {
     if (!options.length) return;
     const count = options.length + (footerAction ? 1 : 0);
@@ -195,11 +206,11 @@ export function CustomSelect({
   const onKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      if (!open) setOpen(true);
+      showMenu();
       move(1);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      if (!open) setOpen(true);
+      showMenu();
       move(-1);
     } else if (event.key === "Home") {
       event.preventDefault();
@@ -209,7 +220,7 @@ export function CustomSelect({
       setActive(Math.max(options.length - (footerAction ? 0 : 1), 0));
     } else if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      if (!open) setOpen(true);
+      if (!open) showMenu();
       else choose(active);
     } else if (event.key === "Escape" && open) {
       event.preventDefault();
@@ -249,7 +260,8 @@ export function CustomSelect({
         aria-disabled={disabled || !options.length}
         disabled={disabled || !options.length}
         onClick={() => {
-          setOpen((current) => !current);
+          if (open) setOpen(false);
+          else showMenu();
           setActive(
             Math.max(
               0,
@@ -289,6 +301,11 @@ export function CustomSelect({
             }
           }}
         >
+          {loading && (
+            <div className="custom-select-loading" role="status">
+              {loadingLabel}
+            </div>
+          )}
           {options.map((option, index) => {
             const selectedOption = values.includes(option.id);
             const item = (
@@ -296,6 +313,7 @@ export function CustomSelect({
                 type="button"
                 role="option"
                 aria-selected={selectedOption}
+                disabled={loading}
                 className={`custom-select-option ${index === active ? "active" : ""} ${selectionIndicator === "start" ? "leading-indicator" : ""}`}
                 key={option.id}
                 onMouseEnter={() => setActive(index)}

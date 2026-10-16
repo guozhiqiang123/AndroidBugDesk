@@ -1,6 +1,17 @@
 import type { Option } from "./domain";
 
 export type ProjectBugSort = "created_desc" | "created_asc";
+export type ProjectBugStatusTone =
+  | "todo"
+  | "progress"
+  | "review"
+  | "success"
+  | "closed"
+  | "blocked"
+  | "custom-0"
+  | "custom-1"
+  | "custom-2"
+  | "custom-3";
 
 export interface ProjectBugFilters {
   keyword: string;
@@ -156,6 +167,27 @@ export const projectBugSortOptions: Option[] = [
   { id: "created_desc", name: "创建时间：最新优先" },
   { id: "created_asc", name: "创建时间：最早优先" },
 ];
+
+export function projectBugStatusTone(
+  status: Option | null,
+): ProjectBugStatusTone {
+  const name = status?.name.trim().toLowerCase() ?? "";
+  if (/暂不|拒绝|取消|挂起|搁置|won'?t\s*fix|rejected|cancel/.test(name))
+    return "blocked";
+  if (/关闭|归档|closed|archived/.test(name)) return "closed";
+  if (/已解决|已修复|已完成|resolved|fixed|completed|done/.test(name))
+    return "success";
+  if (/验证|验收|测试|review|verify|testing/.test(name)) return "review";
+  if (/处理中|修复中|进行中|开发中|in\s*progress|developing/.test(name))
+    return "progress";
+  if (/^待|待处理|待确认|新建|打开|todo|to\s*do|open|backlog/.test(name))
+    return "todo";
+  const key = status?.id || name || "unknown";
+  let hash = 0;
+  for (const character of key)
+    hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return `custom-${hash % 4}` as ProjectBugStatusTone;
+}
 
 export function projectBugDateError(filters: ProjectBugFilters): string {
   if (!!filters.createdFrom !== !!filters.createdTo)

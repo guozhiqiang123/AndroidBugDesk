@@ -499,6 +499,11 @@ textarea:focus {
   background: #fff;
   box-shadow: 0 10px 28px #182b4d22;
 }
+.custom-select-loading {
+  padding: 8px 10px;
+  color: #77859a;
+  font-size: 12px;
+}
 .custom-select-option {
   width: 100%;
   display: flex;
@@ -1800,9 +1805,83 @@ details {
   color: #8491a6;
   line-height: 1.45;
 }
-.project-bug-table .pill {
-  display: inline-block;
+.project-bug-status-select {
+  width: 124px;
+}
+.project-bug-status-select .custom-select-trigger {
+  min-height: 30px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
+}
+.project-bug-status-select .custom-select-menu {
+  right: auto;
+  width: max-content;
+  min-width: 150px;
+}
+.project-bug-status-select.status-tone-todo .custom-select-trigger {
+  border-color: #cbd8ec;
+  background: #edf3fc;
+  color: #526d95;
+}
+.project-bug-status-select.status-tone-progress .custom-select-trigger,
+.project-bug-status-select.status-tone-custom-0 .custom-select-trigger {
+  border-color: #b9d0fb;
+  background: #e8f1ff;
+  color: #2362bf;
+}
+.project-bug-status-select.status-tone-review .custom-select-trigger,
+.project-bug-status-select.status-tone-custom-1 .custom-select-trigger {
+  border-color: #f1d197;
+  background: #fff4dd;
+  color: #96600b;
+}
+.project-bug-status-select.status-tone-success .custom-select-trigger,
+.project-bug-status-select.status-tone-custom-2 .custom-select-trigger {
+  border-color: #b9dfca;
+  background: #e9f7ef;
+  color: #28734a;
+}
+.project-bug-status-select.status-tone-blocked .custom-select-trigger,
+.project-bug-status-select.status-tone-custom-3 .custom-select-trigger {
+  border-color: #d7c5ef;
+  background: #f4edfc;
+  color: #74509e;
+}
+.project-bug-status-select.status-tone-closed .custom-select-trigger {
+  border-color: #d7dee8;
+  background: #f1f4f8;
+  color: #6f7e91;
+}
+.project-bug-status-pill.status-tone-todo {
+  background: #edf3fc;
+  color: #526d95;
+}
+.project-bug-status-pill.status-tone-progress,
+.project-bug-status-pill.status-tone-custom-0 {
+  background: #e8f1ff;
+  color: #2362bf;
+}
+.project-bug-status-pill.status-tone-review,
+.project-bug-status-pill.status-tone-custom-1 {
+  background: #fff4dd;
+  color: #96600b;
+}
+.project-bug-status-pill.status-tone-success,
+.project-bug-status-pill.status-tone-custom-2 {
+  background: #e9f7ef;
+  color: #28734a;
+}
+.project-bug-status-pill.status-tone-blocked,
+.project-bug-status-pill.status-tone-custom-3 {
+  background: #f4edfc;
+  color: #74509e;
+}
+.project-bug-status-pill.status-tone-closed {
+  background: #f1f4f8;
+  color: #6f7e91;
 }
 .project-bug-pagination {
   justify-content: center;

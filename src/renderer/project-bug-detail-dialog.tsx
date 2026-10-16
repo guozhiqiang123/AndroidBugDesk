@@ -11,6 +11,7 @@ import type {
   ProjectBugInlineFile,
   ProjectBugItem,
 } from "../shared/project-bugs";
+import { projectBugStatusTone } from "../shared/project-bugs";
 import { AppDialog } from "./app-dialog";
 import { MarkdownPreview } from "./markdown-editor";
 import "./project-bug-detail-dialog.css";
@@ -330,7 +331,9 @@ export function ProjectBugDetailDialog({
         <div>
           <h3>{detail?.title || item.title || "未命名 Bug"}</h3>
           <div className="project-bug-detail-badges">
-            <span className="pill">
+            <span
+              className={`pill project-bug-status-pill status-tone-${projectBugStatusTone(detail?.status ?? item.status)}`}
+            >
               {detail?.status?.name || item.status?.name || "未提供状态"}
             </span>
             {detail?.archived && <span className="pill muted">已归档</span>}

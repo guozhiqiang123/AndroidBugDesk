@@ -101,6 +101,8 @@ export interface WorkspaceCommands {
   list_remote_history: HistoryPage;
   list_project_bugs: ProjectBugPage;
   project_bug_facets: ProjectBugFacets;
+  project_bug_workflow: Option[];
+  update_project_bug_status: Option;
   project_bug_detail: ProjectBugDetail;
   preview_project_bug_attachment: ProjectBugAttachmentPreview;
   preview_project_bug_inline_file: ProjectBugAttachmentPreview;

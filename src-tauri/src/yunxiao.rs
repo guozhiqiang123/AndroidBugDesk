@@ -359,6 +359,28 @@ impl Api {
             "displayName",
         )
     }
+    pub(crate) async fn workitem_workflow(&self, id: &str) -> Result<Vec<OptionItem>> {
+        let (workflow, _) = self
+            .request(
+                Method::GET,
+                &format!("/workitems/{}/workflow", encode_id(id)?),
+                None,
+            )
+            .await?;
+        let statuses = options(
+            workflow["statuses"]
+                .as_array()
+                .ok_or("工作项工作流状态列表格式变化")?
+                .clone(),
+            "id",
+            "displayName",
+        )?;
+        if statuses.is_empty() {
+            Err("当前 Bug 的工作流没有可用状态".into())
+        } else {
+            Ok(statuses)
+        }
+    }
     pub async fn history(
         &self,
         user_id: &str,
@@ -551,6 +573,25 @@ impl Api {
             Some(json!({"description":description,"formatType":"MARKDOWN"})),
         )
         .await?;
+        Ok(())
+    }
+    pub(crate) async fn update_status(&self, id: &str, status_id: &str) -> Result<()> {
+        let status_id = encode_id(status_id)?;
+        self.request(
+            Method::PUT,
+            &format!("/workitems/{}", encode_id(id)?),
+            Some(json!({"status":status_id})),
+        )
+        .await
+        .map_err(|error| {
+            if error.contains("权限不足") {
+                "云效权限不足，当前令牌需要项目协作工作项读写权限".into()
+            } else if error.contains("未获得确定响应") || error.contains("结果需核对") {
+                "状态写入未获得确定响应，请刷新项目 Bug 列表核对，不要立即重复操作".into()
+            } else {
+                error
+            }
+        })?;
         Ok(())
     }
     pub async fn attachments(&self, id: &str) -> Result<Vec<Value>> {

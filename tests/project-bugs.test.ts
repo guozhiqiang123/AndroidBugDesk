@@ -5,6 +5,7 @@ import {
   projectBugDetailCacheTtl,
   projectBugDateError,
   projectBugQuery,
+  projectBugStatusTone,
 } from "../src/shared/project-bugs";
 
 describe("项目 Bug 查询状态", () => {
@@ -40,5 +41,26 @@ describe("项目 Bug 查询状态", () => {
       isProjectBugDetailCacheFresh(now - projectBugDetailCacheTtl - 1, now),
     ).toBe(false);
     expect(isProjectBugDetailCacheFresh(now + 1, now)).toBe(false);
+  });
+
+  it("按状态语义给出稳定颜色并为自定义状态保留固定兜底色", () => {
+    expect(projectBugStatusTone({ id: "todo", name: "待处理" })).toBe("todo");
+    expect(projectBugStatusTone({ id: "doing", name: "修复中" })).toBe(
+      "progress",
+    );
+    expect(projectBugStatusTone({ id: "verify", name: "待验证" })).toBe(
+      "review",
+    );
+    expect(projectBugStatusTone({ id: "fixed", name: "已修复" })).toBe(
+      "success",
+    );
+    expect(projectBugStatusTone({ id: "later", name: "暂不修复" })).toBe(
+      "blocked",
+    );
+    expect(projectBugStatusTone({ id: "closed", name: "已关闭" })).toBe(
+      "closed",
+    );
+    const custom = { id: "custom-status", name: "需要产品确认" };
+    expect(projectBugStatusTone(custom)).toBe("custom-2");
   });
 });

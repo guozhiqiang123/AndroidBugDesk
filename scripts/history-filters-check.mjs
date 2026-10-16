@@ -99,6 +99,8 @@ try {
         rejectHistory: "",
         emptyHistory: false,
         sparseHistory: false,
+        projectBugStatus: { id: "open", name: "待处理" },
+        rejectStatusUpdate: false,
       });
       const add = (index, foreign = false) => {
         const d = {
@@ -300,6 +302,28 @@ try {
               members: [clone(metadata.members[0])],
               warnings: [],
             };
+          if (cmd === "project_bug_workflow")
+            return [
+              { id: "open", name: "待处理" },
+              { id: "doing", name: "处理中" },
+              { id: "fixed", name: "已修复" },
+              { id: "closed", name: "已关闭" },
+            ];
+          if (cmd === "update_project_bug_status") {
+            if (q.rejectStatusUpdate) throw Error("云效拒绝当前状态流转");
+            const statuses = {
+              open: "待处理",
+              doing: "处理中",
+              fixed: "已修复",
+              closed: "已关闭",
+            };
+            if (!statuses[args.statusId]) throw Error("目标状态不在工作流中");
+            q.projectBugStatus = {
+              id: args.statusId,
+              name: statuses[args.statusId],
+            };
+            return clone(q.projectBugStatus);
+          }
           if (cmd === "list_project_bugs")
             return {
               items: [
@@ -307,7 +331,7 @@ try {
                   id: "bug-detail-1",
                   identifier: "SKII-614",
                   title: "属于清理的部分功能无法使用（见录屏）",
-                  status: { id: "open", name: "待处理" },
+                  status: clone(q.projectBugStatus),
                   assignedTo: clone(metadata.members[0]),
                   creator: { id: "creator", name: "测试同学" },
                   labels: [{ id: "android", name: "Android" }],
@@ -326,7 +350,7 @@ try {
               id: "bug-detail-1",
               identifier: "SKII-614",
               title: "属于清理的部分功能无法使用（见录屏）",
-              status: { id: "open", name: "待处理" },
+              status: clone(q.projectBugStatus),
               assignedTo: clone(metadata.members[0]),
               creator: { id: "creator", name: "测试同学" },
               modifier: { id: "modifier", name: "修改人" },
@@ -799,9 +823,7 @@ try {
     0,
     "project Bug filters should no longer show labels",
   );
-  const sortBox = await filterFields
-    .filter({ hasText: "排序" })
-    .boundingBox();
+  const sortBox = await filterFields.filter({ hasText: "排序" }).boundingBox();
   const createdFromBox = await filterFields
     .filter({ hasText: "创建日期从" })
     .boundingBox();
@@ -809,6 +831,102 @@ try {
   assert(
     Math.abs(sortBox.y - createdFromBox.y) < 2 && sortBox.x < createdFromBox.x,
     "sort should occupy the former label slot before the date filters",
+  );
+  const statusSelect = bugs.getByRole("combobox", {
+    name: "修改 SKII-614 状态",
+    exact: true,
+  });
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "project_bug_workflow")
+          .length,
+    ),
+    0,
+    "workflows should be loaded on demand",
+  );
+  assert(
+    (await statusSelect.getAttribute("class"))?.includes(
+      "custom-select-trigger",
+    ),
+  );
+  assert(
+    (await statusSelect.locator("xpath=..").getAttribute("class"))?.includes(
+      "status-tone-todo",
+    ),
+  );
+  await statusSelect.click();
+  await page.getByRole("option", { name: "已修复", exact: true }).waitFor();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "project_bug_workflow")
+          .length,
+    ),
+    1,
+  );
+  await page.getByRole("option", { name: "待处理", exact: true }).click();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter(
+          (call) => call.cmd === "update_project_bug_status",
+        ).length,
+    ),
+    0,
+    "reselecting the current status should not write",
+  );
+  await statusSelect.click();
+  await page.getByRole("option", { name: "已修复", exact: true }).click();
+  await page
+    .getByText("SKII-614 已更新为「已修复」", { exact: true })
+    .waitFor();
+  await statusSelect.getByText("已修复", { exact: true }).waitFor();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter(
+          (call) =>
+            call.cmd === "update_project_bug_status" &&
+            call.args.id === "bug-detail-1" &&
+            call.args.statusId === "fixed",
+        ).length,
+    ),
+    1,
+  );
+  assert(
+    (await statusSelect.locator("xpath=..").getAttribute("class"))?.includes(
+      "status-tone-success",
+    ),
+  );
+  await page.screenshot({
+    path: path.join(output, "project-bug-status-colors.png"),
+    fullPage: true,
+  });
+  await statusSelect.click();
+  await page.getByRole("option", { name: "待处理", exact: true }).waitFor();
+  await page.keyboard.press("Escape");
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter((call) => call.cmd === "project_bug_workflow")
+          .length,
+    ),
+    1,
+    "the current page should reuse a loaded workflow",
+  );
+  await page.evaluate(() => {
+    window.__qa.rejectStatusUpdate = true;
+  });
+  await statusSelect.click();
+  await page.getByRole("option", { name: "已关闭", exact: true }).click();
+  await bugs.getByText(/状态操作失败：.*云效拒绝当前状态流转/).waitFor();
+  await statusSelect.getByText("已修复", { exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.__qa.rejectStatusUpdate = false;
+  });
+  scenarios.push(
+    "project Bug statuses use semantic colors and an on-demand workflow dropdown with success and rollback states",
   );
   await bugs
     .getByRole("button", {
@@ -855,8 +973,8 @@ try {
     1,
   );
   assert.equal(
-    await detailDialog.getByText("待处理", { exact: true }).count(),
-    2,
+    await detailDialog.getByText("已修复", { exact: true }).count(),
+    1,
   );
   await detailDialog
     .locator(".project-bug-attachment-row")
