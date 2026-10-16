@@ -3,9 +3,10 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{atomic::AtomicU64, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::{Manager, State};
 use zeroize::Zeroize;
@@ -20,10 +21,21 @@ pub struct AppState {
     pub(crate) oauth_flow: crate::oauth::LoginFlow,
     pub(crate) api_base: String,
     pub metadata: Mutex<Option<Metadata>>,
+    pub(crate) metadata_cache: Mutex<HashMap<String, CachedMetadata>>,
+    pub(crate) project_catalog_cache: Mutex<HashMap<String, CachedProjectCatalog>>,
     pub adb: Mutex<Option<PathBuf>>,
     pub collector: Mutex<Option<adb::Collector>>,
     pub locks: Mutex<HashSet<String>>,
 }
+pub(crate) struct CachedMetadata {
+    pub loaded_at: Instant,
+    pub value: Metadata,
+}
+pub(crate) struct CachedProjectCatalog {
+    pub loaded_at: Instant,
+    pub projects: Vec<OptionItem>,
+}
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const SERVICE: &str = "com.qa.androidbugdesk";
 impl AppState {
     pub fn new(root: PathBuf) -> Result<Self> {
@@ -65,6 +77,8 @@ impl AppState {
             oauth_flow: Default::default(),
             api_base: "https://openapi-rdc.aliyuncs.com".into(),
             metadata: Mutex::new(None),
+            metadata_cache: Mutex::new(HashMap::new()),
+            project_catalog_cache: Mutex::new(HashMap::new()),
             adb: Mutex::new(adb::discover()),
             collector: Mutex::new(None),
             locks: Mutex::new(HashSet::new()),
@@ -248,8 +262,19 @@ pub async fn clear_auth(state: State<'_, AppState>) -> Result<()> {
     }
 }
 #[tauri::command]
-pub async fn load_metadata(type_id: String, state: State<'_, AppState>) -> Result<Metadata> {
-    let scope = crate::workspace::current_scope(&state, "")?;
+pub async fn load_metadata(
+    type_id: String,
+    force_refresh: bool,
+    state: State<'_, AppState>,
+) -> Result<Metadata> {
+    load_metadata_for_state(type_id, force_refresh, state.inner()).await
+}
+pub(crate) async fn load_metadata_for_state(
+    type_id: String,
+    force_refresh: bool,
+    state: &AppState,
+) -> Result<Metadata> {
+    let scope = crate::workspace::current_scope(state, "")?;
     let epoch = state
         .workspace_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -263,6 +288,28 @@ pub async fn load_metadata(type_id: String, state: State<'_, AppState>) -> Resul
     } else {
         type_id.clone()
     };
+    let cache_key = format!("{scope}metadata:{remembered}");
+    if !force_refresh {
+        let cached = state
+            .metadata_cache
+            .lock()
+            .unwrap()
+            .get(&cache_key)
+            .filter(|entry| entry.loaded_at.elapsed() <= METADATA_CACHE_TTL)
+            .map(|entry| entry.value.clone());
+        if let Some(metadata) = cached {
+            if epoch
+                != state
+                    .workspace_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                || crate::workspace::current_scope(state, "")? != scope
+            {
+                return Err("账号或项目已变化，请重新读取字段".into());
+            }
+            *state.metadata.lock().unwrap() = Some(metadata.clone());
+            return Ok(metadata);
+        }
+    }
     let api = state.api()?;
     let result = api.metadata(&remembered).await;
     let m = if type_id.is_empty()
@@ -271,18 +318,36 @@ pub async fn load_metadata(type_id: String, state: State<'_, AppState>) -> Resul
             .err()
             .is_some_and(|e| e.contains("所选 Bug 类型不属于当前项目"))
     {
-        crate::workspace::observed_error(&state, api.metadata("").await)?
+        crate::workspace::observed_error(state, api.metadata("").await)?
     } else {
-        crate::workspace::observed_error(&state, result)?
+        crate::workspace::observed_error(state, result)?
     };
     if epoch
         != state
             .workspace_epoch
             .load(std::sync::atomic::Ordering::SeqCst)
-        || crate::workspace::current_scope(&state, "")? != scope
+        || crate::workspace::current_scope(state, "")? != scope
     {
         return Err("账号或项目已变化，请重新读取字段".into());
     }
+    let loaded_at = Instant::now();
+    let selected_key = format!("{scope}metadata:{}", m.type_id);
+    let mut cache = state.metadata_cache.lock().unwrap();
+    cache.insert(
+        cache_key,
+        CachedMetadata {
+            loaded_at,
+            value: m.clone(),
+        },
+    );
+    cache.insert(
+        selected_key,
+        CachedMetadata {
+            loaded_at,
+            value: m.clone(),
+        },
+    );
+    drop(cache);
     *state.metadata.lock().unwrap() = Some(m.clone());
     Ok(m)
 }
@@ -304,9 +369,19 @@ pub async fn list_projects(
     {
         return Err("组织不在当前令牌可访问列表中".into());
     }
-    api.profile.organization_id = organization_id;
+    api.profile.organization_id = organization_id.clone();
     api.profile.validate()?;
-    crate::workspace::observed_error(&state, api.projects().await)
+    let projects = crate::workspace::observed_error(&state, api.projects().await)?;
+    let user_id = state
+        .user
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or("请先验证登录令牌")?
+        .id
+        .clone();
+    crate::workspace::cache_project_catalog(&state, &user_id, &organization_id, &projects);
+    Ok(projects)
 }
 #[tauri::command]
 pub async fn select_project(

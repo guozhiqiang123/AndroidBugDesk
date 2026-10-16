@@ -2,7 +2,6 @@ use crate::model::{string, Metadata, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 pub async fn list_for_state(
     state: &crate::commands::AppState,
@@ -11,31 +10,11 @@ pub async fn list_for_state(
     project_id: Option<&str>,
 ) -> Result<crate::workspace::HistoryPage> {
     filters.validate()?;
-    // Capture identity, scope and token together; don't mix different logins.
-    let (user_id, scope, api, epoch, workspace_epoch) = {
-        let user = state.user.lock().unwrap();
-        let user = user.as_ref().ok_or("请先验证登录令牌")?;
-        let profile = state.profile.lock().unwrap();
-        if profile.project_id == "unconfigured" {
-            return Err("请在主页面选择项目".into());
-        }
-        if project_id.is_some_and(|id| id != profile.project_id) {
-            return Err("主页面项目已变化，请刷新历史".into());
-        }
-        let token = state.token.lock().unwrap();
-        (
-            user.id.clone(),
-            crate::workspace::scope_key(user, &profile, ""),
-            crate::yunxiao::Api::with_base(
-                profile.clone(),
-                token.as_deref().ok_or("请先验证登录令牌")?,
-                &state.api_base,
-            )?
-            .with_oauth(state.oauth.lock().unwrap().clone()),
-            state.auth_epoch.load(Ordering::SeqCst),
-            state.workspace_epoch.load(Ordering::SeqCst),
-        )
-    };
+    // Capture identity, target and credential together; don't mix workspaces.
+    let request = crate::workspace::read_scope(state, project_id)?;
+    let user_id = request.user_id.clone();
+    let scope = request.key.clone();
+    let api = &request.api;
     let metadata = state.metadata.lock().unwrap().clone().filter(|m| {
         m.profile.organization_id == api.profile.organization_id
             && m.profile.project_id == api.profile.project_id
@@ -73,12 +52,7 @@ pub async fn list_for_state(
         .await;
     // A late 401 must not invalidate a replacement account; stale success must
     // not appear in another project's list, including an A -> B -> A switch.
-    if epoch != state.auth_epoch.load(Ordering::SeqCst)
-        || workspace_epoch != state.workspace_epoch.load(Ordering::SeqCst)
-        || crate::workspace::current_scope(state, "")? != scope
-    {
-        return Err("账号或主页面项目已变化，请刷新历史".into());
-    }
+    crate::workspace::ensure_read_scope(state, &request)?;
     crate::workspace::observed_error(state, result)
 }
 
@@ -239,6 +213,7 @@ fn field_ids(key: &str, metadata: Option<&Metadata>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use wiremock::{
         matchers::{body_partial_json, method},
         Mock, MockServer, ResponseTemplate,

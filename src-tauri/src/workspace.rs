@@ -1,7 +1,10 @@
 use crate::{commands::AppState, model::*, yunxiao::Api};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::Ordering;
+use std::{
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 use zeroize::Zeroize;
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
@@ -39,6 +42,85 @@ pub struct HistoryPage {
     pub page: usize,
     pub has_more: bool,
 }
+const PROJECT_CATALOG_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+fn project_catalog_cache_key(user_id: &str, organization_id: &str) -> String {
+    format!("{user_id}:{organization_id}")
+}
+
+pub(crate) fn cache_project_catalog(
+    state: &AppState,
+    user_id: &str,
+    organization_id: &str,
+    projects: &[OptionItem],
+) {
+    state.project_catalog_cache.lock().unwrap().insert(
+        project_catalog_cache_key(user_id, organization_id),
+        crate::commands::CachedProjectCatalog {
+            loaded_at: Instant::now(),
+            projects: projects.to_vec(),
+        },
+    );
+}
+
+fn cached_project_catalog(
+    state: &AppState,
+    user_id: &str,
+    organization_id: &str,
+) -> Option<Vec<OptionItem>> {
+    state
+        .project_catalog_cache
+        .lock()
+        .unwrap()
+        .get(&project_catalog_cache_key(user_id, organization_id))
+        .filter(|entry| entry.loaded_at.elapsed() <= PROJECT_CATALOG_CACHE_TTL)
+        .map(|entry| entry.projects.clone())
+}
+
+/// A read-only Yunxiao request owns one immutable identity/workspace snapshot.
+/// Callers must validate it after awaiting the network before publishing data.
+pub(crate) struct ReadScope {
+    pub user_id: String,
+    pub key: String,
+    pub api: Api,
+    auth_epoch: u64,
+    workspace_epoch: u64,
+}
+
+pub(crate) fn read_scope(state: &AppState, project_id: Option<&str>) -> Result<ReadScope> {
+    let user = state.user.lock().unwrap();
+    let user = user.as_ref().ok_or("请先验证登录令牌")?;
+    let profile = state.profile.lock().unwrap();
+    if profile.project_id == "unconfigured" {
+        return Err("请在主页面选择项目".into());
+    }
+    if project_id.is_some_and(|id| id != profile.project_id) {
+        return Err("主页面项目已变化，请刷新数据".into());
+    }
+    let token = state.token.lock().unwrap();
+    Ok(ReadScope {
+        user_id: user.id.clone(),
+        key: scope_key(user, &profile, ""),
+        api: Api::with_base(
+            profile.clone(),
+            token.as_deref().ok_or("请先验证登录令牌")?,
+            &state.api_base,
+        )?
+        .with_oauth(state.oauth.lock().unwrap().clone()),
+        auth_epoch: state.auth_epoch.load(Ordering::SeqCst),
+        workspace_epoch: state.workspace_epoch.load(Ordering::SeqCst),
+    })
+}
+
+pub(crate) fn ensure_read_scope(state: &AppState, request: &ReadScope) -> Result<()> {
+    if request.auth_epoch != state.auth_epoch.load(Ordering::SeqCst)
+        || request.workspace_epoch != state.workspace_epoch.load(Ordering::SeqCst)
+        || current_scope(state, "")? != request.key
+    {
+        return Err("账号或主页面项目已变化，请刷新数据".into());
+    }
+    Ok(())
+}
 
 pub fn empty_profile() -> Profile {
     Profile {
@@ -67,6 +149,8 @@ pub fn invalidate(state: &AppState) {
     drop(user);
     state.workspace_epoch.fetch_add(1, Ordering::SeqCst);
     *state.metadata.lock().unwrap() = None;
+    state.metadata_cache.lock().unwrap().clear();
+    state.project_catalog_cache.lock().unwrap().clear();
 }
 pub fn observed_error<T>(state: &AppState, result: Result<T>) -> Result<T> {
     if result
@@ -361,25 +445,33 @@ pub async fn select_project(
         .unwrap()
         .clone()
         .ok_or("请先验证登录令牌")?;
-    if !api
-        .organizations()
-        .await?
-        .iter()
-        .any(|o| o.id == organization_id)
-    {
-        return Err("组织不在当前令牌可访问列表中".into());
-    }
+    let previous = state.profile.lock().unwrap().clone();
     let mut profile = empty_profile();
-    profile.organization_id = organization_id;
+    profile.organization_id = organization_id.clone();
     profile.validate()?;
-    let mut scoped_api = api;
-    scoped_api.profile = profile.clone();
-    let projects = scoped_api.projects().await?;
+    let projects = if let Some(projects) = cached_project_catalog(state, &user.id, &organization_id)
+    {
+        projects
+    } else {
+        if previous.organization_id != organization_id
+            && !api
+                .organizations()
+                .await?
+                .iter()
+                .any(|o| o.id == organization_id)
+        {
+            return Err("组织不在当前令牌可访问列表中".into());
+        }
+        let mut scoped_api = api;
+        scoped_api.profile = profile.clone();
+        let projects = scoped_api.projects().await?;
+        cache_project_catalog(state, &user.id, &organization_id, &projects);
+        projects
+    };
     let project = projects
         .iter()
         .find(|p| p.id == project_id)
         .ok_or("项目不在当前令牌可访问列表中")?;
-    let previous = state.profile.lock().unwrap().clone();
     if previous.organization_id == profile.organization_id && previous.project_id == project_id {
         profile = previous;
     }
@@ -580,6 +672,174 @@ mod tests {
         );
         assert!(s.user.lock().unwrap().is_none());
     }
+    #[tokio::test]
+    async fn same_organization_project_switch_skips_reloading_organizations() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oapi/v1/projex/organizations/org-a/projects:search"))
+            .and(body_partial_json(json!({"page":1,"perPage":100})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([{"id":"project-b","name":"项目 B"}])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let s = state(&server, root.path());
+        *s.token.lock().unwrap() = Some("test-personal-pat".into());
+        *s.user.lock().unwrap() = Some(UserIdentity {
+            id: "user-a".into(),
+            name: "测试员".into(),
+            ..Default::default()
+        });
+        let mut current = empty_profile();
+        current.organization_id = "org-a".into();
+        current.project_id = "project-a".into();
+        current.name = "项目 A".into();
+        *s.profile.lock().unwrap() = current;
+
+        let selected = select_project(&s, "org-a".into(), "project-b".into())
+            .await
+            .unwrap();
+        assert_eq!(selected.project_id, "project-b");
+        assert_eq!(selected.name, "项目 B");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url.path(),
+            "/oapi/v1/projex/organizations/org-a/projects:search"
+        );
+    }
+    #[tokio::test]
+    async fn project_switch_reuses_the_recent_backend_verified_catalog() {
+        let server = MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let s = state(&server, root.path());
+        *s.token.lock().unwrap() = Some("test-personal-pat".into());
+        *s.user.lock().unwrap() = Some(UserIdentity {
+            id: "user-a".into(),
+            name: "测试员".into(),
+            ..Default::default()
+        });
+        let mut current = empty_profile();
+        current.organization_id = "org-a".into();
+        current.project_id = "project-a".into();
+        current.name = "项目 A".into();
+        *s.profile.lock().unwrap() = current;
+        cache_project_catalog(
+            &s,
+            "user-a",
+            "org-a",
+            &[OptionItem {
+                id: "project-b".into(),
+                name: "项目 B".into(),
+            }],
+        );
+
+        let selected = select_project(&s, "org-a".into(), "project-b".into())
+            .await
+            .unwrap();
+        assert_eq!(selected.project_id, "project-b");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(!s.project_catalog_cache.lock().unwrap().is_empty());
+        invalidate(&s);
+        assert!(s.project_catalog_cache.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn cross_organization_project_switch_still_validates_organization_access() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oapi/v1/platform/organizations"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([{"id":"org-b","name":"组织 B"}])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oapi/v1/projex/organizations/org-b/projects:search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([{"id":"project-b","name":"项目 B"}])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let s = state(&server, root.path());
+        *s.token.lock().unwrap() = Some("test-personal-pat".into());
+        *s.user.lock().unwrap() = Some(UserIdentity {
+            id: "user-a".into(),
+            name: "测试员".into(),
+            ..Default::default()
+        });
+        let mut current = empty_profile();
+        current.organization_id = "org-a".into();
+        current.project_id = "project-a".into();
+        current.name = "项目 A".into();
+        *s.profile.lock().unwrap() = current;
+
+        let selected = select_project(&s, "org-b".into(), "project-b".into())
+            .await
+            .unwrap();
+        assert_eq!(selected.organization_id, "org-b");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn metadata_cache_avoids_repeat_reads_and_force_refresh_reloads() {
+        let server = MockServer::start().await;
+        let prefix = "/oapi/v1/projex/organizations/org-a/projects/project-a";
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/workitemTypes")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!([{"id":"bug-type","name":"缺陷"}])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/workitemTypes/bug-type/fields")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/members")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let s = state(&server, root.path());
+        *s.token.lock().unwrap() = Some("test-personal-pat".into());
+        *s.user.lock().unwrap() = Some(UserIdentity {
+            id: "user-a".into(),
+            name: "测试员".into(),
+            ..Default::default()
+        });
+        let mut profile = empty_profile();
+        profile.organization_id = "org-a".into();
+        profile.project_id = "project-a".into();
+        profile.name = "项目 A".into();
+        profile.enable_versions = false;
+        profile.enable_sprints = false;
+        *s.profile.lock().unwrap() = profile;
+
+        crate::commands::load_metadata_for_state("bug-type".into(), false, &s)
+            .await
+            .unwrap();
+        crate::commands::load_metadata_for_state("bug-type".into(), false, &s)
+            .await
+            .unwrap();
+        crate::commands::load_metadata_for_state("bug-type".into(), true, &s)
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+        assert!(!s.metadata_cache.lock().unwrap().is_empty());
+        invalidate(&s);
+        assert!(s.metadata_cache.lock().unwrap().is_empty());
+    }
     #[test]
     fn selections_are_scoped_and_remove_obsolete_or_arbitrary_values() {
         let mut p = empty_profile();
@@ -741,6 +1001,45 @@ mod field_tests {
         assert!(m.fields[0].options.is_empty());
         assert_eq!(m.fields[1].options[0].name, "中");
         assert!(m.fields[0].show_when_create);
+    }
+    #[tokio::test]
+    async fn metadata_fetches_independent_project_collections_concurrently() {
+        let server = MockServer::start().await;
+        let mut p = empty_profile();
+        p.organization_id = "org-a".into();
+        p.project_id = "project-a".into();
+        let api = Api::with_base(p, "mock-token", &server.uri()).unwrap();
+        let prefix = "/oapi/v1/projex/organizations/org-a/projects/project-a";
+        let delayed =
+            || ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(350));
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/workitemTypes")))
+            .respond_with(delayed().set_body_json(json!([{"id":"bug-type","name":"缺陷"}])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/workitemTypes/bug-type/fields")))
+            .respond_with(delayed().set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for endpoint in ["members", "versions", "sprints"] {
+            Mock::given(method("GET"))
+                .and(path(format!("{prefix}/{endpoint}")))
+                .respond_with(delayed().set_body_json(json!([])))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let started = tokio::time::Instant::now();
+        api.metadata("").await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_250),
+            "independent metadata reads were serialized: {elapsed:?}"
+        );
     }
     #[test]
     fn native_tag_selection_is_validated_before_payload_and_preserves_remote_ids() {

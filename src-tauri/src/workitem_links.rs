@@ -159,6 +159,8 @@ mod tests {
             oauth_flow: Default::default(),
             api_base: "http://127.0.0.1:1".into(),
             metadata: Mutex::new(Some(metadata.clone())),
+            metadata_cache: Mutex::new(Default::default()),
+            project_catalog_cache: Mutex::new(Default::default()),
             adb: Mutex::new(None),
             collector: Mutex::new(None),
             locks: Mutex::new(HashSet::new()),

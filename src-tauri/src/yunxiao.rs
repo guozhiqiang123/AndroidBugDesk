@@ -14,6 +14,23 @@ pub struct UploadedAttachment {
     pub embed_url: String,
 }
 
+pub(crate) struct WorkitemSearchQuery {
+    pub page: usize,
+    pub per_page: usize,
+    pub order_by: &'static str,
+    pub sort: &'static str,
+    pub conditions: Value,
+}
+
+pub(crate) struct WorkitemSearchPage {
+    pub rows: Vec<Value>,
+    pub page: usize,
+    pub per_page: usize,
+    pub total: Option<usize>,
+    pub total_pages: Option<usize>,
+    pub has_more: bool,
+}
+
 pub struct Api {
     client: Client,
     pub profile: Profile,
@@ -217,6 +234,131 @@ impl Api {
         }
         Err("项目列表读取超出分页限制，未完整读取".into())
     }
+    pub(crate) async fn search_workitems(
+        &self,
+        query: WorkitemSearchQuery,
+    ) -> Result<WorkitemSearchPage> {
+        if !(1..=1000).contains(&query.page)
+            || !(1..=200).contains(&query.per_page)
+            || !["gmtCreate", "name"].contains(&query.order_by)
+            || !["asc", "desc"].contains(&query.sort)
+        {
+            return Err("工作项搜索分页或排序条件不正确".into());
+        }
+        let mut body = json!({
+            "category":"Bug",
+            "spaceId":self.profile.project_id,
+            "spaceType":"Project",
+            "page":query.page,
+            "perPage":query.per_page,
+            "orderBy":query.order_by,
+            "sort":query.sort
+        });
+        if query.conditions["conditionGroups"]
+            .as_array()
+            .is_some_and(|groups| {
+                groups
+                    .iter()
+                    .any(|group| group.as_array().is_some_and(|items| !items.is_empty()))
+            })
+        {
+            body["conditions"] =
+                json!(serde_json::to_string(&query.conditions)
+                    .map_err(|_| "工作项筛选条件格式错误")?);
+        }
+        let (value, headers) = self
+            .request(Method::POST, "/workitems:search", Some(body))
+            .await?;
+        let rows = value.as_array().ok_or("工作项列表格式变化")?.clone();
+        if rows.len() > query.per_page {
+            return Err("云效工作项返回超出请求页大小，停止展示".into());
+        }
+        let header = |name: &str| -> Result<Option<usize>> {
+            headers
+                .get(name)
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map_err(|_| "接口分页响应头不正确".to_string())?
+                        .parse::<usize>()
+                        .map_err(|_| "接口分页响应头不正确".to_string())
+                })
+                .transpose()
+        };
+        if header("x-page")?.is_some_and(|page| page != query.page)
+            || header("x-per-page")?.is_some_and(|size| size != query.per_page)
+        {
+            return Err("云效工作项分页响应与请求不一致，停止展示".into());
+        }
+        let total = header("x-total")?;
+        let total_pages = header("x-total-pages")?;
+        let more = has_more(&headers, query.page, rows.len(), query.per_page)?;
+        Ok(WorkitemSearchPage {
+            rows,
+            page: query.page,
+            per_page: query.per_page,
+            total,
+            total_pages,
+            has_more: more,
+        })
+    }
+    pub(crate) async fn bug_types(&self) -> Result<Vec<OptionItem>> {
+        options(
+            self.list(
+                &format!(
+                    "/projects/{}/workitemTypes?category=Bug",
+                    self.profile.project_id
+                ),
+                false,
+            )
+            .await?,
+            "id",
+            "name",
+        )
+    }
+    pub(crate) async fn project_members(&self) -> Result<Vec<OptionItem>> {
+        options(
+            self.list(
+                &format!("/projects/{}/members", self.profile.project_id),
+                true,
+            )
+            .await?,
+            "userId",
+            "userName",
+        )
+    }
+    pub(crate) async fn project_labels(&self) -> Result<Vec<OptionItem>> {
+        options(
+            self.list(
+                &format!("/projects/{}/labels", self.profile.project_id),
+                true,
+            )
+            .await?,
+            "id",
+            "name",
+        )
+    }
+    pub(crate) async fn workitem_statuses(&self, type_id: &str) -> Result<Vec<OptionItem>> {
+        let type_id = encode_id(type_id)?;
+        let (workflow, _) = self
+            .request(
+                Method::GET,
+                &format!(
+                    "/projects/{}/workitemTypes/{type_id}/workflows",
+                    self.profile.project_id
+                ),
+                None,
+            )
+            .await?;
+        options(
+            workflow["statuses"]
+                .as_array()
+                .ok_or("工作项状态列表格式变化")?
+                .clone(),
+            "id",
+            "displayName",
+        )
+    }
     pub async fn history(
         &self,
         user_id: &str,
@@ -247,23 +389,17 @@ impl Api {
         // Stop on a matching page or after three empty pages. Never crawl the
         // entire project automatically; page is the consumed server cursor.
         for page in start_page..=(start_page + 2).min(1000) {
-            let (value, headers) = self
-            .request(
-                Method::POST,
-                "/workitems:search",
-                Some(json!({
-                    "category":"Bug","spaceId":self.profile.project_id,"spaceType":"Project",
-                    "page":page,"perPage":50,"orderBy":"gmtCreate","sort":"desc",
-                    "conditions":serde_json::to_string(&filters.conditions(user_id)).map_err(|_| "历史筛选条件格式错误")?
-                })),
-            )
-            .await?;
-            let rows = value.as_array().ok_or("历史记录列表格式变化")?;
-            if rows.len() > 50 {
-                return Err("云效历史返回超出请求页大小，停止展示".into());
-            }
+            let search = self
+                .search_workitems(WorkitemSearchQuery {
+                    page,
+                    per_page: 50,
+                    order_by: "gmtCreate",
+                    sort: "desc",
+                    conditions: filters.conditions(user_id),
+                })
+                .await?;
             let mut items = Vec::new();
-            for row in rows {
+            for row in &search.rows {
                 let id = string(row, "id");
                 encode_id(&id).map_err(|_| "历史记录缺少有效工作项 ID")?;
                 // A malformed/overbroad response must not leak another project's/user's records.
@@ -289,7 +425,7 @@ impl Api {
                     updated_at: string(row, "gmtModified"),
                 });
             }
-            let has_more = has_more(&headers, page, rows.len(), 50)?;
+            let has_more = search.has_more;
             if page == 1000 && has_more {
                 return Err("历史读取已达到分页上限，请缩小筛选范围".into());
             }
@@ -305,23 +441,45 @@ impl Api {
     }
     pub async fn metadata(&self, type_id: &str) -> Result<Metadata> {
         let path = format!("/projects/{}", self.profile.project_id);
-        let types = options(
-            self.list(&format!("{path}/workitemTypes?category=Bug"), false)
-                .await?,
-            "id",
-            "name",
-        )?;
-        let selected = if type_id.is_empty() {
-            types.first().ok_or("项目没有可用的 Bug 类型")?.id.clone()
-        } else {
-            type_id.into()
+        let fields = async {
+            let types = self.bug_types().await?;
+            let selected = if type_id.is_empty() {
+                types.first().ok_or("项目没有可用的 Bug 类型")?.id.clone()
+            } else {
+                type_id.into()
+            };
+            if !types.iter().any(|v| v.id == selected) {
+                return Err("所选 Bug 类型不属于当前项目".into());
+            }
+            let raw = self
+                .list(&format!("{path}/workitemTypes/{selected}/fields"), false)
+                .await?;
+            Ok::<_, String>((types, selected, raw))
         };
-        if !types.iter().any(|v| v.id == selected) {
-            return Err("所选 Bug 类型不属于当前项目".into());
-        }
-        let raw = self
-            .list(&format!("{path}/workitemTypes/{selected}/fields"), false)
-            .await?;
+        let versions = async {
+            if self.profile.enable_versions {
+                options(
+                    self.list(&format!("{path}/versions"), true).await?,
+                    "id",
+                    "name",
+                )
+            } else {
+                Ok(vec![])
+            }
+        };
+        let sprints = async {
+            if self.profile.enable_sprints {
+                options(
+                    self.list(&format!("{path}/sprints"), true).await?,
+                    "id",
+                    "name",
+                )
+            } else {
+                Ok(vec![])
+            }
+        };
+        let ((types, selected, raw), members, versions, sprints) =
+            tokio::try_join!(fields, self.project_members(), versions, sprints)?;
         let mut fields = raw
             .into_iter()
             .map(|v| {
@@ -348,8 +506,8 @@ impl Api {
                     || crate::validation::native_target(field, &self.profile) == Some("labels"))
                 && field.options.is_empty()
             {
-                match self.list(&format!("{path}/labels"), true).await {
-                    Ok(labels) => field.options = options(labels, "id", "name")?,
+                match self.project_labels().await {
+                    Ok(labels) => field.options = labels,
                     Err(error) if error.contains("[授权失效]") => return Err(error),
                     Err(_) => {
                         field.option_error = Some(
@@ -360,29 +518,6 @@ impl Api {
                 }
             }
         }
-        let members = options(
-            self.list(&format!("{path}/members"), true).await?,
-            "userId",
-            "userName",
-        )?;
-        let versions = if self.profile.enable_versions {
-            options(
-                self.list(&format!("{path}/versions"), true).await?,
-                "id",
-                "name",
-            )?
-        } else {
-            vec![]
-        };
-        let sprints = if self.profile.enable_sprints {
-            options(
-                self.list(&format!("{path}/sprints"), true).await?,
-                "id",
-                "name",
-            )?
-        } else {
-            vec![]
-        };
         Ok(Metadata {
             profile: self.profile.clone(),
             type_id: selected,
@@ -500,14 +635,20 @@ impl Api {
     pub async fn candidates(&self, title: &str) -> Result<Vec<Value>> {
         let mut result = Vec::new();
         for page in 1..=1000 {
-            let (v,h)=self.request(Method::POST,"/workitems:search",Some(json!({"spaceId":self.profile.project_id,"category":"Bug","page":page,"perPage":100,"orderBy":"gmtCreate","sort":"desc","conditions":serde_json::to_string(&json!({"conditionGroups":[[{"fieldIdentifier":"subject","operator":"CONTAINS","value":[title],"toValue":null,"className":"string","format":"input"}]]})).unwrap()}))).await?;
-            let rows = v.as_array().ok_or("搜索返回格式变化")?;
-            result.extend(rows.iter().cloned());
-            let next = h
-                .get("x-next-page")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if next.is_empty() && rows.len() < 100 {
+            let found = self
+                .search_workitems(WorkitemSearchQuery {
+                    page,
+                    per_page: 100,
+                    order_by: "gmtCreate",
+                    sort: "desc",
+                    conditions: json!({"conditionGroups":[[{
+                        "fieldIdentifier":"subject","operator":"CONTAINS","value":[title],
+                        "toValue":null,"className":"string","format":"input"
+                    }]]}),
+                })
+                .await?;
+            result.extend(found.rows);
+            if !found.has_more {
                 return Ok(result);
             }
         }

@@ -864,7 +864,10 @@ function App() {
   };
   const loadProjectMetadataAndDraft = async (profile: Profile) => {
     const epoch = ++workspaceEpoch.current;
-    const metadata = await invoke<Metadata>("load_metadata", { typeId: "" });
+    const metadata = await invoke<Metadata>("load_metadata", {
+      typeId: "",
+      forceRefresh: false,
+    });
     if (epoch !== workspaceEpoch.current) return;
     setBoot((current) =>
       current ? { ...current, profile, metadata, authorized: true } : current,
@@ -923,8 +926,11 @@ function App() {
       organizationId: nextOrganizationId,
       projectId: nextProjectId,
     });
-    const b = await refresh();
-    setBoot({ ...b, profile, authorized: true, metadata: null });
+    setBoot((current) =>
+      current
+        ? { ...current, profile, authorized: true, metadata: null }
+        : current,
+    );
     setOrganizationId(nextOrganizationId);
     setProjectId(nextProjectId);
     if (configuredProjectPackage(appliedProjectSettings, nextProjectId)) {
@@ -1071,7 +1077,10 @@ function App() {
     next.sprint = "";
     next.versions = [];
     next.customFields = {};
-    const metadata = await invoke<Metadata>("load_metadata", { typeId });
+    const metadata = await invoke<Metadata>("load_metadata", {
+      typeId,
+      forceRefresh: false,
+    });
     setBoot((current) => (current ? { ...current, metadata } : current));
     const memory = await invoke<Partial<SelectionMemory>>(
       "load_selection_memory",
@@ -1278,7 +1287,6 @@ function App() {
     if (dirty && draft) await save();
     await loadProjectMetadataAndDraft(boot.profile);
     setTab("new");
-    await refresh();
   };
   const confirmLogin = async (restoredResult?: AuthResult, quiet = false) => {
     let result: AuthResult;
@@ -2721,10 +2729,16 @@ function App() {
                           async () => {
                             setBackendIssues([]);
                             await save();
-                            await invoke("load_metadata", {
-                              typeId: draft.workitemTypeId,
-                            });
-                            await refresh();
+                            const metadata = await invoke<Metadata>(
+                              "load_metadata",
+                              {
+                                typeId: draft.workitemTypeId,
+                                forceRefresh: true,
+                              },
+                            );
+                            setBoot((current) =>
+                              current ? { ...current, metadata } : current,
+                            );
                           },
                           "workitemTypeId",
                         )
