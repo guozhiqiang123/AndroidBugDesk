@@ -943,9 +943,10 @@ try {
       .getAttribute("href"),
     null,
   );
-  await detailDialog
-    .locator('.project-bug-richtext img[src^="data:image/png"]')
-    .waitFor({ state: "attached" });
+  const detailImage = detailDialog.locator(
+    '.project-bug-richtext img[src^="data:image/png"]',
+  );
+  await detailImage.waitFor({ state: "attached" });
   assert.equal(
     await page.evaluate(
       () =>
@@ -964,6 +965,24 @@ try {
     ),
     "inline-image",
   );
+  await detailImage.click();
+  const imagePreview = detailDialog.getByRole("dialog", {
+    name: "图片预览：正文图片",
+  });
+  await imagePreview.locator('img[src^="data:image/png"]').waitFor();
+  await page.screenshot({
+    path: path.join(output, "project-bug-image-preview.png"),
+    fullPage: true,
+  });
+  await imagePreview
+    .getByRole("button", { name: "关闭图片预览", exact: true })
+    .click();
+  assert.equal(await imagePreview.count(), 0);
+  await detailImage.click();
+  await imagePreview.waitFor();
+  await page.keyboard.press("Escape");
+  assert.equal(await imagePreview.count(), 0);
+  await detailDialog.waitFor({ state: "visible" });
   assert.equal(
     await detailDialog.getByText("严重程度", { exact: true }).count(),
     1,
@@ -1000,6 +1019,18 @@ try {
     () =>
       window.__qa.calls.filter((call) => call.cmd === "project_bug_detail")
         .length === 2,
+  );
+  await detailDialog
+    .getByRole("button", { name: "复制链接", exact: true })
+    .click();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls
+          .filter((call) => call.cmd === "copy_history_link")
+          .at(-1).args.identifier,
+    ),
+    "SKII-614",
   );
   await detailDialog
     .getByRole("button", { name: "在云效中打开", exact: true })

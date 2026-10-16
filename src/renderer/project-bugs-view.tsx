@@ -58,7 +58,7 @@ export function ProjectBugsView({
   const [error, setError] = useState("");
   const [facetsError, setFacetsError] = useState("");
   const [actionError, setActionError] = useState("");
-  const [actionBusy, setActionBusy] = useState(false);
+  const [linkAction, setLinkAction] = useState<"" | "copy" | "open">("");
   const [statusError, setStatusError] = useState("");
   const [statusUpdating, setStatusUpdating] = useState("");
   const [statusLoading, setStatusLoading] = useState<Set<string>>(new Set());
@@ -152,16 +152,20 @@ export function ProjectBugsView({
     setError("");
   };
 
-  const openWeb = async (identifier: string) => {
-    if (!identifier || actionBusy) return;
-    setActionBusy(true);
+  const runLinkAction = async (action: "copy" | "open", identifier: string) => {
+    if (!identifier || linkAction) return;
+    setLinkAction(action);
     setActionError("");
     try {
-      await invoke("open_history_item", { identifier });
+      await invoke(
+        action === "copy" ? "copy_history_link" : "open_history_item",
+        { identifier },
+      );
+      if (action === "copy") notify("Bug 链接已复制");
     } catch (failure) {
       if (alive.current) setActionError(String(failure));
     } finally {
-      if (alive.current) setActionBusy(false);
+      if (alive.current) setLinkAction("");
     }
   };
 
@@ -452,7 +456,7 @@ export function ProjectBugsView({
         )}
         {actionError && (
           <p className="banner error" role="alert">
-            打开云效失败：{actionError}
+            云效链接操作失败：{actionError}
           </p>
         )}
         {statusError && (
@@ -579,11 +583,12 @@ export function ProjectBugsView({
           profile={profile}
           loading={detailLoading}
           error={detailError}
-          openError={actionError}
-          openingWeb={actionBusy}
+          linkError={actionError}
+          linkAction={linkAction}
           onClose={closeDetail}
           onRefresh={() => void loadDetail(selected, true)}
-          onOpenWeb={() => void openWeb(selected.identifier)}
+          onCopyLink={() => void runLinkAction("copy", selected.identifier)}
+          onOpenWeb={() => void runLinkAction("open", selected.identifier)}
           remoteError={remoteErrorRef.current}
         />
       )}

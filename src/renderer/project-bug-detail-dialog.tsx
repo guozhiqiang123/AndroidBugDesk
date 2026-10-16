@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import DOMPurify from "dompurify";
 import type { Option, Profile } from "../shared/domain";
@@ -22,10 +26,11 @@ interface Props {
   profile: Profile;
   loading: boolean;
   error: string;
-  openError: string;
-  openingWeb: boolean;
+  linkError: string;
+  linkAction: "" | "copy" | "open";
   onClose: () => void;
   onRefresh: () => void;
+  onCopyLink: () => void;
   onOpenWeb: () => void;
   remoteError: (error: unknown) => Promise<void>;
 }
@@ -136,21 +141,23 @@ function ContentPreview({
   value,
   format,
   readImage,
+  onPreviewImage,
 }: {
   value: string;
   format: ProjectBugContentFormat;
   readImage: (source: string, alt: string) => Promise<string>;
+  onPreviewImage: (source: string, name: string) => void;
 }) {
-  const richRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const html = useMemo(
     () => (format === "richtext" ? safeRichText(value) : ""),
     [format, value],
   );
 
   useEffect(() => {
-    if (format !== "richtext" || !richRef.current) return;
+    if (format !== "richtext" || !contentRef.current) return;
     let active = true;
-    for (const image of richRef.current.querySelectorAll("img")) {
+    for (const image of contentRef.current.querySelectorAll("img")) {
       const source = image.dataset.remoteSource ?? "";
       const alt = image.getAttribute("alt") ?? "";
       void readImage(source, alt)
@@ -173,16 +180,51 @@ function ContentPreview({
     };
   }, [format, html, readImage]);
 
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || format === "plain") return;
+    const decorateImages = () => {
+      for (const image of content.querySelectorAll("img")) {
+        image.tabIndex = 0;
+        image.setAttribute("role", "button");
+        image.setAttribute(
+          "aria-label",
+          image.alt ? `放大预览：${image.alt}` : "放大预览图片",
+        );
+      }
+    };
+    decorateImages();
+    const observer = new MutationObserver(decorateImages);
+    observer.observe(content, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [format, html, value]);
+
+  const previewTargetImage = (target: EventTarget | null) => {
+    if (!(target instanceof Element)) return false;
+    const image = target.closest("img");
+    if (!(image instanceof HTMLImageElement)) return false;
+    const source = image.currentSrc || image.src;
+    if (!source.startsWith("data:image/")) return false;
+    onPreviewImage(source, image.alt.trim() || "正文图片");
+    return true;
+  };
+
+  const contentEvents = {
+    onClickCapture: (event: ReactMouseEvent<HTMLDivElement>) => {
+      if ((event.target as HTMLElement).closest("a")) event.preventDefault();
+      previewTargetImage(event.target);
+    },
+    onKeyDownCapture: (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      if (!previewTargetImage(event.target)) return;
+      event.preventDefault();
+    },
+  };
+
   if (!value.trim()) return <p className="empty-text">未填写描述</p>;
   if (format === "markdown") {
     return (
-      <div
-        className="project-bug-content"
-        onClickCapture={(event) => {
-          if ((event.target as HTMLElement).closest("a"))
-            event.preventDefault();
-        }}
-      >
+      <div ref={contentRef} className="project-bug-content" {...contentEvents}>
         <MarkdownPreview
           value={value}
           onReadAsset={() => Promise.reject(new Error("非本地正文资源"))}
@@ -194,13 +236,67 @@ function ContentPreview({
   if (format === "richtext") {
     return (
       <div
-        ref={richRef}
+        ref={contentRef}
         className="project-bug-content project-bug-richtext"
+        {...contentEvents}
         dangerouslySetInnerHTML={{ __html: html }}
       />
     );
   }
   return <pre className="project-bug-plain-content">{value}</pre>;
+}
+
+function ImageLightbox({
+  source,
+  name,
+  onClose,
+}: {
+  source: string;
+  name: string;
+  onClose: () => void;
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => closeRef.current?.focus(), []);
+  return (
+    <div
+      className="project-bug-image-lightbox"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`图片预览：${name}`}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+          return;
+        }
+        if (event.key === "Tab") {
+          event.preventDefault();
+          event.stopPropagation();
+          closeRef.current?.focus();
+        }
+      }}
+    >
+      <div className="project-bug-image-lightbox-titlebar">
+        <strong>{name}</strong>
+        <button
+          ref={closeRef}
+          type="button"
+          className="app-dialog-close"
+          aria-label="关闭图片预览"
+          onClick={onClose}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6 6l12 12M18 6L6 18" />
+          </svg>
+        </button>
+      </div>
+      <img src={source} alt={name} />
+    </div>
+  );
 }
 
 function activityText(activity: ProjectBugActivity) {
@@ -225,10 +321,11 @@ export function ProjectBugDetailDialog({
   profile,
   loading,
   error,
-  openError,
-  openingWeb,
+  linkError,
+  linkAction,
   onClose,
   onRefresh,
+  onCopyLink,
   onOpenWeb,
   remoteError,
 }: Props) {
@@ -238,6 +335,10 @@ export function ProjectBugDetailDialog({
   const [preview, setPreview] = useState<ProjectBugAttachmentPreview | null>(
     null,
   );
+  const [imagePreview, setImagePreview] = useState<{
+    source: string;
+    name: string;
+  } | null>(null);
   const previewCache = useRef(new Map<string, ProjectBugAttachmentPreview>());
 
   const readAttachment = useCallback(
@@ -343,8 +444,18 @@ export function ProjectBugDetailDialog({
           <button disabled={loading} onClick={onRefresh}>
             {loading ? "正在刷新…" : "刷新"}
           </button>
-          <button className="primary" disabled={openingWeb} onClick={onOpenWeb}>
-            {openingWeb ? "正在打开…" : "在云效中打开"}
+          <button
+            disabled={!!linkAction || !item.identifier}
+            onClick={onCopyLink}
+          >
+            {linkAction === "copy" ? "正在复制…" : "复制链接"}
+          </button>
+          <button
+            className="primary"
+            disabled={!!linkAction || !item.identifier}
+            onClick={onOpenWeb}
+          >
+            {linkAction === "open" ? "正在打开…" : "在云效中打开"}
           </button>
         </div>
       </div>
@@ -355,9 +466,9 @@ export function ProjectBugDetailDialog({
           <button onClick={onRefresh}>重试</button>
         </div>
       )}
-      {openError && (
+      {linkError && (
         <div className="banner error" role="alert">
-          打开云效失败：{openError}
+          云效链接操作失败：{linkError}
         </div>
       )}
       {loading && !detail && (
@@ -416,6 +527,9 @@ export function ProjectBugDetailDialog({
               value={detail.description}
               format={detail.format}
               readImage={readContentImage}
+              onPreviewImage={(source, name) =>
+                setImagePreview({ source, name })
+              }
             />
           </section>
 
@@ -499,7 +613,19 @@ export function ProjectBugDetailDialog({
                   </button>
                 </div>
                 {preview.kind === "image" ? (
-                  <img src={preview.data} alt={preview.name} />
+                  <button
+                    type="button"
+                    className="project-bug-image-preview-trigger"
+                    aria-label={`放大预览：${preview.name}`}
+                    onClick={() =>
+                      setImagePreview({
+                        source: preview.data,
+                        name: preview.name,
+                      })
+                    }
+                  >
+                    <img src={preview.data} alt={preview.name} />
+                  </button>
                 ) : (
                   <pre>{preview.data}</pre>
                 )}
@@ -537,6 +663,9 @@ export function ProjectBugDetailDialog({
                     value={comment.content}
                     format={comment.format}
                     readImage={readContentImage}
+                    onPreviewImage={(source, name) =>
+                      setImagePreview({ source, name })
+                    }
                   />
                 </article>
               ))
@@ -588,6 +717,13 @@ export function ProjectBugDetailDialog({
             )}
           </section>
         </div>
+      )}
+      {imagePreview && (
+        <ImageLightbox
+          source={imagePreview.source}
+          name={imagePreview.name}
+          onClose={() => setImagePreview(null)}
+        />
       )}
     </AppDialog>
   );
