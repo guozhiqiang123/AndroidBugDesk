@@ -308,6 +308,36 @@ fn content_format(value: &str) -> ProjectBugContentFormat {
     }
 }
 
+fn content_payload(
+    value: &Value,
+    content_path: &str,
+    format_path: &str,
+) -> (String, ProjectBugContentFormat) {
+    let declared = content_format(&string(value, format_path));
+    let source = &value[content_path];
+    let parsed;
+    let payload = match source {
+        Value::Object(_) => Some(source),
+        Value::String(raw) => {
+            parsed = serde_json::from_str::<Value>(raw).ok();
+            parsed.as_ref().filter(|value| value.is_object())
+        }
+        _ => None,
+    };
+    if let Some(payload) = payload {
+        if let Some(content) = payload["htmlValue"].as_str() {
+            return (content.to_string(), ProjectBugContentFormat::Richtext);
+        }
+        if let Some(content) = payload["markdownValue"].as_str() {
+            return (content.to_string(), ProjectBugContentFormat::Markdown);
+        }
+        if let Some(content) = payload["textValue"].as_str() {
+            return (content.to_string(), ProjectBugContentFormat::Plain);
+        }
+    }
+    (source.as_str().unwrap_or_default().to_string(), declared)
+}
+
 fn display_value(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
@@ -400,10 +430,11 @@ fn map_page(page: WorkitemSearchPage, project_id: &str) -> Result<ProjectBugPage
 }
 
 fn map_detail(value: &Value, project_id: &str) -> Result<ProjectBugDetail> {
+    let (description, format) = content_payload(value, "description", "formatType");
     Ok(ProjectBugDetail {
         item: item(value, project_id)?,
-        description: string(value, "description"),
-        format: content_format(&string(value, "formatType")),
+        description,
+        format,
         modifier: option_at(value, "modifier")?,
         verifier: option_at(value, "verifier")?,
         participants: option_list(value, "participants")?,
@@ -458,12 +489,13 @@ fn map_comments(values: Vec<Value>) -> Result<Vec<ProjectBugComment>> {
         .map(|value| {
             let id = string(&value, "id");
             crate::yunxiao::encode_id(&id).map_err(|_| "项目 Bug 评论 ID 不正确")?;
+            let (content, format) = content_payload(&value, "content", "contentFormat");
             Ok(ProjectBugComment {
                 id,
                 parent_id: string(&value, "parentId"),
                 author: option_at(&value, "user")?,
-                content: string(&value, "content"),
-                format: content_format(&string(&value, "contentFormat")),
+                content,
+                format,
                 created_at: string(&value, "gmtCreate"),
                 updated_at: string(&value, "gmtModified"),
                 pinned: value["top"].as_bool().unwrap_or(false),
@@ -1025,6 +1057,25 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn content_payload_accepts_stringified_cloud_richtext_objects() {
+        let detail = json!({
+            "description": "{\"htmlValue\":\"<p>真实正文</p>\",\"jsonMLValue\":[\"root\",{}]}",
+            "formatType": "RICHTEXT"
+        });
+        let (content, format) = content_payload(&detail, "description", "formatType");
+        assert_eq!(content, "<p>真实正文</p>");
+        assert!(matches!(format, ProjectBugContentFormat::Richtext));
+
+        let comment = json!({
+            "content": {"htmlValue":"<p>真实评论</p>","jsonMLValue":["root",{}]},
+            "contentFormat": ""
+        });
+        let (content, format) = content_payload(&comment, "content", "contentFormat");
+        assert_eq!(content, "<p>真实评论</p>");
+        assert!(matches!(format, ProjectBugContentFormat::Richtext));
     }
 
     #[tokio::test]
