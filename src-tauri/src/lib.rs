@@ -55,6 +55,7 @@ pub fn run() {
             commands::list_remote_history,
             project_bugs::list_project_bugs,
             project_bugs::project_bug_facets,
+            project_bugs::project_bug_detail,
             commands::set_auth,
             commands::clear_auth,
             commands::load_metadata,

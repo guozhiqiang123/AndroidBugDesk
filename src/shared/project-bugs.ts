@@ -46,6 +46,71 @@ export interface ProjectBugFacets {
   warnings: string[];
 }
 
+export type ProjectBugContentFormat = "markdown" | "richtext" | "plain";
+
+export interface ProjectBugCustomField {
+  id: string;
+  name: string;
+  format: string;
+  values: string[];
+}
+
+export interface ProjectBugAttachment {
+  id: string;
+  fileId: string;
+  name: string;
+  suffix: string;
+  size: number;
+  creator: Option | null;
+  createdAt: string;
+}
+
+export interface ProjectBugComment {
+  id: string;
+  parentId: string;
+  author: Option | null;
+  content: string;
+  format: ProjectBugContentFormat;
+  createdAt: string;
+  updatedAt: string;
+  pinned: boolean;
+}
+
+export interface ProjectBugActivity {
+  id: string;
+  eventType: string;
+  actionType: string;
+  actor: Option | null;
+  propertyName: string;
+  oldValues: string[];
+  newValues: string[];
+  relatedResourceId: string;
+  relatedResourceType: string;
+  occurredAt: string;
+}
+
+export interface ProjectBugSectionWarning {
+  section: "attachments" | "comments" | "activities";
+  message: string;
+}
+
+export interface ProjectBugDetail extends ProjectBugItem {
+  description: string;
+  format: ProjectBugContentFormat;
+  modifier: Option | null;
+  verifier: Option | null;
+  participants: Option[];
+  trackers: Option[];
+  sprint: Option | null;
+  statusUpdatedAt: string;
+  archived: boolean;
+  customFields: ProjectBugCustomField[];
+  attachments: ProjectBugAttachment[];
+  comments: ProjectBugComment[];
+  activities: ProjectBugActivity[];
+  sectionWarnings: ProjectBugSectionWarning[];
+}
+
 export function emptyProjectBugFilters(): ProjectBugFilters {
   return {
     keyword: "",

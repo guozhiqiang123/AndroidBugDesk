@@ -159,6 +159,91 @@ pub struct ProjectBugFacets {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectBugContentFormat {
+    Markdown,
+    Richtext,
+    Plain,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugCustomField {
+    pub id: String,
+    pub name: String,
+    pub format: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugAttachment {
+    pub id: String,
+    pub file_id: String,
+    pub name: String,
+    pub suffix: String,
+    pub size: u64,
+    pub creator: Option<OptionItem>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugComment {
+    pub id: String,
+    pub parent_id: String,
+    pub author: Option<OptionItem>,
+    pub content: String,
+    pub format: ProjectBugContentFormat,
+    pub created_at: String,
+    pub updated_at: String,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugActivity {
+    pub id: String,
+    pub event_type: String,
+    pub action_type: String,
+    pub actor: Option<OptionItem>,
+    pub property_name: String,
+    pub old_values: Vec<String>,
+    pub new_values: Vec<String>,
+    pub related_resource_id: String,
+    pub related_resource_type: String,
+    pub occurred_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugSectionWarning {
+    pub section: &'static str,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBugDetail {
+    #[serde(flatten)]
+    pub item: ProjectBugItem,
+    pub description: String,
+    pub format: ProjectBugContentFormat,
+    pub modifier: Option<OptionItem>,
+    pub verifier: Option<OptionItem>,
+    pub participants: Vec<OptionItem>,
+    pub trackers: Vec<OptionItem>,
+    pub sprint: Option<OptionItem>,
+    pub status_updated_at: String,
+    pub archived: bool,
+    pub custom_fields: Vec<ProjectBugCustomField>,
+    pub attachments: Vec<ProjectBugAttachment>,
+    pub comments: Vec<ProjectBugComment>,
+    pub activities: Vec<ProjectBugActivity>,
+    pub section_warnings: Vec<ProjectBugSectionWarning>,
+}
+
 fn option_at(value: &Value, path: &str) -> Result<Option<OptionItem>> {
     let id = string(value, &format!("{path}.id"));
     if id.is_empty() {
@@ -175,6 +260,79 @@ fn option_at(value: &Value, path: &str) -> Result<Option<OptionItem>> {
         name: if name.is_empty() { id.clone() } else { name },
         id,
     }))
+}
+
+fn option_list(value: &Value, path: &str) -> Result<Vec<OptionItem>> {
+    value[path]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let id = string(entry, "id");
+            crate::yunxiao::encode_id(&id).map_err(|_| "项目 Bug 人员 ID 不正确")?;
+            let display = string(entry, "displayName");
+            let name = if display.is_empty() {
+                string(entry, "name")
+            } else {
+                display
+            };
+            Ok(OptionItem {
+                name: if name.is_empty() { id.clone() } else { name },
+                id,
+            })
+        })
+        .collect()
+}
+
+fn content_format(value: &str) -> ProjectBugContentFormat {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "MARKDOWN" => ProjectBugContentFormat::Markdown,
+        "RICHTEXT" => ProjectBugContentFormat::Richtext,
+        _ => ProjectBugContentFormat::Plain,
+    }
+}
+
+fn display_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => (!value.trim().is_empty()).then(|| value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(if *value { "是" } else { "否" }.into()),
+        Value::Object(_) => ["displayValue", "name", "value", "identifier"]
+            .iter()
+            .map(|key| string(value, key))
+            .find(|value| !value.trim().is_empty()),
+        _ => None,
+    }
+}
+
+fn display_values(value: &Value, path: &str) -> Vec<String> {
+    value[path]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(display_value)
+        .collect()
+}
+
+fn custom_fields(value: &Value) -> Vec<ProjectBugCustomField> {
+    value["customFieldValues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|field| {
+            let id = string(field, "fieldId");
+            let name = string(field, "fieldName");
+            if id.is_empty() && name.is_empty() {
+                return None;
+            }
+            Some(ProjectBugCustomField {
+                id,
+                name,
+                format: string(field, "fieldFormat"),
+                values: display_values(field, "values"),
+            })
+        })
+        .collect()
 }
 
 fn item(row: &Value, project_id: &str) -> Result<ProjectBugItem> {
@@ -223,6 +381,173 @@ fn map_page(page: WorkitemSearchPage, project_id: &str) -> Result<ProjectBugPage
         total_pages: page.total_pages,
         has_more: page.has_more,
     })
+}
+
+fn map_detail(value: &Value, project_id: &str) -> Result<ProjectBugDetail> {
+    Ok(ProjectBugDetail {
+        item: item(value, project_id)?,
+        description: string(value, "description"),
+        format: content_format(&string(value, "formatType")),
+        modifier: option_at(value, "modifier")?,
+        verifier: option_at(value, "verifier")?,
+        participants: option_list(value, "participants")?,
+        trackers: option_list(value, "trackers")?,
+        sprint: option_at(value, "sprint")?,
+        status_updated_at: string(value, "updateStatusAt"),
+        archived: string(value, "logicalStatus").eq_ignore_ascii_case("archived"),
+        custom_fields: custom_fields(value),
+        attachments: vec![],
+        comments: vec![],
+        activities: vec![],
+        section_warnings: vec![],
+    })
+}
+
+fn map_attachments(values: Vec<Value>) -> Result<Vec<ProjectBugAttachment>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let id = string(&value, "id");
+            crate::yunxiao::encode_id(&id).map_err(|_| "项目 Bug 附件 ID 不正确")?;
+            let file_id = string(&value, "fileId");
+            if !file_id.is_empty() {
+                crate::yunxiao::encode_id(&file_id).map_err(|_| "项目 Bug 附件文件 ID 不正确")?;
+            }
+            Ok(ProjectBugAttachment {
+                id,
+                file_id,
+                name: {
+                    let name = string(&value, "fileName");
+                    if name.is_empty() {
+                        string(&value, "name")
+                    } else {
+                        name
+                    }
+                },
+                suffix: string(&value, "suffix"),
+                size: value["size"]
+                    .as_u64()
+                    .or_else(|| string(&value, "size").parse().ok())
+                    .unwrap_or_default(),
+                creator: option_at(&value, "creator")?,
+                created_at: string(&value, "gmtCreate"),
+            })
+        })
+        .collect()
+}
+
+fn map_comments(values: Vec<Value>) -> Result<Vec<ProjectBugComment>> {
+    let mut comments = values
+        .into_iter()
+        .map(|value| {
+            let id = string(&value, "id");
+            crate::yunxiao::encode_id(&id).map_err(|_| "项目 Bug 评论 ID 不正确")?;
+            Ok(ProjectBugComment {
+                id,
+                parent_id: string(&value, "parentId"),
+                author: option_at(&value, "user")?,
+                content: string(&value, "content"),
+                format: content_format(&string(&value, "contentFormat")),
+                created_at: string(&value, "gmtCreate"),
+                updated_at: string(&value, "gmtModified"),
+                pinned: value["top"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    comments.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(comments)
+}
+
+fn event_id(value: &Value) -> String {
+    value["eventId"]
+        .as_i64()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| string(value, "eventId"))
+}
+
+fn map_activities(values: Vec<Value>) -> Result<Vec<ProjectBugActivity>> {
+    let mut activities = values
+        .into_iter()
+        .map(|value| {
+            let id = event_id(&value);
+            if id.is_empty() {
+                return Err("项目 Bug 动态缺少事件 ID".into());
+            }
+            Ok(ProjectBugActivity {
+                id,
+                event_type: string(&value, "eventType"),
+                action_type: string(&value, "actionType"),
+                actor: option_at(&value, "operator")?,
+                property_name: string(&value, "property.propertyName"),
+                old_values: display_values(&value, "oldValue"),
+                new_values: display_values(&value, "newValue"),
+                related_resource_id: string(&value, "relatedResource.resourceId"),
+                related_resource_type: string(&value, "relatedResource.resourceType"),
+                occurred_at: string(&value, "eventTime"),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    activities.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
+    Ok(activities)
+}
+
+fn section_warning(
+    error: String,
+    section: &'static str,
+    label: &str,
+) -> Result<ProjectBugSectionWarning> {
+    if error.contains("[授权失效]") {
+        Err(error)
+    } else {
+        Ok(ProjectBugSectionWarning {
+            section,
+            message: format!("{label}读取失败：{error}"),
+        })
+    }
+}
+
+async fn detail_for_state(
+    state: &AppState,
+    id: &str,
+    project_id: Option<&str>,
+) -> Result<ProjectBugDetail> {
+    crate::yunxiao::encode_id(id).map_err(|_| "项目 Bug ID 不正确")?;
+    let request = crate::workspace::read_scope(state, project_id)?;
+    let result = async {
+        let value = request.api.get(id).await?;
+        let mut detail = map_detail(&value, &request.api.profile.project_id)?;
+        let (attachments, comments, activities) = tokio::join!(
+            request.api.attachments(id),
+            request.api.comments(id),
+            request.api.activities(id)
+        );
+        match attachments.and_then(map_attachments) {
+            Ok(values) => detail.attachments = values,
+            Err(error) => {
+                detail
+                    .section_warnings
+                    .push(section_warning(error, "attachments", "附件")?)
+            }
+        }
+        match comments.and_then(map_comments) {
+            Ok(values) => detail.comments = values,
+            Err(error) => detail
+                .section_warnings
+                .push(section_warning(error, "comments", "评论")?),
+        }
+        match activities.and_then(map_activities) {
+            Ok(values) => detail.activities = values,
+            Err(error) => {
+                detail
+                    .section_warnings
+                    .push(section_warning(error, "activities", "动态")?)
+            }
+        }
+        Ok(detail)
+    }
+    .await;
+    crate::workspace::ensure_read_scope(state, &request)?;
+    crate::workspace::observed_error(state, result)
 }
 
 async fn list_for_state(
@@ -328,6 +653,15 @@ pub async fn project_bug_facets(
     state: State<'_, AppState>,
 ) -> Result<ProjectBugFacets> {
     facets_for_state(&state, project_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn project_bug_detail(
+    id: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectBugDetail> {
+    detail_for_state(&state, &id, project_id.as_deref()).await
 }
 
 #[cfg(test)]
@@ -474,5 +808,147 @@ mod tests {
         assert_eq!(result.members[0].name, "测试人员");
         assert_eq!(result.tags[0].name, "Android");
         assert!(result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detail_aggregates_documented_fields_comments_attachments_and_activities() {
+        let server = MockServer::start().await;
+        let base = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"SKII-614","subject":"清理功能异常",
+                "categoryId":"Bug","space":{"id":"project-a"},
+                "description":"## 复现\n点击清理","formatType":"MARKDOWN",
+                "status":{"id":"todo","displayName":"待处理"},
+                "assignedTo":{"id":"owner-a","name":"负责人"},
+                "creator":{"id":"creator-a","name":"创建者"},
+                "modifier":{"id":"modifier-a","name":"修改者"},
+                "verifier":{"id":"verifier-a","name":"验证者"},
+                "participants":[{"id":"participant-a","name":"参与者"}],
+                "trackers":[{"id":"tracker-a","name":"抄送者"}],
+                "sprint":{"id":"sprint-a","name":"迭代 A"},
+                "labels":[{"id":"tag-a","name":"Android"}],
+                "customFieldValues":[{
+                    "fieldId":"priority","fieldName":"优先级","fieldFormat":"list",
+                    "values":[{"identifier":"high","displayValue":"高"}]
+                }],
+                "logicalStatus":"normal","updateStatusAt":"2026-10-16 12:00:00",
+                "gmtCreate":"2026-10-16 10:00:00","gmtModified":"2026-10-16 11:00:00"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/attachments")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id":"attachment-a","fileId":"file-a","fileName":"evidence.png",
+                "suffix":".png","size":1024,"creator":{"id":"creator-a","name":"创建者"},
+                "gmtCreate":"2026-10-16 10:05:00","url":"https://example.test/evidence.png"
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/comments")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id":"comment-a","parentId":"","content":"已复现","contentFormat":"RICHTEXT",
+                "gmtCreate":"2026-10-16 10:10:00","gmtModified":"2026-10-16 10:11:00",
+                "top":true,"user":{"id":"owner-a","name":"负责人"}
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/activities")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "eventId":42,"eventTime":"2026-10-16 10:20:00",
+                "eventType":"workitem.updated","actionType":"updated",
+                "operator":{"id":"owner-a","name":"负责人"},
+                "property":{"propertyId":"priority","propertyName":"优先级","propertyType":"Field"},
+                "oldValue":[{"identifier":"middle","displayValue":"中"}],
+                "newValue":[{"identifier":"high","displayValue":"高"}],
+                "relatedResource":{"resourceId":"","resourceType":""}
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        let result = detail_for_state(&state, "bug-a", Some("project-a"))
+            .await
+            .unwrap();
+        assert_eq!(result.item.identifier, "SKII-614");
+        assert!(matches!(result.format, ProjectBugContentFormat::Markdown));
+        assert_eq!(result.custom_fields[0].values, ["高"]);
+        assert_eq!(result.attachments[0].name, "evidence.png");
+        assert!(matches!(
+            result.comments[0].format,
+            ProjectBugContentFormat::Richtext
+        ));
+        assert_eq!(result.activities[0].id, "42");
+        assert_eq!(result.activities[0].old_values, ["中"]);
+        assert!(result.section_warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detail_keeps_primary_data_when_one_optional_section_fails() {
+        let server = MockServer::start().await;
+        let base = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"SKII-614","subject":"清理功能异常",
+                "categoryId":"Bug","space":{"id":"project-a"},"labels":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for endpoint in ["attachments", "activities"] {
+            Mock::given(method("GET"))
+                .and(path(format!("{base}/{endpoint}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/comments")))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        let result = detail_for_state(&state, "bug-a", Some("project-a"))
+            .await
+            .unwrap();
+        assert_eq!(result.item.title, "清理功能异常");
+        assert!(result.comments.is_empty());
+        assert_eq!(result.section_warnings.len(), 1);
+        assert_eq!(result.section_warnings[0].section, "comments");
+        assert!(state.user.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn detail_rejects_cross_project_workitem_before_reading_optional_sections() {
+        let server = MockServer::start().await;
+        let base = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"OTHER-1","subject":"其他项目",
+                "categoryId":"Bug","space":{"id":"project-b"},"labels":[]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        assert!(detail_for_state(&state, "bug-a", Some("project-a"))
+            .await
+            .unwrap_err()
+            .contains("范围不一致"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

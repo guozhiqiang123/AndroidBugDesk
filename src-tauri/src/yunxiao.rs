@@ -557,6 +557,14 @@ impl Api {
         self.list(&format!("/workitems/{}/attachments", encode_id(id)?), false)
             .await
     }
+    pub async fn comments(&self, id: &str) -> Result<Vec<Value>> {
+        self.list(&format!("/workitems/{}/comments", encode_id(id)?), false)
+            .await
+    }
+    pub async fn activities(&self, id: &str) -> Result<Vec<Value>> {
+        self.list(&format!("/workitems/{}/activities", encode_id(id)?), false)
+            .await
+    }
     pub async fn upload(&self, id: &str, a: &Attachment, name: &str) -> Result<UploadedAttachment> {
         let part = reqwest::multipart::Part::file(&a.path)
             .await
