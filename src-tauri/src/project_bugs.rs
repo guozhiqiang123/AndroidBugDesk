@@ -4,7 +4,7 @@ use crate::{
     yunxiao::{WorkitemSearchPage, WorkitemSearchQuery},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -197,6 +197,15 @@ pub struct ProjectBugAttachment {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectBugInlineFile {
+    pub file_id: String,
+    pub name: String,
+    pub suffix: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectBugComment {
     pub id: String,
     pub parent_id: String,
@@ -245,6 +254,7 @@ pub struct ProjectBugDetail {
     pub status_updated_at: String,
     pub archived: bool,
     pub custom_fields: Vec<ProjectBugCustomField>,
+    pub inline_files: Vec<ProjectBugInlineFile>,
     pub attachments: Vec<ProjectBugAttachment>,
     pub comments: Vec<ProjectBugComment>,
     pub activities: Vec<ProjectBugActivity>,
@@ -315,16 +325,7 @@ fn content_payload(
 ) -> (String, ProjectBugContentFormat) {
     let declared = content_format(&string(value, format_path));
     let source = &value[content_path];
-    let parsed;
-    let payload = match source {
-        Value::Object(_) => Some(source),
-        Value::String(raw) => {
-            parsed = serde_json::from_str::<Value>(raw).ok();
-            parsed.as_ref().filter(|value| value.is_object())
-        }
-        _ => None,
-    };
-    if let Some(payload) = payload {
+    if let Some(payload) = parsed_content_payload(source) {
         if let Some(content) = payload["htmlValue"].as_str() {
             return (content.to_string(), ProjectBugContentFormat::Richtext);
         }
@@ -336,6 +337,180 @@ fn content_payload(
         }
     }
     (source.as_str().unwrap_or_default().to_string(), declared)
+}
+
+fn parsed_content_payload(source: &Value) -> Option<Value> {
+    let mut current = source.clone();
+    for _ in 0..3 {
+        match current {
+            Value::Object(_) => return Some(current),
+            Value::String(ref raw) => current = serde_json::from_str(raw).ok()?,
+            _ => return None,
+        }
+    }
+    current.is_object().then_some(current)
+}
+
+fn value_at<'a>(value: &'a Value, path: &str) -> &'a Value {
+    path.split('.').fold(value, |current, part| &current[part])
+}
+
+fn timestamp_value(value: &Value, paths: &[&str]) -> String {
+    for path in paths {
+        let candidate = value_at(value, path);
+        if let Some(text) = candidate.as_str().filter(|text| !text.trim().is_empty()) {
+            return text.to_string();
+        }
+        let raw = candidate.as_i64().or_else(|| {
+            candidate
+                .as_u64()
+                .and_then(|value| i64::try_from(value).ok())
+        });
+        if let Some(raw) = raw {
+            let millis = if raw.unsigned_abs() >= 10_000_000_000 {
+                raw
+            } else {
+                raw.saturating_mul(1_000)
+            };
+            if let Some(timestamp) = DateTime::<Utc>::from_timestamp_millis(millis) {
+                return timestamp.to_rfc3339();
+            }
+        }
+    }
+    String::new()
+}
+
+fn file_identifier(source: &str) -> Option<String> {
+    let from_url = reqwest::Url::parse(source).ok().and_then(|url| {
+        url.query_pairs()
+            .find(|(key, _)| key == "fileIdentifier")
+            .map(|(_, value)| value.into_owned())
+    });
+    let value = from_url.or_else(|| {
+        let marker = "fileIdentifier=";
+        let start = source.find(marker)? + marker.len();
+        let value = source[start..]
+            .chars()
+            .take_while(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_'))
+            .collect::<String>();
+        (!value.is_empty()).then_some(value)
+    })?;
+    if crate::yunxiao::encode_id(&value).is_ok() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn file_suffix(name: &str, explicit: &str) -> String {
+    if !explicit.trim().is_empty() {
+        return explicit.trim().to_string();
+    }
+    Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default()
+}
+
+fn upsert_inline_file(files: &mut Vec<ProjectBugInlineFile>, incoming: ProjectBugInlineFile) {
+    if let Some(current) = files
+        .iter_mut()
+        .find(|current| current.file_id == incoming.file_id)
+    {
+        if current.name == "正文图片" && incoming.name != "正文图片" {
+            current.name = incoming.name;
+        }
+        if current.suffix.is_empty() {
+            current.suffix = incoming.suffix;
+        }
+        if current.size == 0 {
+            current.size = incoming.size;
+        }
+    } else {
+        files.push(incoming);
+    }
+}
+
+fn collect_inline_files(value: &Value, files: &mut Vec<ProjectBugInlineFile>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(source) = object.get("src").and_then(Value::as_str) {
+                if let Some(file_id) = file_identifier(source) {
+                    let name = object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("正文图片")
+                        .to_string();
+                    let suffix = file_suffix(
+                        &name,
+                        object
+                            .get("suffix")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    );
+                    let size = object
+                        .get("size")
+                        .and_then(Value::as_u64)
+                        .or_else(|| {
+                            object
+                                .get("size")
+                                .and_then(Value::as_str)
+                                .and_then(|value| value.parse().ok())
+                        })
+                        .unwrap_or_default();
+                    upsert_inline_file(
+                        files,
+                        ProjectBugInlineFile {
+                            file_id,
+                            name,
+                            suffix,
+                            size,
+                        },
+                    );
+                }
+            }
+            for child in object.values() {
+                collect_inline_files(child, files);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_inline_files(child, files);
+            }
+        }
+        Value::String(source) => {
+            if let Some(file_id) = file_identifier(source) {
+                upsert_inline_file(
+                    files,
+                    ProjectBugInlineFile {
+                        file_id,
+                        name: "正文图片".into(),
+                        suffix: String::new(),
+                        size: 0,
+                    },
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inline_files_from_content(value: &Value, content_path: &str) -> Vec<ProjectBugInlineFile> {
+    let source = &value[content_path];
+    let mut files = Vec::new();
+    if let Some(payload) = parsed_content_payload(source) {
+        collect_inline_files(&payload, &mut files);
+    } else {
+        collect_inline_files(source, &mut files);
+    }
+    files
+}
+
+fn merge_inline_files(target: &mut Vec<ProjectBugInlineFile>, incoming: Vec<ProjectBugInlineFile>) {
+    for file in incoming {
+        upsert_inline_file(target, file);
+    }
 }
 
 fn display_value(value: &Value) -> Option<String> {
@@ -408,8 +583,8 @@ fn item(row: &Value, project_id: &str) -> Result<ProjectBugItem> {
         assigned_to: option_at(row, "assignedTo")?,
         creator: option_at(row, "creator")?,
         labels,
-        created_at: string(row, "gmtCreate"),
-        updated_at: string(row, "gmtModified"),
+        created_at: timestamp_value(row, &["gmtCreate", "createTime", "createdAt"]),
+        updated_at: timestamp_value(row, &["gmtModified", "modifiedTime", "updatedAt"]),
     })
 }
 
@@ -440,9 +615,13 @@ fn map_detail(value: &Value, project_id: &str) -> Result<ProjectBugDetail> {
         participants: option_list(value, "participants")?,
         trackers: option_list(value, "trackers")?,
         sprint: option_at(value, "sprint")?,
-        status_updated_at: string(value, "updateStatusAt"),
+        status_updated_at: timestamp_value(
+            value,
+            &["updateStatusAt", "statusUpdateTime", "statusUpdatedAt"],
+        ),
         archived: string(value, "logicalStatus").eq_ignore_ascii_case("archived"),
         custom_fields: custom_fields(value),
+        inline_files: inline_files_from_content(value, "description"),
         attachments: vec![],
         comments: vec![],
         activities: vec![],
@@ -477,7 +656,7 @@ fn map_attachments(values: Vec<Value>) -> Result<Vec<ProjectBugAttachment>> {
                     .or_else(|| string(&value, "size").parse().ok())
                     .unwrap_or_default(),
                 creator: option_at(&value, "creator")?,
-                created_at: string(&value, "gmtCreate"),
+                created_at: timestamp_value(&value, &["gmtCreate", "createTime", "createdAt"]),
             })
         })
         .collect()
@@ -496,8 +675,8 @@ fn map_comments(values: Vec<Value>) -> Result<Vec<ProjectBugComment>> {
                 author: option_at(&value, "user")?,
                 content,
                 format,
-                created_at: string(&value, "gmtCreate"),
-                updated_at: string(&value, "gmtModified"),
+                created_at: timestamp_value(&value, &["gmtCreate", "createTime", "createdAt"]),
+                updated_at: timestamp_value(&value, &["gmtModified", "modifiedTime", "updatedAt"]),
                 pinned: value["top"].as_bool().unwrap_or(false),
             })
         })
@@ -531,7 +710,10 @@ fn map_activities(values: Vec<Value>) -> Result<Vec<ProjectBugActivity>> {
                 new_values: display_values(&value, "newValue"),
                 related_resource_id: string(&value, "relatedResource.resourceId"),
                 related_resource_type: string(&value, "relatedResource.resourceType"),
-                occurred_at: string(&value, "eventTime"),
+                occurred_at: timestamp_value(
+                    &value,
+                    &["eventTime", "gmtCreate", "createTime", "createdAt"],
+                ),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -577,8 +759,21 @@ async fn detail_for_state(
                     .push(section_warning(error, "attachments", "附件")?)
             }
         }
-        match comments.and_then(map_comments) {
-            Ok(values) => detail.comments = values,
+        match comments {
+            Ok(values) => {
+                for value in &values {
+                    merge_inline_files(
+                        &mut detail.inline_files,
+                        inline_files_from_content(value, "content"),
+                    );
+                }
+                match map_comments(values) {
+                    Ok(values) => detail.comments = values,
+                    Err(error) => detail
+                        .section_warnings
+                        .push(section_warning(error, "comments", "评论")?),
+                }
+            }
             Err(error) => detail
                 .section_warnings
                 .push(section_warning(error, "comments", "评论")?),
@@ -855,6 +1050,87 @@ async fn attachment_preview_for_state(
     crate::workspace::observed_error(state, result)
 }
 
+async fn inline_file_preview_for_state(
+    state: &AppState,
+    id: &str,
+    file_id: &str,
+    project_id: Option<&str>,
+) -> Result<ProjectBugAttachmentPreview> {
+    crate::yunxiao::encode_id(id).map_err(|_| "项目 Bug ID 不正确")?;
+    crate::yunxiao::encode_id(file_id).map_err(|_| "正文图片文件 ID 不正确")?;
+    let request = crate::workspace::read_scope(state, project_id)?;
+    let result = async {
+        let value = request.api.get(id).await?;
+        item(&value, &request.api.profile.project_id)?;
+        let mut files = inline_files_from_content(&value, "description");
+        if !files.iter().any(|file| file.file_id == file_id) {
+            for comment in request.api.comments(id).await? {
+                merge_inline_files(&mut files, inline_files_from_content(&comment, "content"));
+            }
+        }
+        let embedded = files
+            .into_iter()
+            .find(|file| file.file_id == file_id)
+            .ok_or("正文图片不存在或已被移除")?;
+        if embedded.size > INLINE_IMAGE_LIMIT as u64 {
+            return Err("正文图片超过 12 MB，不能在详情中直接预览".into());
+        }
+        let row = request.api.workitem_file(id, file_id).await?;
+        let remote_size = row["size"]
+            .as_u64()
+            .or_else(|| string(&row, "size").parse().ok())
+            .unwrap_or_default();
+        if remote_size > INLINE_IMAGE_LIMIT as u64 {
+            return Err("正文图片超过 12 MB，不能在详情中直接预览".into());
+        }
+        let bytes = request
+            .api
+            .download_attachment_bytes(&row, INLINE_IMAGE_LIMIT as u64)
+            .await?;
+        let remote_name = {
+            let name = string(&row, "name");
+            if name.is_empty() {
+                string(&row, "fileName")
+            } else {
+                name
+            }
+        };
+        let remote_suffix = string(&row, "suffix");
+        let name = safe_attachment_name(
+            if remote_name.is_empty() {
+                &embedded.name
+            } else {
+                &remote_name
+            },
+            if remote_suffix.is_empty() {
+                &embedded.suffix
+            } else {
+                &remote_suffix
+            },
+        );
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Ok(ProjectBugAttachmentPreview {
+                kind: "image",
+                name,
+                mime: "image/png".into(),
+                data: format!("data:image/png;base64,{}", STANDARD.encode(bytes)),
+            });
+        }
+        if bytes.starts_with(b"\xff\xd8\xff") {
+            return Ok(ProjectBugAttachmentPreview {
+                kind: "image",
+                name,
+                mime: "image/jpeg".into(),
+                data: format!("data:image/jpeg;base64,{}", STANDARD.encode(bytes)),
+            });
+        }
+        Err("正文文件不是可预览的 PNG 或 JPEG 图片".into())
+    }
+    .await;
+    crate::workspace::ensure_read_scope(state, &request)?;
+    crate::workspace::observed_error(state, result)
+}
+
 async fn list_for_state(
     state: &AppState,
     query: ProjectBugQuery,
@@ -1004,6 +1280,16 @@ pub async fn preview_project_bug_attachment(
     Ok(preview)
 }
 
+#[tauri::command]
+pub async fn preview_project_bug_inline_file(
+    id: String,
+    file_id: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<ProjectBugAttachmentPreview> {
+    inline_file_preview_for_state(&state, &id, &file_id, project_id.as_deref()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +1362,39 @@ mod tests {
         let (content, format) = content_payload(&comment, "content", "contentFormat");
         assert_eq!(content, "<p>真实评论</p>");
         assert!(matches!(format, ProjectBugContentFormat::Richtext));
+
+        let real_shape = json!({
+            "description": serde_json::to_string(&json!({
+                "htmlValue":"<p><img src=\"https://devops.aliyun.com/projex/api/workitem/file/url?fileIdentifier=6c0fb48b245b0e833822df43a9\"></p>",
+                "jsonMLValue":["root",{},["p",{},["img",{
+                    "id":"829sgi","name":"image.png","size":424784,
+                    "src":"https://devops.aliyun.com/projex/api/workitem/file/url?fileIdentifier=6c0fb48b245b0e833822df43a9"
+                }]]]
+            })).unwrap(),
+            "formatType":"RICHTEXT"
+        });
+        let files = inline_files_from_content(&real_shape, "description");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_id, "6c0fb48b245b0e833822df43a9");
+        assert_eq!(files[0].name, "image.png");
+        assert_eq!(files[0].size, 424784);
+    }
+
+    #[test]
+    fn timestamps_accept_real_cloud_milliseconds_and_legacy_strings() {
+        let value = json!({
+            "gmtCreate": 1792057374000_i64,
+            "gmtModified": 1792120296000_i64,
+            "createTime":"2026-10-16 10:00:00"
+        });
+        assert_eq!(
+            timestamp_value(&value, &["gmtCreate", "createTime"]),
+            "2026-10-15T09:42:54+00:00"
+        );
+        assert_eq!(
+            timestamp_value(&value, &["missing", "createTime"]),
+            "2026-10-16 10:00:00"
+        );
     }
 
     #[tokio::test]
@@ -1354,6 +1673,60 @@ mod tests {
         let signed = requests
             .iter()
             .find(|request| request.url.path() == "/signed/screen")
+            .unwrap();
+        assert!(signed.headers.get("x-yunxiao-token").is_none());
+        assert!(signed.headers.get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn embedded_workitem_image_is_resolved_by_file_identifier_without_pat_leak() {
+        let server = MockServer::start().await;
+        let base = "/oapi/v1/projex/organizations/org-a/workitems/bug-a";
+        Mock::given(method("GET"))
+            .and(path(base))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"bug-a","serialNumber":"SKII-629","subject":"UI 异常",
+                "categoryId":"Bug","space":{"id":"project-a"},"labels":[],
+                "description":serde_json::to_string(&json!({
+                    "htmlValue":"<p><img src=\"https://devops.aliyun.com/projex/api/workitem/file/url?fileIdentifier=inline-a\"></p>",
+                    "jsonMLValue":["root",{},["img",{
+                        "name":"image.png","size":12,
+                        "src":"https://devops.aliyun.com/projex/api/workitem/file/url?fileIdentifier=inline-a"
+                    }]]
+                })).unwrap(),
+                "formatType":"RICHTEXT"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/files/inline-a")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id":"inline-a","name":"image.png","suffix":".png","size":12,
+                "url":format!("{}/signed/inline-image", server.uri())
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/signed/inline-image"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"\x89PNG\r\n\x1a\nmock".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let state = state(&server, root.path());
+        let preview = inline_file_preview_for_state(&state, "bug-a", "inline-a", Some("project-a"))
+            .await
+            .unwrap();
+        assert_eq!(preview.kind, "image");
+        assert_eq!(preview.name, "image.png");
+        let requests = server.received_requests().await.unwrap();
+        let signed = requests
+            .iter()
+            .find(|request| request.url.path() == "/signed/inline-image")
             .unwrap();
         assert!(signed.headers.get("x-yunxiao-token").is_none());
         assert!(signed.headers.get("authorization").is_none());

@@ -57,6 +57,7 @@ pub fn run() {
             project_bugs::project_bug_facets,
             project_bugs::project_bug_detail,
             project_bugs::preview_project_bug_attachment,
+            project_bugs::preview_project_bug_inline_file,
             commands::set_auth,
             commands::clear_auth,
             commands::load_metadata,

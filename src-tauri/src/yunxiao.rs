@@ -565,6 +565,20 @@ impl Api {
         self.list(&format!("/workitems/{}/activities", encode_id(id)?), false)
             .await
     }
+    pub async fn workitem_file(&self, id: &str, file_id: &str) -> Result<Value> {
+        Ok(self
+            .request(
+                Method::GET,
+                &format!(
+                    "/workitems/{}/files/{}",
+                    encode_id(id)?,
+                    encode_id(file_id)?
+                ),
+                None,
+            )
+            .await?
+            .0)
+    }
     pub(crate) async fn download_attachment_bytes(
         &self,
         row: &Value,
