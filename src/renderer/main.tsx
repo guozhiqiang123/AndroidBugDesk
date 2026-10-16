@@ -61,6 +61,7 @@ import { initialWorkspace, remoteAuthReaction } from "./session";
 import "./style.css";
 import { UserProfile } from "./user-profile";
 import { HistoryView } from "./history-view";
+import { ProjectBugsView } from "./project-bugs-view";
 import { EnvironmentSnapshotEntry, PostCaptureEntry } from "./post-capture";
 import {
   splitPostCaptureAttachmentDescription,
@@ -2093,6 +2094,7 @@ function App() {
           <nav>
             {[
               ["new", "新建提交"],
+              ["bugs", "项目 Bug"],
               ["history", "历史提交"],
               ["settings", "设置"],
             ].map(([id, title]) => (
@@ -2116,7 +2118,9 @@ function App() {
             ? `home-main ${draft && mainPackageReady ? "has-submit-review-dock" : ""}`
             : tab === "history"
               ? "history-main"
-              : undefined
+              : tab === "bugs"
+                ? "project-bugs-main"
+                : undefined
         }
         style={
           tab === "new" && draft && mainPackageReady
@@ -3425,6 +3429,15 @@ function App() {
               )}
             </>
           ))}
+        {tab === "bugs" && (
+          <ProjectBugsView
+            key={`${boot.user?.id}:${organizationId}:${projectId}`}
+            profile={boot.profile}
+            configured={!!projectId && profileConfigured(boot.profile)}
+            busy={!!busy}
+            remoteError={(e) => handleRemoteError(e, "项目 Bug 读取失败")}
+          />
+        )}
         {tab === "history" && (
           <HistoryView
             key={`${boot.user?.id}:${organizationId}:${projectId}`}

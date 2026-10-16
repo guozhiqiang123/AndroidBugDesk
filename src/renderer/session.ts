@@ -25,7 +25,7 @@ export function defaultUnchecked(
   return target === "participants" || target === "trackers";
 }
 
-export type AppTab = "auth" | "new" | "history";
+export type AppTab = "auth" | "new" | "bugs" | "history" | "settings";
 
 export function profileConfigured(profile: Profile): boolean {
   return ![profile.organizationId, profile.projectId, profile.name].some(

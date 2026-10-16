@@ -1680,6 +1680,116 @@ details {
   min-height: 0;
   overflow: hidden;
 }
+.project-bugs-main {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+.card.project-bugs-view {
+  height: 100%;
+  min-height: 0;
+  margin-bottom: 0;
+  padding: 0;
+  overflow: hidden;
+}
+.project-bugs-scroll {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 20px 24px;
+}
+.project-bugs-heading {
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+.project-bugs-heading h2,
+.project-bugs-heading p {
+  margin: 0;
+}
+.project-bugs-heading p {
+  margin-top: 4px;
+}
+.project-bug-search {
+  margin-bottom: 8px;
+}
+.project-bug-search label,
+.project-bug-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+.project-bug-filters {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 14px;
+}
+.project-bugs-view .project-bug-search input,
+.project-bugs-view .project-bug-filters input,
+.project-bugs-view .project-bug-filters .custom-select-trigger {
+  min-height: 36px;
+  padding: 7px 10px;
+}
+.project-bug-filter-actions {
+  gap: 7px;
+  margin: 10px 0 12px;
+}
+.project-bug-filter-actions button,
+.project-bug-pagination button,
+.project-bug-table button {
+  padding: 7px 11px;
+  font-size: 12px;
+}
+.project-bug-table-wrap {
+  overflow-x: auto;
+  border-top: 1px solid #e4e9f1;
+}
+.project-bug-table {
+  width: 100%;
+  min-width: 1000px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.project-bug-table th {
+  padding: 10px 9px;
+  background: #f7f9fc;
+  color: #76849b;
+  text-align: left;
+  font-weight: 600;
+}
+.project-bug-table td {
+  padding: 11px 9px;
+  border-bottom: 1px solid #edf1f7;
+  color: #35435a;
+  vertical-align: middle;
+}
+.project-bug-table td:first-child {
+  width: 42%;
+}
+.project-bug-table strong,
+.project-bug-table small {
+  display: block;
+}
+.project-bug-table strong {
+  color: #24344f;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.project-bug-table small {
+  margin-top: 3px;
+  color: #8491a6;
+  line-height: 1.45;
+}
+.project-bug-table .pill {
+  display: inline-block;
+  white-space: nowrap;
+}
+.project-bug-pagination {
+  justify-content: center;
+  margin-top: 14px;
+}
 .card.history-view {
   display: flex;
   flex-direction: column;
@@ -1788,12 +1898,14 @@ details {
   justify-content: center;
 }
 @media (max-width: 1100px) {
-  .history-filters {
+  .history-filters,
+  .project-bug-filters {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 @media (max-width: 760px) {
-  .history-filters {
+  .history-filters,
+  .project-bug-filters {
     grid-template-columns: minmax(0, 1fr);
   }
   .history-tabs button {

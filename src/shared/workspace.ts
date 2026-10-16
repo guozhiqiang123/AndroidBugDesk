@@ -1,5 +1,6 @@
 import type { Draft, Option, Profile } from "./domain";
 import type { ShortcutSettings } from "./shortcuts";
+import type { ProjectBugFacets, ProjectBugPage } from "./project-bugs";
 
 export interface UserIdentity {
   id: string;
@@ -93,6 +94,8 @@ export interface WorkspaceCommands {
   load_selection_memory: Partial<SelectionMemory>;
   remember_selections: void;
   list_remote_history: HistoryPage;
+  list_project_bugs: ProjectBugPage;
+  project_bug_facets: ProjectBugFacets;
   check_for_updates: UpdateCheckResult;
   install_update: UpdateInstallResult;
   open_release_page: void;

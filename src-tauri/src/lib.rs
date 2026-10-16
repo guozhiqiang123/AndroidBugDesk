@@ -12,6 +12,7 @@ pub mod markdown_assets;
 pub mod model;
 pub mod oauth;
 pub mod post_capture;
+pub mod project_bugs;
 pub mod project_settings;
 pub mod software_diagnostics;
 pub mod store;
@@ -52,6 +53,8 @@ pub fn run() {
             commands::load_selection_memory,
             commands::remember_selections,
             commands::list_remote_history,
+            project_bugs::list_project_bugs,
+            project_bugs::project_bug_facets,
             commands::set_auth,
             commands::clear_auth,
             commands::load_metadata,
