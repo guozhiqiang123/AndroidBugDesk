@@ -7,7 +7,6 @@ export interface ProjectBugFilters {
   statusIds: string[];
   assignedToIds: string[];
   creatorIds: string[];
-  tagIds: string[];
   createdFrom: string;
   createdTo: string;
   sort: ProjectBugSort;
@@ -42,7 +41,6 @@ export interface ProjectBugPage {
 export interface ProjectBugFacets {
   statuses: Option[];
   members: Option[];
-  tags: Option[];
   warnings: string[];
 }
 
@@ -141,7 +139,6 @@ export function emptyProjectBugFilters(): ProjectBugFilters {
     statusIds: [],
     assignedToIds: [],
     creatorIds: [],
-    tagIds: [],
     createdFrom: "",
     createdTo: "",
     sort: "created_desc",

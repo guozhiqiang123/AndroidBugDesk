@@ -26,7 +26,6 @@ interface Props {
 const emptyFacets: ProjectBugFacets = {
   statuses: [],
   members: [],
-  tags: [],
   warnings: [],
 };
 function displayTime(value: string) {
@@ -274,17 +273,17 @@ export function ProjectBugsView({
             />
           </label>
           <label>
-            标签
+            排序
             <CustomSelect
-              multiple
-              autoSelectFirst={false}
-              emptyLabel="不限"
-              label="筛选标签"
-              value={filters.tagIds}
-              options={facets.tags}
-              disabled={loading || facetsLoading}
+              value={filters.sort}
+              options={projectBugSortOptions}
+              label="排序方式"
+              disabled={loading}
               onChange={(value) =>
-                edit({ ...filters, tagIds: value as string[] })
+                edit({
+                  ...filters,
+                  sort: value as ProjectBugFilters["sort"],
+                })
               }
             />
           </label>
@@ -307,21 +306,6 @@ export function ProjectBugsView({
               disabled={loading}
               onChange={(event) =>
                 edit({ ...filters, createdTo: event.target.value })
-              }
-            />
-          </label>
-          <label>
-            排序
-            <CustomSelect
-              value={filters.sort}
-              options={projectBugSortOptions}
-              label="排序方式"
-              disabled={loading}
-              onChange={(value) =>
-                edit({
-                  ...filters,
-                  sort: value as ProjectBugFilters["sort"],
-                })
               }
             />
           </label>

@@ -298,7 +298,6 @@ try {
             return {
               statuses: [{ id: "open", name: "待处理" }],
               members: [clone(metadata.members[0])],
-              tags: [{ id: "android", name: "Android" }],
               warnings: [],
             };
           if (cmd === "list_project_bugs")
@@ -794,6 +793,23 @@ try {
   await page.getByRole("button", { name: "项目 Bug", exact: true }).click();
   const bugs = page.locator(".project-bugs-view");
   await bugs.getByText("属于清理的部分功能无法使用（见录屏）").waitFor();
+  const filterFields = bugs.locator(".project-bug-filters > label");
+  assert.equal(
+    await filterFields.filter({ hasText: "标签" }).count(),
+    0,
+    "project Bug filters should no longer show labels",
+  );
+  const sortBox = await filterFields
+    .filter({ hasText: "排序" })
+    .boundingBox();
+  const createdFromBox = await filterFields
+    .filter({ hasText: "创建日期从" })
+    .boundingBox();
+  assert(sortBox && createdFromBox, "sort and date filters should be visible");
+  assert(
+    Math.abs(sortBox.y - createdFromBox.y) < 2 && sortBox.x < createdFromBox.x,
+    "sort should occupy the former label slot before the date filters",
+  );
   await bugs
     .getByRole("button", {
       name: "属于清理的部分功能无法使用（见录屏）",

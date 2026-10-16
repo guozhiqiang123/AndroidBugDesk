@@ -33,7 +33,6 @@ pub struct ProjectBugQuery {
     pub status_ids: Vec<String>,
     pub assigned_to_ids: Vec<String>,
     pub creator_ids: Vec<String>,
-    pub tag_ids: Vec<String>,
     pub created_from: String,
     pub created_to: String,
     pub sort: ProjectBugSort,
@@ -48,7 +47,6 @@ impl Default for ProjectBugQuery {
             status_ids: vec![],
             assigned_to_ids: vec![],
             creator_ids: vec![],
-            tag_ids: vec![],
             created_from: String::new(),
             created_to: String::new(),
             sort: ProjectBugSort::CreatedDesc,
@@ -64,12 +62,7 @@ impl ProjectBugQuery {
         {
             return Err("项目 Bug 查询条件不正确".into());
         }
-        for values in [
-            &self.status_ids,
-            &self.assigned_to_ids,
-            &self.creator_ids,
-            &self.tag_ids,
-        ] {
+        for values in [&self.status_ids, &self.assigned_to_ids, &self.creator_ids] {
             if values.len() > 100 {
                 return Err("项目 Bug 筛选选项过多".into());
             }
@@ -103,9 +96,6 @@ impl ProjectBugQuery {
         }
         if !self.creator_ids.is_empty() {
             group.push(json!({"fieldIdentifier":"creator","operator":"CONTAINS","value":self.creator_ids,"toValue":null,"className":"user","format":"list"}));
-        }
-        if !self.tag_ids.is_empty() {
-            group.push(json!({"fieldIdentifier":"tag","operator":"CONTAINS","value":self.tag_ids,"toValue":null,"className":"tag","format":"multiList"}));
         }
         if !self.created_from.is_empty() {
             group.push(json!({
@@ -162,7 +152,6 @@ pub struct ProjectBugPage {
 pub struct ProjectBugFacets {
     pub statuses: Vec<OptionItem>,
     pub members: Vec<OptionItem>,
-    pub tags: Vec<OptionItem>,
     pub warnings: Vec<String>,
 }
 
@@ -1187,22 +1176,6 @@ async fn facets(
     } else {
         api.project_members().await?
     };
-    let mut tags = metadata
-        .into_iter()
-        .flat_map(|metadata| &metadata.fields)
-        .filter(|field| {
-            field.format == "tag"
-                || crate::validation::native_target(field, &api.profile) == Some("labels")
-        })
-        .flat_map(|field| field.options.clone())
-        .collect::<Vec<_>>();
-    if tags.is_empty() {
-        match api.project_labels().await {
-            Ok(values) => tags = values,
-            Err(error) if error.contains("[授权失效]") => return Err(error),
-            Err(_) => warnings.push("标签筛选项未能读取，其他条件仍可使用".into()),
-        }
-    }
     let mut statuses = Vec::new();
     for workitem_type in types {
         match api.workitem_statuses(&workitem_type.id).await {
@@ -1214,7 +1187,6 @@ async fn facets(
     Ok(ProjectBugFacets {
         statuses: unique(statuses),
         members: unique(members),
-        tags: unique(tags),
         warnings,
     })
 }
@@ -1321,7 +1293,6 @@ mod tests {
             status_ids: vec!["todo".into()],
             assigned_to_ids: vec!["owner-a".into()],
             creator_ids: vec!["creator-a".into()],
-            tag_ids: vec!["tag-a".into()],
             created_from: "2026-10-01".into(),
             created_to: "2026-10-16".into(),
             ..Default::default()
@@ -1329,10 +1300,9 @@ mod tests {
         query.validate().unwrap();
         let conditions = query.conditions();
         let group = conditions["conditionGroups"][0].as_array().unwrap();
-        assert_eq!(group.len(), 6);
+        assert_eq!(group.len(), 5);
         assert_eq!(group[0]["fieldIdentifier"], "subject");
-        assert_eq!(group[4]["fieldIdentifier"], "tag");
-        assert_eq!(group[5]["toValue"], "2026-10-16 23:59:59");
+        assert_eq!(group[4]["toValue"], "2026-10-16 23:59:59");
         assert!(!group.iter().any(|value| {
             value["fieldIdentifier"] == "creator" && value["value"] == json!(["user-a"])
         }));
@@ -1471,20 +1441,11 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path(format!("{base}/labels")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"id":"tag-a","name":"Android"}
-            ])))
-            .expect(1)
-            .mount(&server)
-            .await;
         let root = tempfile::tempdir().unwrap();
         let state = state(&server, root.path());
         let result = facets_for_state(&state, Some("project-a")).await.unwrap();
         assert_eq!(result.statuses.len(), 1);
         assert_eq!(result.members[0].name, "测试人员");
-        assert_eq!(result.tags[0].name, "Android");
         assert!(result.warnings.is_empty());
     }
 
