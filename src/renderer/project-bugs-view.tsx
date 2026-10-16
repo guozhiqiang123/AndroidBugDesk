@@ -4,13 +4,17 @@ import type { Profile } from "../shared/domain";
 import {
   emptyProjectBugFilters,
   projectBugDateError,
+  isProjectBugDetailCacheFresh,
   projectBugQuery,
   projectBugSortOptions,
   type ProjectBugFacets,
   type ProjectBugFilters,
+  type ProjectBugDetail,
+  type ProjectBugItem,
   type ProjectBugPage,
 } from "../shared/project-bugs";
 import { CustomSelect } from "./custom-select";
+import { ProjectBugDetailDialog } from "./project-bug-detail-dialog";
 
 interface Props {
   profile: Profile;
@@ -25,7 +29,6 @@ const emptyFacets: ProjectBugFacets = {
   tags: [],
   warnings: [],
 };
-
 function displayTime(value: string) {
   if (!value) return "—";
   const parsed = new Date(value.replace(" ", "T"));
@@ -54,9 +57,17 @@ export function ProjectBugsView({
   const [facetsError, setFacetsError] = useState("");
   const [actionError, setActionError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
+  const [selected, setSelected] = useState<ProjectBugItem | null>(null);
+  const [detail, setDetail] = useState<ProjectBugDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState("");
   const alive = useRef(true);
   const listEpoch = useRef(0);
   const facetEpoch = useRef(0);
+  const detailEpoch = useRef(0);
+  const detailCache = useRef(
+    new Map<string, { detail: ProjectBugDetail; loadedAt: number }>(),
+  );
   const remoteErrorRef = useRef(remoteError);
   remoteErrorRef.current = remoteError;
   const pending = JSON.stringify(filters) !== JSON.stringify(applied);
@@ -122,6 +133,7 @@ export function ProjectBugsView({
       alive.current = false;
       listEpoch.current += 1;
       facetEpoch.current += 1;
+      detailEpoch.current += 1;
     };
   }, []);
 
@@ -132,7 +144,7 @@ export function ProjectBugsView({
     setError("");
   };
 
-  const open = async (identifier: string) => {
+  const openWeb = async (identifier: string) => {
     if (!identifier || actionBusy) return;
     setActionBusy(true);
     setActionError("");
@@ -143,6 +155,46 @@ export function ProjectBugsView({
     } finally {
       if (alive.current) setActionBusy(false);
     }
+  };
+
+  const loadDetail = async (item: ProjectBugItem, force = false) => {
+    const epoch = ++detailEpoch.current;
+    const cached = detailCache.current.get(item.id);
+    setSelected(item);
+    setDetailError("");
+    setActionError("");
+    if (cached) setDetail(cached.detail);
+    else setDetail(null);
+    if (!force && cached && isProjectBugDetailCacheFresh(cached.loadedAt))
+      return;
+    setDetailLoading(true);
+    try {
+      const result = await invoke<ProjectBugDetail>("project_bug_detail", {
+        id: item.id,
+        projectId: profile.projectId,
+      });
+      if (!alive.current || epoch !== detailEpoch.current) return;
+      detailCache.current.set(item.id, {
+        detail: result,
+        loadedAt: Date.now(),
+      });
+      setDetail(result);
+    } catch (failure) {
+      if (!alive.current || epoch !== detailEpoch.current) return;
+      setDetailError(String(failure));
+      await remoteErrorRef.current(failure);
+    } finally {
+      if (alive.current && epoch === detailEpoch.current)
+        setDetailLoading(false);
+    }
+  };
+
+  const closeDetail = () => {
+    detailEpoch.current += 1;
+    setDetailLoading(false);
+    setSelected(null);
+    setDetail(null);
+    setDetailError("");
   };
 
   return (
@@ -351,7 +403,12 @@ export function ProjectBugsView({
               {page?.items.map((item) => (
                 <tr key={item.id}>
                   <td>
-                    <strong>{item.title || "未命名 Bug"}</strong>
+                    <button
+                      className="project-bug-title-button"
+                      onClick={() => void loadDetail(item)}
+                    >
+                      {item.title || "未命名 Bug"}
+                    </button>
                     <small>
                       {item.identifier || item.id}
                       {item.labels.length
@@ -370,10 +427,10 @@ export function ProjectBugsView({
                   <td>{displayTime(item.updatedAt)}</td>
                   <td>
                     <button
-                      disabled={!item.identifier || actionBusy || busy}
-                      onClick={() => void open(item.identifier)}
+                      disabled={detailLoading || busy}
+                      onClick={() => void loadDetail(item)}
                     >
-                      打开
+                      查看详情
                     </button>
                   </td>
                 </tr>
@@ -413,6 +470,21 @@ export function ProjectBugsView({
           </div>
         )}
       </div>
+      {selected && (
+        <ProjectBugDetailDialog
+          item={selected}
+          detail={detail}
+          profile={profile}
+          loading={detailLoading}
+          error={detailError}
+          openError={actionError}
+          openingWeb={actionBusy}
+          onClose={closeDetail}
+          onRefresh={() => void loadDetail(selected, true)}
+          onOpenWeb={() => void openWeb(selected.identifier)}
+          remoteError={remoteErrorRef.current}
+        />
+      )}
     </section>
   );
 }

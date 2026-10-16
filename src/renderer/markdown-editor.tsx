@@ -23,6 +23,10 @@ const ManagedImage = Image.extend({
         default: null,
         rendered: false,
       },
+      remoteSource: {
+        default: null,
+        rendered: false,
+      },
     };
   },
   parseMarkdown(token, helpers) {
@@ -33,6 +37,7 @@ const ManagedImage = Image.extend({
     return helpers.createNode("image", {
       src: resourceId ? "" : source,
       resourceId,
+      remoteSource: resourceId ? null : source,
       title: token.title,
       alt: token.text,
     });
@@ -41,7 +46,7 @@ const ManagedImage = Image.extend({
     const resourceId = String(node.attrs?.resourceId ?? "");
     const source = resourceId
       ? `${assetScheme}${resourceId}`
-      : String(node.attrs?.src ?? "");
+      : String(node.attrs?.remoteSource ?? node.attrs?.src ?? "");
     const alt = String(node.attrs?.alt ?? "").replaceAll("]", "\\]");
     const title = String(node.attrs?.title ?? "").replaceAll('"', '\\"');
     return title ? `![${alt}](${source} "${title}")` : `![${alt}](${source})`;
@@ -152,6 +157,35 @@ function replacePreviewSource(
     transaction.setNodeMarkup(position, undefined, {
       ...node.attrs,
       resourceId,
+      src: source,
+    });
+    changed = true;
+  });
+  if (changed) editor.view.dispatch(transaction.setMeta("addToHistory", false));
+}
+
+function remoteSourceFromNode(node: { attrs?: Record<string, unknown> }) {
+  const source = String(node.attrs?.remoteSource ?? "");
+  return source || String(node.attrs?.src ?? "");
+}
+
+function replaceRemotePreviewSource(
+  editor: Editor,
+  remoteSource: string,
+  source: string,
+) {
+  const transaction = editor.state.tr;
+  let changed = false;
+  editor.state.doc.descendants((node, position) => {
+    if (
+      node.type.name !== "image" ||
+      resourceIdFromNode(node) ||
+      remoteSourceFromNode(node) !== remoteSource
+    )
+      return;
+    transaction.setNodeMarkup(position, undefined, {
+      ...node.attrs,
+      remoteSource,
       src: source,
     });
     changed = true;
@@ -387,12 +421,19 @@ export function MarkdownEditor({
 interface MarkdownPreviewProps {
   value: string;
   onReadAsset: (assetId: string) => Promise<string>;
+  onReadRemoteImage?: (source: string, alt: string) => Promise<string>;
 }
 
-export function MarkdownPreview({ value, onReadAsset }: MarkdownPreviewProps) {
+export function MarkdownPreview({
+  value,
+  onReadAsset,
+  onReadRemoteImage,
+}: MarkdownPreviewProps) {
   const previews = useRef(new Map<string, string>());
   const readAsset = useRef(onReadAsset);
+  const readRemoteImage = useRef(onReadRemoteImage);
   readAsset.current = onReadAsset;
+  readRemoteImage.current = onReadRemoteImage;
   const editor = useEditor({
     immediatelyRender: false,
     content: value,
@@ -417,10 +458,16 @@ export function MarkdownPreview({ value, onReadAsset }: MarkdownPreviewProps) {
       emitUpdate: false,
     });
     const resourceIds = new Set<string>();
+    const remoteImages = new Map<string, string>();
     editor.state.doc.descendants((node) => {
       if (node.type.name !== "image") return;
       const id = resourceIdFromNode(node);
-      if (id) resourceIds.add(id);
+      if (id) {
+        resourceIds.add(id);
+        return;
+      }
+      const source = remoteSourceFromNode(node);
+      if (source) remoteImages.set(source, String(node.attrs?.alt ?? ""));
     });
     for (const id of resourceIds) {
       const cached = previews.current.get(id);
@@ -435,6 +482,23 @@ export function MarkdownPreview({ value, onReadAsset }: MarkdownPreviewProps) {
           replacePreviewSource(editor, id, source);
         })
         .catch(() => undefined);
+    }
+    if (readRemoteImage.current) {
+      for (const [source, alt] of remoteImages) {
+        const key = `remote:${source}`;
+        const cached = previews.current.get(key);
+        if (cached) {
+          replaceRemotePreviewSource(editor, source, cached);
+          continue;
+        }
+        void readRemoteImage
+          .current(source, alt)
+          .then((preview) => {
+            previews.current.set(key, preview);
+            replaceRemotePreviewSource(editor, source, preview);
+          })
+          .catch(() => undefined);
+      }
     }
   }, [editor, value]);
 

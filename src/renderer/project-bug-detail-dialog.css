@@ -1,0 +1,304 @@
+.project-bug-detail-dialog {
+  width: min(1080px, calc(100vw - 40px));
+  max-height: calc(100vh - 36px);
+}
+.project-bug-detail-dialog .app-dialog-scroll {
+  padding-top: 0;
+}
+.project-bug-detail-toolbar {
+  position: sticky;
+  z-index: 3;
+  top: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 0 -24px 16px;
+  padding: 16px 24px;
+  border-bottom: 1px solid #e8edf4;
+  background: rgb(255 255 255 / 96%);
+  backdrop-filter: blur(8px);
+}
+.project-bug-detail-toolbar h3,
+.project-bug-detail-section h4 {
+  margin: 0;
+}
+.project-bug-detail-toolbar h3 {
+  margin-bottom: 8px;
+  font-size: 19px;
+  line-height: 1.45;
+}
+.project-bug-detail-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.project-bug-detail-loading {
+  padding: 52px 20px;
+  color: #73819a;
+  text-align: center;
+}
+.project-bug-detail-sections {
+  display: grid;
+  gap: 14px;
+}
+.project-bug-detail-section {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid #e4eaf2;
+  border-radius: 11px;
+  background: #fff;
+}
+.project-bug-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.project-bug-section-title > span {
+  color: #7b889d;
+  font-size: 12px;
+}
+.project-bug-section-title button {
+  min-height: 30px;
+  padding: 4px 9px;
+}
+.project-bug-detail-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 18px;
+}
+.project-bug-detail-summary > div {
+  min-width: 0;
+}
+.project-bug-detail-summary > div.wide {
+  grid-column: 1 / -1;
+}
+.project-bug-detail-summary span,
+.project-bug-detail-summary strong {
+  display: block;
+}
+.project-bug-detail-summary span {
+  margin-bottom: 3px;
+  color: #7d899d;
+  font-size: 12px;
+}
+.project-bug-detail-summary strong {
+  overflow-wrap: anywhere;
+  color: #2d3b53;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.project-bug-content,
+.project-bug-richtext,
+.project-bug-plain-content {
+  overflow-wrap: anywhere;
+  color: #2e3c53;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.project-bug-content .markdown-preview-content {
+  min-height: 0;
+  padding: 0;
+  border: 0;
+}
+.project-bug-content img,
+.project-bug-richtext img {
+  display: block;
+  max-width: min(100%, 820px);
+  max-height: 520px;
+  margin: 10px 0;
+  border: 1px solid #dce3ef;
+  border-radius: 8px;
+  object-fit: contain;
+}
+.project-bug-richtext > :first-child {
+  margin-top: 0;
+}
+.project-bug-richtext > :last-child {
+  margin-bottom: 0;
+}
+.project-bug-richtext table {
+  max-width: 100%;
+  border-collapse: collapse;
+}
+.project-bug-richtext td,
+.project-bug-richtext th {
+  padding: 6px 8px;
+  border: 1px solid #dce3ef;
+}
+.project-bug-inline-image-missing {
+  display: block;
+  width: fit-content;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #f4f6f9;
+  color: #78869c;
+  font-size: 12px;
+}
+.project-bug-plain-content,
+.project-bug-attachment-preview pre {
+  overflow: auto;
+  max-height: 520px;
+  margin: 0;
+  padding: 12px;
+  border-radius: 7px;
+  background: #f6f8fb;
+  white-space: pre-wrap;
+}
+.project-bug-custom-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 22px;
+  margin: 0;
+}
+.project-bug-custom-fields > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 34%) 1fr;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid #edf1f6;
+}
+.project-bug-custom-fields dt {
+  color: #738097;
+}
+.project-bug-custom-fields dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #2e3c53;
+}
+.project-bug-attachments {
+  display: grid;
+  gap: 8px;
+}
+.project-bug-attachment-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border: 1px solid #e5eaf1;
+  border-radius: 8px;
+  background: #fafbfd;
+}
+.project-bug-attachment-row > div {
+  min-width: 0;
+}
+.project-bug-attachment-row strong,
+.project-bug-attachment-row small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.project-bug-attachment-row small {
+  margin-top: 3px;
+  color: #7c899e;
+}
+.project-bug-attachment-preview {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #dce4ef;
+  border-radius: 9px;
+  background: #f9fbfd;
+}
+.project-bug-attachment-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 620px;
+  margin: 0 auto;
+  object-fit: contain;
+}
+.project-bug-comment {
+  padding: 11px 0;
+  border-bottom: 1px solid #edf1f6;
+}
+.project-bug-comment:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+.project-bug-comment.reply {
+  margin-left: 24px;
+  padding-left: 12px;
+  border-left: 3px solid #dfe7f3;
+}
+.project-bug-comment header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+}
+.project-bug-comment header span,
+.project-bug-comment small {
+  color: #8290a5;
+  font-size: 12px;
+}
+.project-bug-activities {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.project-bug-activities li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 10px;
+  padding: 0 0 15px;
+}
+.project-bug-activities li:not(:last-child)::before {
+  position: absolute;
+  top: 11px;
+  bottom: -2px;
+  left: 5px;
+  width: 2px;
+  background: #dce5f2;
+  content: "";
+}
+.project-bug-activity-dot {
+  position: relative;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #3977e8;
+}
+.project-bug-activities strong,
+.project-bug-activities small {
+  display: block;
+}
+.project-bug-activities small {
+  margin-top: 2px;
+}
+.project-bug-activities p {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 7px 0 0;
+  color: #5d6b82;
+}
+.project-bug-activities p span {
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: #f2f5f9;
+}
+.empty-text {
+  margin: 0;
+  color: #8793a6;
+}
+@media (max-width: 760px) {
+  .project-bug-detail-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .project-bug-detail-summary,
+  .project-bug-custom-fields {
+    grid-template-columns: 1fr;
+  }
+  .project-bug-attachment-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

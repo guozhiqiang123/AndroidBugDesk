@@ -176,6 +176,9 @@ try {
               user: q.user,
               authorized: q.authorized,
               rememberLogin: q.rememberLogin,
+              adbPath: null,
+              developerOptions: { debugEnabled: false },
+              shortcutSettings: { version: 1, overrides: {} },
               drafts: q.drafts,
               draftScopes: q.draftScopes,
               submissions: q.submissions,
@@ -290,6 +293,142 @@ try {
               await new Promise((resolve) => q.pending.push(resolve));
             if (failure) throw failure;
             return clone(result);
+          }
+          if (cmd === "project_bug_facets")
+            return {
+              statuses: [{ id: "open", name: "待处理" }],
+              members: [clone(metadata.members[0])],
+              tags: [{ id: "android", name: "Android" }],
+              warnings: [],
+            };
+          if (cmd === "list_project_bugs")
+            return {
+              items: [
+                {
+                  id: "bug-detail-1",
+                  identifier: "SKII-614",
+                  title: "属于清理的部分功能无法使用（见录屏）",
+                  status: { id: "open", name: "待处理" },
+                  assignedTo: clone(metadata.members[0]),
+                  creator: { id: "creator", name: "测试同学" },
+                  labels: [{ id: "android", name: "Android" }],
+                  createdAt: "2026-10-16T08:00:00Z",
+                  updatedAt: "2026-10-16T09:00:00Z",
+                },
+              ],
+              page: 1,
+              perPage: 50,
+              total: 1,
+              totalPages: 1,
+              hasMore: false,
+            };
+          if (cmd === "project_bug_detail")
+            return {
+              id: "bug-detail-1",
+              identifier: "SKII-614",
+              title: "属于清理的部分功能无法使用（见录屏）",
+              status: { id: "open", name: "待处理" },
+              assignedTo: clone(metadata.members[0]),
+              creator: { id: "creator", name: "测试同学" },
+              modifier: { id: "modifier", name: "修改人" },
+              verifier: { id: "verifier", name: "验证者" },
+              participants: [{ id: "participant", name: "参与人" }],
+              trackers: [{ id: "tracker", name: "抄送人" }],
+              sprint: { id: "sprint", name: "当前迭代" },
+              labels: [{ id: "android", name: "Android" }],
+              createdAt: "2026-10-16T08:00:00Z",
+              updatedAt: "2026-10-16T09:00:00Z",
+              statusUpdatedAt: "2026-10-16T08:30:00Z",
+              archived: false,
+              description:
+                '<p>完整富文本详情</p><a href="https://evil.example">外部链接</a><script>window.__unsafeRan=true</script><img src="https://files.example/screen.png" alt="screen.png">',
+              format: "richtext",
+              customFields: [
+                {
+                  id: "severity",
+                  name: "严重程度",
+                  format: "list",
+                  values: ["2-严重"],
+                },
+              ],
+              attachments: [
+                {
+                  id: "image-attachment",
+                  fileId: "file-image",
+                  name: "screen.png",
+                  suffix: ".png",
+                  size: 68,
+                  creator: { id: "creator", name: "测试同学" },
+                  createdAt: "2026-10-16T08:10:00Z",
+                },
+                {
+                  id: "text-attachment",
+                  fileId: "file-text",
+                  name: "diagnostic.txt",
+                  suffix: ".txt",
+                  size: 32,
+                  creator: { id: "creator", name: "测试同学" },
+                  createdAt: "2026-10-16T08:11:00Z",
+                },
+                {
+                  id: "system-attachment",
+                  fileId: "file-system",
+                  name: "recording.mp4",
+                  suffix: ".mp4",
+                  size: 1024,
+                  creator: { id: "creator", name: "测试同学" },
+                  createdAt: "2026-10-16T08:12:00Z",
+                },
+              ],
+              comments: [
+                {
+                  id: "comment-1",
+                  parentId: "",
+                  author: { id: "developer", name: "开发同学" },
+                  content: "已确认 **可以复现**",
+                  format: "markdown",
+                  createdAt: "2026-10-16T09:10:00Z",
+                  updatedAt: "2026-10-16T09:10:00Z",
+                  pinned: true,
+                },
+              ],
+              activities: [
+                {
+                  id: "activity-1",
+                  eventType: "workitem.transitioned",
+                  actionType: "update",
+                  actor: { id: "developer", name: "开发同学" },
+                  propertyName: "状态",
+                  oldValues: ["待处理"],
+                  newValues: ["处理中"],
+                  relatedResourceId: "",
+                  relatedResourceType: "",
+                  occurredAt: "2026-10-16T09:20:00Z",
+                },
+              ],
+              sectionWarnings: [],
+            };
+          if (cmd === "preview_project_bug_attachment") {
+            if (args.attachmentId === "image-attachment")
+              return {
+                kind: "image",
+                name: "screen.png",
+                mime: "image/png",
+                data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0E8AAAAASUVORK5CYII=",
+              };
+            if (args.attachmentId === "text-attachment")
+              return {
+                kind: "text",
+                name: "diagnostic.txt",
+                mime: "text/plain",
+                data: "mock adb diagnostic output",
+              };
+            return {
+              kind: "system",
+              name: "recording.mp4",
+              mime: "video/mp4",
+              data: "",
+            };
           }
           throw Error(`Unexpected IPC ${cmd}`);
         },
@@ -649,6 +788,87 @@ try {
     path: path.join(output, "cloud-tabs-filters.png"),
     fullPage: true,
   });
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  await page.getByRole("button", { name: "项目 Bug", exact: true }).click();
+  const bugs = page.locator(".project-bugs-view");
+  await bugs.getByText("属于清理的部分功能无法使用（见录屏）").waitFor();
+  await bugs
+    .getByRole("button", {
+      name: "属于清理的部分功能无法使用（见录屏）",
+      exact: true,
+    })
+    .click();
+  const detailDialog = page.getByRole("dialog", { name: "SKII-614 · 详情" });
+  await detailDialog.getByText("完整富文本详情", { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.__unsafeRan), undefined);
+  assert.equal(
+    await detailDialog
+      .getByText("外部链接", { exact: true })
+      .getAttribute("href"),
+    null,
+  );
+  await detailDialog
+    .locator('.project-bug-richtext img[src^="data:image/png"]')
+    .waitFor();
+  assert.equal(
+    await detailDialog.getByText("严重程度", { exact: true }).count(),
+    1,
+  );
+  assert.equal(
+    await detailDialog.getByText("已确认 可以复现", { exact: true }).count(),
+    1,
+  );
+  assert.equal(
+    await detailDialog.getByText("待处理", { exact: true }).count(),
+    2,
+  );
+  await detailDialog
+    .locator(".project-bug-attachment-row")
+    .filter({ hasText: "diagnostic.txt" })
+    .getByRole("button", { name: "预览", exact: true })
+    .click();
+  await detailDialog
+    .getByText("mock adb diagnostic output", { exact: true })
+    .waitFor();
+  await detailDialog
+    .getByRole("button", { name: "关闭附件预览", exact: true })
+    .click();
+  await detailDialog
+    .locator(".project-bug-attachment-row")
+    .filter({ hasText: "recording.mp4" })
+    .getByRole("button", { name: "预览", exact: true })
+    .click();
+  await detailDialog
+    .getByText("已使用系统应用打开 recording.mp4", { exact: true })
+    .waitFor();
+  await detailDialog.getByRole("button", { name: "刷新", exact: true }).click();
+  await page.waitForFunction(
+    () =>
+      window.__qa.calls.filter((call) => call.cmd === "project_bug_detail")
+        .length === 2,
+  );
+  await detailDialog
+    .getByRole("button", { name: "在云效中打开", exact: true })
+    .click();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls
+          .filter((call) => call.cmd === "open_history_item")
+          .at(-1).args.identifier,
+    ),
+    "SKII-614",
+  );
+  await page.screenshot({
+    path: path.join(output, "project-bug-detail.png"),
+    fullPage: true,
+  });
+  await detailDialog
+    .getByRole("button", { name: "关闭SKII-614 · 详情", exact: true })
+    .click();
+  scenarios.push(
+    "project Bug detail stays in-app with sanitized rich text, safe inline images, fields, comments, activities, attachment previews, refresh and cloud fallback",
+  );
   await page.setViewportSize({ width: 980, height: 1000 });
   assert.ok(
     await page.evaluate(

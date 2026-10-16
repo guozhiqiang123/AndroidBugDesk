@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   emptyProjectBugFilters,
+  isProjectBugDetailCacheFresh,
+  projectBugDetailCacheTtl,
   projectBugDateError,
   projectBugQuery,
 } from "../src/shared/project-bugs";
@@ -26,5 +28,17 @@ describe("项目 Bug 查询状态", () => {
     expect(projectBugDateError(filters)).toContain("不能晚于");
     filters.createdTo = "2026-10-16";
     expect(projectBugDateError(filters)).toBe("");
+  });
+
+  it("详情缓存仅在两分钟内复用并拒绝未来时间", () => {
+    const now = Date.parse("2026-10-16T12:00:00Z");
+    expect(isProjectBugDetailCacheFresh(now, now)).toBe(true);
+    expect(
+      isProjectBugDetailCacheFresh(now - projectBugDetailCacheTtl, now),
+    ).toBe(true);
+    expect(
+      isProjectBugDetailCacheFresh(now - projectBugDetailCacheTtl - 1, now),
+    ).toBe(false);
+    expect(isProjectBugDetailCacheFresh(now + 1, now)).toBe(false);
   });
 });

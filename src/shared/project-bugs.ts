@@ -118,6 +118,15 @@ export interface ProjectBugAttachmentPreview {
   data: string;
 }
 
+export const projectBugDetailCacheTtl = 2 * 60 * 1000;
+
+export function isProjectBugDetailCacheFresh(
+  loadedAt: number,
+  now = Date.now(),
+): boolean {
+  return now >= loadedAt && now - loadedAt <= projectBugDetailCacheTtl;
+}
+
 export function emptyProjectBugFilters(): ProjectBugFilters {
   return {
     keyword: "",

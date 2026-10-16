@@ -1777,6 +1777,24 @@ details {
   font-size: 13px;
   line-height: 1.45;
 }
+.project-bug-title-button {
+  max-width: 100%;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #24344f;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.45;
+  text-align: left;
+}
+.project-bug-title-button:hover,
+.project-bug-title-button:focus-visible {
+  background: transparent;
+  color: #2768dc;
+  text-decoration: underline;
+}
 .project-bug-table small {
   margin-top: 3px;
   color: #8491a6;
