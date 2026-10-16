@@ -8,6 +8,7 @@ import type {
   ProjectBugAttachmentPreview,
   ProjectBugContentFormat,
   ProjectBugDetail,
+  ProjectBugInlineFile,
   ProjectBugItem,
 } from "../shared/project-bugs";
 import { AppDialog } from "./app-dialog";
@@ -99,6 +100,23 @@ function attachmentCandidates(source: string, alt: string) {
   return candidates;
 }
 
+function inlineFileIdentifier(source: string) {
+  try {
+    const value = new URL(source).searchParams.get("fileIdentifier") ?? "";
+    if (value) return value;
+  } catch {
+    // Fall through to the conservative query-fragment parser.
+  }
+  return (
+    source.match(/(?:[?&]|&amp;)fileIdentifier=([A-Za-z0-9_-]+)/)?.[1] ?? ""
+  );
+}
+
+function matchingInlineFile(files: ProjectBugInlineFile[], source: string) {
+  const fileId = inlineFileIdentifier(source);
+  return fileId ? files.find((file) => file.fileId === fileId) : undefined;
+}
+
 function matchingImage(
   attachments: ProjectBugAttachment[],
   source: string,
@@ -116,13 +134,11 @@ function matchingImage(
 function ContentPreview({
   value,
   format,
-  attachments,
   readImage,
 }: {
   value: string;
   format: ProjectBugContentFormat;
-  attachments: ProjectBugAttachment[];
-  readImage: (attachment: ProjectBugAttachment) => Promise<string>;
+  readImage: (source: string, alt: string) => Promise<string>;
 }) {
   const richRef = useRef<HTMLDivElement>(null);
   const html = useMemo(
@@ -135,30 +151,17 @@ function ContentPreview({
     let active = true;
     for (const image of richRef.current.querySelectorAll("img")) {
       const source = image.dataset.remoteSource ?? "";
-      const attachment = matchingImage(
-        attachments,
-        source,
-        image.getAttribute("alt") ?? "",
-      );
-      if (!attachment) {
-        image.replaceWith(
-          Object.assign(document.createElement("span"), {
-            className: "project-bug-inline-image-missing",
-            textContent: "正文图片可在附件区预览",
-          }),
-        );
-        continue;
-      }
-      void readImage(attachment)
+      const alt = image.getAttribute("alt") ?? "";
+      void readImage(source, alt)
         .then((source) => {
           if (active && image.isConnected) image.src = source;
         })
-        .catch(() => {
+        .catch((failure) => {
           if (active && image.isConnected) {
             image.replaceWith(
               Object.assign(document.createElement("span"), {
                 className: "project-bug-inline-image-missing",
-                textContent: `图片 ${attachment.name} 读取失败，可在附件区重试`,
+                textContent: `正文图片读取失败：${String(failure)}`,
               }),
             );
           }
@@ -167,7 +170,7 @@ function ContentPreview({
     return () => {
       active = false;
     };
-  }, [attachments, format, html, readImage]);
+  }, [format, html, readImage]);
 
   if (!value.trim()) return <p className="empty-text">未填写描述</p>;
   if (format === "markdown") {
@@ -182,12 +185,7 @@ function ContentPreview({
         <MarkdownPreview
           value={value}
           onReadAsset={() => Promise.reject(new Error("非本地正文资源"))}
-          onReadRemoteImage={(source, alt) => {
-            const attachment = matchingImage(attachments, source, alt);
-            return attachment
-              ? readImage(attachment)
-              : Promise.reject(new Error("正文图片未匹配附件"));
-          }}
+          onReadRemoteImage={readImage}
         />
       </div>
     );
@@ -267,6 +265,37 @@ export function ProjectBugDetailDialog({
       return result.data;
     },
     [readAttachment],
+  );
+
+  const readInlineImage = useCallback(
+    async (file: ProjectBugInlineFile) => {
+      const key = `inline:${file.fileId}`;
+      const cached = previewCache.current.get(key);
+      if (cached?.kind === "image") return cached.data;
+      const result = await invoke<ProjectBugAttachmentPreview>(
+        "preview_project_bug_inline_file",
+        {
+          id: item.id,
+          fileId: file.fileId,
+          projectId: profile.projectId,
+        },
+      );
+      if (result.kind !== "image") throw new Error("正文文件不是可预览图片");
+      previewCache.current.set(key, result);
+      return result.data;
+    },
+    [item.id, profile.projectId],
+  );
+
+  const readContentImage = useCallback(
+    async (source: string, alt: string) => {
+      const inline = matchingInlineFile(detail?.inlineFiles ?? [], source);
+      if (inline) return readInlineImage(inline);
+      const attachment = matchingImage(detail?.attachments ?? [], source, alt);
+      if (attachment) return readImage(attachment);
+      throw new Error("正文图片未匹配到云效文件");
+    },
+    [detail?.attachments, detail?.inlineFiles, readImage, readInlineImage],
   );
 
   const openAttachment = async (attachment: ProjectBugAttachment) => {
@@ -383,8 +412,7 @@ export function ProjectBugDetailDialog({
             <ContentPreview
               value={detail.description}
               format={detail.format}
-              attachments={detail.attachments}
-              readImage={readImage}
+              readImage={readContentImage}
             />
           </section>
 
@@ -505,8 +533,7 @@ export function ProjectBugDetailDialog({
                   <ContentPreview
                     value={comment.content}
                     format={comment.format}
-                    attachments={detail.attachments}
-                    readImage={readImage}
+                    readImage={readContentImage}
                   />
                 </article>
               ))

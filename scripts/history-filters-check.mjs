@@ -341,7 +341,7 @@ try {
               statusUpdatedAt: "2026-10-16T08:30:00Z",
               archived: false,
               description:
-                '<p>完整富文本详情</p><a href="https://evil.example">外部链接</a><script>window.__unsafeRan=true</script><img src="https://files.example/screen.png" alt="screen.png">',
+                '<p>完整富文本详情</p><a href="https://evil.example">外部链接</a><script>window.__unsafeRan=true</script><img src="https://devops.aliyun.com/projex/api/workitem/file/url?fileIdentifier=inline-image" alt="正文图片">',
               format: "richtext",
               customFields: [
                 {
@@ -351,16 +351,15 @@ try {
                   values: ["2-严重"],
                 },
               ],
-              attachments: [
+              inlineFiles: [
                 {
-                  id: "image-attachment",
-                  fileId: "file-image",
-                  name: "screen.png",
+                  fileId: "inline-image",
+                  name: "image.png",
                   suffix: ".png",
                   size: 68,
-                  creator: { id: "creator", name: "测试同学" },
-                  createdAt: "2026-10-16T08:10:00Z",
                 },
+              ],
+              attachments: [
                 {
                   id: "text-attachment",
                   fileId: "file-text",
@@ -385,8 +384,8 @@ try {
                   id: "comment-1",
                   parentId: "",
                   author: { id: "developer", name: "开发同学" },
-                  content: "已确认 **可以复现**",
-                  format: "markdown",
+                  content: "<p>已确认 <strong>可以复现</strong></p>",
+                  format: "richtext",
                   createdAt: "2026-10-16T09:10:00Z",
                   updatedAt: "2026-10-16T09:10:00Z",
                   pinned: true,
@@ -409,13 +408,6 @@ try {
               sectionWarnings: [],
             };
           if (cmd === "preview_project_bug_attachment") {
-            if (args.attachmentId === "image-attachment")
-              return {
-                kind: "image",
-                name: "screen.png",
-                mime: "image/png",
-                data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0E8AAAAASUVORK5CYII=",
-              };
             if (args.attachmentId === "text-attachment")
               return {
                 kind: "text",
@@ -428,6 +420,16 @@ try {
               name: "recording.mp4",
               mime: "video/mp4",
               data: "",
+            };
+          }
+          if (cmd === "preview_project_bug_inline_file") {
+            if (args.fileId !== "inline-image")
+              throw Error(`Unexpected inline file ${args.fileId}`);
+            return {
+              kind: "image",
+              name: "image.png",
+              mime: "image/png",
+              data: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0E8AAAAASUVORK5CYII=",
             };
           }
           throw Error(`Unexpected IPC ${cmd}`);
@@ -809,7 +811,25 @@ try {
   );
   await detailDialog
     .locator('.project-bug-richtext img[src^="data:image/png"]')
-    .waitFor();
+    .waitFor({ state: "attached" });
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter(
+          (call) => call.cmd === "preview_project_bug_inline_file",
+        ).length,
+    ),
+    1,
+  );
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.find(
+          (call) => call.cmd === "preview_project_bug_inline_file",
+        ).args.fileId,
+    ),
+    "inline-image",
+  );
   assert.equal(
     await detailDialog.getByText("严重程度", { exact: true }).count(),
     1,

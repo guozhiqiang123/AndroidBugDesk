@@ -103,6 +103,7 @@ export interface WorkspaceCommands {
   project_bug_facets: ProjectBugFacets;
   project_bug_detail: ProjectBugDetail;
   preview_project_bug_attachment: ProjectBugAttachmentPreview;
+  preview_project_bug_inline_file: ProjectBugAttachmentPreview;
   check_for_updates: UpdateCheckResult;
   install_update: UpdateInstallResult;
   open_release_page: void;

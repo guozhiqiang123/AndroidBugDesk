@@ -65,6 +65,13 @@ export interface ProjectBugAttachment {
   createdAt: string;
 }
 
+export interface ProjectBugInlineFile {
+  fileId: string;
+  name: string;
+  suffix: string;
+  size: number;
+}
+
 export interface ProjectBugComment {
   id: string;
   parentId: string;
@@ -105,6 +112,7 @@ export interface ProjectBugDetail extends ProjectBugItem {
   statusUpdatedAt: string;
   archived: boolean;
   customFields: ProjectBugCustomField[];
+  inlineFiles: ProjectBugInlineFile[];
   attachments: ProjectBugAttachment[];
   comments: ProjectBugComment[];
   activities: ProjectBugActivity[];
