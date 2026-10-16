@@ -1005,6 +1005,7 @@ struct Remote {
     lose_create: bool,
     lose_upload: bool,
     reject_upload: bool,
+    expire_upload_auth: bool,
     unsupported_field: bool,
     empty_search: bool,
     download_saw_token: bool,
@@ -1090,6 +1091,10 @@ impl Respond for Simulator {
         }
         if path.ends_with("/attachments") && method == "POST" {
             state.uploads += 1;
+            if state.expire_upload_auth {
+                state.expire_upload_auth = false;
+                return ResponseTemplate::new(401);
+            }
             if state.reject_upload {
                 state.reject_upload = false;
                 return ResponseTemplate::new(403);
@@ -1566,6 +1571,42 @@ async fn command_partial_recovery_requires_original_account_and_keeps_evidence()
     assert!(Path::new(&resumed.evidence.directory)
         .with_extension("receipt.json")
         .exists());
+}
+
+#[tokio::test]
+async fn command_auth_expiry_during_partial_recovery_returns_to_login_boundary() {
+    let (server, remote, api) = mock(Remote {
+        reject_upload: true,
+        ..Default::default()
+    })
+    .await;
+    let (_temp, store, d) = setup();
+    let id = string(&d, "id");
+    bind_alice(&store, &id);
+    let state = submission_state(&store, &server, &api.profile);
+
+    let partial = crate::commands::submit_with_state(id.clone(), &state)
+        .await
+        .unwrap();
+    assert_eq!(partial.state, "partial");
+    assert!(state.user.lock().unwrap().is_some());
+    remote.lock().unwrap().expire_upload_auth = true;
+
+    let error = crate::commands::submit_with_state(id.clone(), &state)
+        .await
+        .unwrap_err();
+    assert!(error.contains("[授权失效]"));
+    assert!(state.user.lock().unwrap().is_none());
+    assert!(state.metadata.lock().unwrap().is_none());
+    assert!(state.locks.lock().unwrap().is_empty());
+
+    let saved: Submission = store.get("submission", &id).unwrap().unwrap();
+    assert_eq!(saved.state, "partial");
+    assert!(saved
+        .error
+        .as_deref()
+        .is_some_and(|message| message.contains("[授权失效]")));
+    assert!(Path::new(&saved.evidence.zip_path).is_file());
 }
 #[tokio::test]
 async fn command_unknown_creation_checks_account_before_search_or_explicit_id() {

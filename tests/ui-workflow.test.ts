@@ -272,6 +272,13 @@ describe("登录和工作区门禁", () => {
     expect(remoteAuthReaction("403 permission denied")).toBe("stay");
     expect(remoteAuthReaction("network timeout")).toBe("stay");
     expect(remoteAuthReaction("401 unauthorized")).toBe("logout");
+    expect(
+      remoteAuthReaction(
+        "[未写入] [授权失效] 云效授权失效，请重新输入个人 PAT",
+      ),
+    ).toBe("logout");
+    expect(remoteAuthReaction("请先验证登录令牌")).toBe("logout");
+    expect(remoteAuthReaction("所选 USB 设备尚未授权")).toBe("stay");
   });
 
   it("项目设置默认停用新项目并保留已保存配置，只提示非空包名冲突", () => {

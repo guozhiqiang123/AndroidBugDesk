@@ -1238,6 +1238,13 @@ pub async fn export_evidence(
 pub async fn submit_bug(id: String, state: State<'_, AppState>) -> Result<Submission> {
     submit_with_state(id, &state).await
 }
+fn observed_submission_result(state: &AppState, result: Result<Submission>) -> Result<Submission> {
+    let result = result.and_then(|submission| match submission.error.as_deref() {
+        Some(error) if error.contains("[授权失效]") => Err(error.to_owned()),
+        _ => Ok(submission),
+    });
+    crate::workspace::observed_error(state, result)
+}
 pub(crate) async fn submit_with_state(id: String, state: &AppState) -> Result<Submission> {
     {
         let mut locks = state.locks.lock().unwrap();
@@ -1264,7 +1271,7 @@ pub(crate) async fn submit_with_state(id: String, state: &AppState) -> Result<Su
     }
     .await;
     state.locks.lock().unwrap().remove(&id);
-    result
+    observed_submission_result(state, result)
 }
 #[tauri::command]
 pub async fn reconcile_submission(
@@ -1295,7 +1302,7 @@ pub(crate) async fn reconcile_with_state(
     }
     .await;
     state.locks.lock().unwrap().remove(&id);
-    result
+    observed_submission_result(state, result)
 }
 #[tauri::command]
 pub fn copy_receipt(id: String, repair: bool, state: State<AppState>) -> Result<()> {

@@ -718,3 +718,11 @@ DMG：`artifacts/local-dialog-refresh-macos-arm64-20261010/Android Bug Desk_0.1.
 - 无 Shift 默认组合回归继续通过 198 项前端测试、188 项 Rust 测试（3 项外部环境测试按设计忽略）、生产构建、严格 Clippy 和 8 个快捷键专项场景；专项结果位于 `artifacts/shortcuts-no-shift-browser-20261015/`。
 - 用户授权后，固定本机入口从首次 release 构建即使用 ad hoc 签名，约 179 秒一次完成应用、DMG、签名、架构和包内文件校验。直接覆盖 `/Applications/Android Bug Desk.app` 后，原生窗口确认按钮快捷键提示和设置页快捷键卡片均已加载；唯一安装路径进程持续运行至少 187 秒，未新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-macos-arm64-20261015/`，DMG SHA-256 为 `9d4cd98b3ab0471a463b982180bb6ce04119aae619401e8f0c53fb436c2a0573`。
 - 无 Shift 默认组合版本使用固定本机入口重新完整构建，约 178 秒一次通过应用与 DMG 签名、ARM64 架构、DMG 完整性和逐文件核对。覆盖 `/Applications/Android Bug Desk.app` 后，安装文件与产物一致，原生设置页显示 ⌘N、⌘E、⌘G、⌘O、⌘S、⌘D、⌘Enter；应用持续运行超过 90 秒且没有新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-no-shift-macos-arm64-20261015/`，DMG SHA-256 为 `95e1c64426a4782732e4bd145e35c65687cd988ea6982876dd576b78943d8faa`。
+
+## 云效授权过期回退（2026-10-16）
+
+登录有效性采用两层判断：应用启动时校验已保存授权；运行中不额外轮询，而以每次云效请求返回的 401／`[授权失效]` 为准立即结束当前工作区并返回登录页。403 仍作为项目或资源权限不足处理，不退出登录。
+
+补传和创建结果核对会保存部分提交记录。此前这两条链路会把授权过期写入记录后按成功结果返回，界面只显示“授权失效”而不会退出。本次在提交命令边界检查已落盘结果：保留草稿、证据包和部分提交记录，同时把授权失效重新返回给统一登录处理；设备“尚未授权”不参与云效退出判断。
+
+验证通过：198 项前端测试、186 项 Rust 测试（3 项外部环境测试按设计忽略）、TypeScript、生产构建、Rust 格式、严格 Clippy、Prettier、差异检查和 55 个完整 React/mock IPC 场景。新增 Rust 回归覆盖“先因 403 保持部分提交，再在补传时收到 401”的真实状态转换，确认授权和元数据被清空、提交锁释放、部分提交及证据包保留。

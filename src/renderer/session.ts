@@ -34,7 +34,7 @@ export function profileConfigured(profile: Profile): boolean {
 }
 
 export function remoteAuthReaction(error: unknown): "logout" | "stay" {
-  return /(^|\D)401(\D|$)|unauthorized|令牌失效|授权失效|token.*(expired|invalid)|过期/i.test(
+  return /(^|\D)401(\D|$)|unauthorized|令牌失效|授权失效|请先验证登录令牌|请先登录云效|token.*(expired|invalid)|过期/i.test(
     String(error),
   )
     ? "logout"
