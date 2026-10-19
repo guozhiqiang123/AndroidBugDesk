@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Draft } from "../shared/domain";
+import type { Draft, Session } from "../shared/domain";
 import type { ShortcutPresentation } from "../shared/shortcuts";
 import {
   captureItems,
@@ -16,6 +16,137 @@ import {
 import { AppDialog } from "./app-dialog";
 import { ShortcutBadge } from "./shortcut-badge";
 import "./post-capture.css";
+
+const evidenceSourceLabels: Record<string, string> = {
+  "crash-buffer": "Crash 缓冲区",
+  "dropbox-SYSTEM_TOMBSTONE": "DropBox 系统墓碑",
+  "dropbox-data_app_crash": "DropBox 应用崩溃",
+  "dropbox-data_app_native_crash": "DropBox Native 崩溃",
+  "dropbox-data_app_anr": "DropBox ANR",
+  "system-events": "系统进程事件",
+  "application-exit-info": "ApplicationExitInfo",
+};
+
+export function ReproductionCaptureEntry({
+  session,
+  serial,
+  packageName,
+  markedAt,
+  disabled,
+  onStart,
+  onMark,
+  onStop,
+}: {
+  session: Session | null;
+  serial: string;
+  packageName: string;
+  markedAt: number | null;
+  disabled: boolean;
+  onStart: () => Promise<void>;
+  onMark: () => Promise<void>;
+  onStop: () => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => {
+    if (!session) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [session?.id]);
+  const execute = async (action: () => Promise<void>) => {
+    if (working) return;
+    setWorking(true);
+    setError("");
+    try {
+      await action();
+    } catch (failure) {
+      setError(String(failure));
+    } finally {
+      setWorking(false);
+    }
+  };
+  const elapsed = session
+    ? Math.max(
+        0,
+        Math.floor((clock - new Date(session.startedAt).getTime()) / 1000),
+      )
+    : 0;
+  const remaining = markedAt
+    ? Math.max(0, 30 - Math.floor((clock - markedAt) / 1000))
+    : null;
+  return (
+    <div className="action-item reproduction-capture-entry">
+      <button
+        type="button"
+        disabled={disabled || working || (!serial && !session)}
+        onClick={() => {
+          setOpen(true);
+          if (!session) void execute(onStart);
+        }}
+      >
+        {session ? "复现采集中" : "开始复现采集"}
+      </button>
+      {session && <small role="status">已采集 {elapsed} 秒</small>}
+      {!open && error && <small className="error-text">{error}</small>}
+      {open && (
+        <AppDialog
+          title="复现日志采集"
+          closeLabel="关闭复现采集窗口"
+          onClose={() => setOpen(false)}
+        >
+          <p className="post-capture-context">
+            目标应用：{packageName} · 设备：{session?.serial || serial}
+          </p>
+          <p className="post-capture-context">
+            在手机上复现问题后点击“标记问题”。标记后继续采集 30
+            秒并自动结束；提前结束会在回执中标明覆盖不完整。
+          </p>
+          <div className="reproduction-capture-status" role="status">
+            {session
+              ? markedAt
+                ? `问题已标记，剩余约 ${remaining} 秒`
+                : `正在等待复现，已运行 ${elapsed} 秒`
+              : working
+                ? "正在建立采集会话…"
+                : "采集会话尚未开始"}
+          </div>
+          <div className="actions">
+            {!session && (
+              <button
+                className="primary"
+                disabled={working || disabled || !serial}
+                onClick={() => void execute(onStart)}
+              >
+                开始采集
+              </button>
+            )}
+            {session && !markedAt && (
+              <button
+                className="primary"
+                disabled={working}
+                onClick={() => void execute(onMark)}
+              >
+                标记问题
+              </button>
+            )}
+            {session && (
+              <button disabled={working} onClick={() => void execute(onStop)}>
+                {markedAt ? "提前结束" : "停止采集"}
+              </button>
+            )}
+          </div>
+          {error && (
+            <small className="error-text" role="alert">
+              {error}
+            </small>
+          )}
+        </AppDialog>
+      )}
+    </div>
+  );
+}
 
 export function PostCaptureEntry({
   draft,
@@ -250,6 +381,9 @@ export function PostCaptureEntry({
               <small>
                 目标应用：{latest.targetPackage || "未填写"} · 设备：
                 {latest.serial}
+                {latest.androidApiLevel
+                  ? ` · Android API ${latest.androidApiLevel}`
+                  : " · Android API 未识别"}
               </small>
               {latest.error && (
                 <small className="error-text">{latest.error}</small>
@@ -293,6 +427,28 @@ export function PostCaptureEntry({
                           key={`warning-${index}`}
                         >
                           {command.warning}
+                        </small>
+                      ))}
+                    {result.commands
+                      ?.filter((command) => command.source)
+                      .map((command, index) => (
+                        <small
+                          className="post-capture-source"
+                          key={`source-${index}`}
+                        >
+                          来源：
+                          {evidenceSourceLabels[command.source!] ||
+                            command.source}
+                          {typeof command.matchedRecordCount === "number"
+                            ? ` · 匹配 ${command.matchedRecordCount} 条`
+                            : ""}
+                          {typeof command.discardedRecordCount === "number" &&
+                          command.discardedRecordCount > 0
+                            ? ` · 已丢弃 ${command.discardedRecordCount} 条非目标记录`
+                            : ""}
+                          {command.rawDeviceLogPersisted === false
+                            ? " · 整机原始输出未保存"
+                            : ""}
                         </small>
                       ))}
                     {retryableItems(job).includes(itemId) && (

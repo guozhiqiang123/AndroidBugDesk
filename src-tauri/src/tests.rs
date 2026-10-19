@@ -1973,6 +1973,12 @@ if args[:1]==['-s']:
  args=args[2:]
 if args[:1]==['devices']: print('List of devices attached\nintegration-device device model:Mock');sys.exit(0)
 if args[:1]==['logcat']:
+ if 'crash' in args and '--uid=10123' not in args:
+  print('10-16 19:00:00.000 999 999 F DEBUG: *** *** *** ***',flush=True)
+  print('10-16 19:00:00.001 999 999 F DEBUG: Cmdline: com.example.test',flush=True)
+  print('10-16 19:00:00.002 777 777 F DEBUG: target native crash',flush=True)
+  if '-d' in args: sys.exit(0)
+  while True: time.sleep(.1)
  assert '--uid=10123' in args,args
  if '-d' in args:
   for offset in [-125,-120,-119]: print(f'{time.time()+offset:.6f} 11 11 I Mock: secret@example.test before')
@@ -2007,6 +2013,98 @@ print('unknown fake command',file=sys.stderr);sys.exit(1)
     std::fs::write(&path, body).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     path
+}
+
+#[cfg(unix)]
+fn legacy_stream_fake_adb(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("legacy-stream-adb.py");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import sys,time
+args=sys.argv[1:]
+if args[:1]==['-s']:
+ assert args[1]=='legacy-device'
+ args=args[2:]
+if args[:3]==['shell','pm','list']:
+ print('package:com.example.test uid:10123');sys.exit(0)
+if args[:3]==['shell','dumpsys','package']:
+ print('Package [com.example.test]\n userId=10123');sys.exit(0)
+if args[:2]==['shell','am']:
+ print('0');sys.exit(0)
+if args[:2]==['shell','pidof']:
+ print('321');sys.exit(0)
+if args[:2]==['shell','ps']:
+ print('USER PID PPID NAME\nu0_a123 321 1 com.example.test');sys.exit(0)
+if args[:1]==['logcat'] and any(x.startswith('--uid=') for x in args):
+ print('Unrecognized Option',file=sys.stderr);sys.exit(1)
+if args[:1]==['logcat'] and '-d' in args and 'crash' in args:
+ print('10-16 19:00:00.000 999 999 F DEBUG: *** *** *** ***')
+ print('10-16 19:00:00.001 999 999 F DEBUG: Cmdline: com.other.private')
+ print('10-16 19:01:00.000 888 888 F DEBUG: *** *** *** ***')
+ print('10-16 19:01:00.001 888 888 F DEBUG: Cmdline: com.example.test')
+ print('10-16 19:01:00.002 777 777 F DEBUG: target crash')
+ sys.exit(0)
+if args[:1]==['logcat'] and '-d' in args:
+ print('1789102800.000 999 999 I OTHER: private existing')
+ print('1789102801.000 321 322 E APP: target existing')
+ sys.exit(0)
+if args[:1]==['logcat'] and 'crash' in args:
+ print('10-16 19:02:00.000 999 999 F DEBUG: *** *** *** ***',flush=True)
+ print('10-16 19:02:00.001 999 999 F DEBUG: Cmdline: com.other.private',flush=True)
+ print('10-16 19:03:00.000 888 888 F DEBUG: *** *** *** ***',flush=True)
+ print('10-16 19:03:00.001 888 888 F DEBUG: Cmdline: com.example.test',flush=True)
+ print('10-16 19:03:00.002 777 777 F DEBUG: target live crash',flush=True)
+ while True: time.sleep(.1)
+if args[:1]==['logcat']:
+ while True:
+  print('1789102802.000 999 999 I OTHER: private live',flush=True)
+  print('1789102803.000 321 322 E APP: target live',flush=True)
+  time.sleep(.05)
+print('unknown',args,file=sys.stderr);sys.exit(1)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn legacy_realtime_logs_filter_before_disk_and_keep_target_crash_records() {
+    let (temp, store, _) = setup();
+    let adb = legacy_stream_fake_adb(temp.path());
+    let session = json!({
+        "id":"legacy-session",
+        "serial":"legacy-device",
+        "packageName":"com.example.test",
+        "startedAt":now(),
+        "stoppedAt":null,
+        "snapshot":{},
+        "logFiles":[],
+        "gaps":[]
+    });
+    let collector = crate::adb::start_logs(adb, "legacy-device".into(), store.clone(), session)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    crate::adb::stop_logs(collector).await;
+
+    let stored: Value = store.get("session", "legacy-session").unwrap().unwrap();
+    assert_eq!(stored["logFilter"]["mode"], "localTargetIdentity");
+    assert_eq!(stored["logFilter"]["rawDeviceLogPersisted"], false);
+    let mut combined = String::new();
+    for path in stored["logFiles"].as_array().unwrap() {
+        combined.push_str(&std::fs::read_to_string(path.as_str().unwrap()).unwrap());
+    }
+    assert!(combined.contains("target existing"));
+    assert!(combined.contains("target live"));
+    assert!(combined.contains("target crash"));
+    assert!(combined.contains("target live crash"));
+    assert!(!combined.contains("private existing"));
+    assert!(!combined.contains("private live"));
+    assert!(!combined.contains("com.other.private"));
 }
 #[cfg(unix)]
 #[tokio::test]

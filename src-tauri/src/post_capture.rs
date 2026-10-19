@@ -113,11 +113,31 @@ pub(crate) async fn prepare(
     let package = crate::project_settings::current_package_for_state(state)?;
     let path = state.adb_path()?;
     connected(&path, serial).await?;
-    let target_uid = if items
+    let api_probe = adb::output(
+        &path,
+        Some(serial),
+        &["shell", "getprop", "ro.build.version.sdk"],
+        5,
+    )
+    .await;
+    let (android_api_level, api_probe_error) = match api_probe {
+        Ok(bytes) => {
+            let value = String::from_utf8_lossy(&bytes).trim().parse::<u32>().ok();
+            let error = value
+                .is_none()
+                .then(|| "设备未返回有效 Android API 级别，将按命令结果安全回退".to_string());
+            (value, error)
+        }
+        Err(error) => (None, Some(error)),
+    };
+    let requires_uid = items.iter().any(|item| item == "logs");
+    let wants_optional_uid = items
         .iter()
-        .any(|item| ["logs", "crash"].contains(&item.as_str()))
-    {
+        .any(|item| ["crash", "exit"].contains(&item.as_str()));
+    let target_uid = if requires_uid {
         Some(adb::package_uid(&path, serial, &package).await?)
+    } else if wants_optional_uid {
+        adb::package_uid(&path, serial, &package).await.ok()
     } else {
         None
     };
@@ -169,7 +189,7 @@ pub(crate) async fn prepare(
             json!({"status":"pending","attachments":[],"commands":[]}),
         );
     }
-    let job = json!({"id":uuid(),"draftId":id,"kind":"post-capture","status":"pending","scope":original_scope,"workspaceEpoch":epoch,"serial":serial,"targetPackage":package,"targetUid":target_uid,"issueKind":draft["kind"],"bugOccurredAt":draft["event"]["occurredAt"],"startedAt":now(),"finishedAt":null,"retryOf":retry_of,"items":selected,"timeSemantics":"事后补采；当前状态不代表问题发生时状态；历史记录不保证连续覆盖"});
+    let job = json!({"id":uuid(),"draftId":id,"kind":"post-capture","status":"pending","scope":original_scope,"workspaceEpoch":epoch,"serial":serial,"targetPackage":package,"targetUid":target_uid,"androidApiLevel":android_api_level,"deviceCapabilityProbe":{"argv":["-s",serial,"shell","getprop","ro.build.version.sdk"],"androidApiLevel":android_api_level,"error":api_probe_error},"issueKind":draft["kind"],"bugOccurredAt":draft["event"]["occurredAt"],"startedAt":now(),"finishedAt":null,"retryOf":retry_of,"items":selected,"timeSemantics":"事后补采；当前状态不代表问题发生时状态；历史记录不保证连续覆盖"});
     state.store.put("capture", &string(&job, "id"), &job)?;
     Ok(job)
 }
@@ -324,11 +344,7 @@ fn commands(item: &str, package: &str, target_uid: Option<u32>) -> Vec<Vec<Strin
         ],
         "logs" if target_uid.is_some() => {
             let filter = format!("--uid={}", target_uid.unwrap());
-            vec![logcat_command(item, &filter)]
-        }
-        "crash" if target_uid.is_some() => {
-            let filter = format!("--uid={}", target_uid.unwrap());
-            vec![logcat_command(item, &filter)]
+            vec![logcat_command(&filter)]
         }
         "app" if !package.is_empty() => vec![
             app(&["shell", "dumpsys", "package"]),
@@ -338,7 +354,6 @@ fn commands(item: &str, package: &str, target_uid: Option<u32>) -> Vec<Vec<Strin
             cmd(&["shell", "dumpsys", "activity", "-p", package, "activities"]),
             cmd(&["shell", "dumpsys", "activity", "-p", package, "recents"]),
         ],
-        "exit" if !package.is_empty() => vec![app(&["shell", "dumpsys", "activity", "exit-info"])],
         "memory" if !package.is_empty() => vec![app(&["shell", "dumpsys", "meminfo"])],
         "frames" if !package.is_empty() => {
             vec![cmd(&["shell", "dumpsys", "gfxinfo", package, "framestats"])]
@@ -395,7 +410,7 @@ fn commands(item: &str, package: &str, target_uid: Option<u32>) -> Vec<Vec<Strin
     }
 }
 
-fn logcat_command(item: &str, filter: &str) -> Vec<String> {
+fn logcat_command(filter: &str) -> Vec<String> {
     let mut args = vec![
         "logcat".into(),
         "-d".into(),
@@ -404,19 +419,15 @@ fn logcat_command(item: &str, filter: &str) -> Vec<String> {
         filter.into(),
         "-b".into(),
     ];
-    if item == "crash" {
-        args.push("crash".into());
-    } else {
-        args.extend(
-            ["main", "-b", "system", "-b", "events"]
-                .into_iter()
-                .map(str::to_string),
-        );
-    }
+    args.extend(
+        ["main", "-b", "system", "-b", "events"]
+            .into_iter()
+            .map(str::to_string),
+    );
     args
 }
 
-fn unfiltered_logcat_command(item: &str) -> Vec<String> {
+fn unfiltered_logcat_command() -> Vec<String> {
     let mut args = vec![
         "logcat".into(),
         "-d".into(),
@@ -424,15 +435,11 @@ fn unfiltered_logcat_command(item: &str) -> Vec<String> {
         "threadtime".into(),
         "-b".into(),
     ];
-    if item == "crash" {
-        args.push("crash".into());
-    } else {
-        args.extend(
-            ["main", "-b", "system", "-b", "events"]
-                .into_iter()
-                .map(str::to_string),
-        );
-    }
+    args.extend(
+        ["main", "-b", "system", "-b", "events"]
+            .into_iter()
+            .map(str::to_string),
+    );
     args
 }
 
@@ -534,7 +541,7 @@ fn unavailable(item: &str, output: &str) -> bool {
     {
         return true;
     }
-    if ["logs", "crash"].contains(&item) {
+    if item == "logs" {
         return log_bounds(text).is_none();
     }
     if item == "exit" {
@@ -561,6 +568,306 @@ fn log_bounds(text: &str) -> Option<Value> {
         json!({"firstDeviceLogAt":format(min),"lastDeviceLogAt":format(max),"continuousCoverageKnown":false,"clock":"设备日志 epoch；未假定与电脑精确同步"}),
     )
 }
+
+#[derive(Clone, Copy)]
+enum LocalEvidenceFilter {
+    CrashRecord,
+    DropBoxEntry,
+    SystemEvent,
+}
+
+#[derive(Clone, Copy)]
+struct EvidenceTarget<'a> {
+    path: &'a Path,
+    serial: &'a str,
+    package: &'a str,
+    uid: Option<u32>,
+}
+
+async fn collect_filtered_source(
+    target: EvidenceTarget<'_>,
+    process_ids: &[u32],
+    args: &[&str],
+    timeout: u64,
+    source: &str,
+    filter: LocalEvidenceFilter,
+) -> (Value, Option<Vec<u8>>, Vec<u32>) {
+    let started = now();
+    let output = adb::output(target.path, Some(target.serial), args, timeout).await;
+    let mut argv = vec!["-s".to_string(), target.serial.to_string()];
+    argv.extend(args.iter().map(|value| value.to_string()));
+    let mut observation = json!({
+        "argv":argv,
+        "source":source,
+        "startedAt":started,
+        "finishedAt":now(),
+        "rawDeviceLogPersisted":false
+    });
+    match output {
+        Ok(bytes) => {
+            let filtered = match filter {
+                LocalEvidenceFilter::CrashRecord => {
+                    crate::crash_evidence::filter_crash_records(&bytes, target.package, target.uid)
+                }
+                LocalEvidenceFilter::DropBoxEntry => crate::crash_evidence::filter_dropbox_entries(
+                    &bytes,
+                    target.package,
+                    target.uid,
+                ),
+                LocalEvidenceFilter::SystemEvent => crate::crash_evidence::filter_system_events(
+                    &bytes,
+                    target.package,
+                    target.uid,
+                    process_ids,
+                ),
+            };
+            observation["matchedRecordCount"] = json!(filtered.matched);
+            observation["discardedRecordCount"] = json!(filtered.discarded);
+            observation["processIds"] = json!(filtered.process_ids);
+            if filtered.bytes.is_empty() {
+                observation["status"] = json!("unavailable");
+                observation["error"] =
+                    json!("该来源没有目标应用匹配记录；其他应用内容已丢弃且未保存");
+                (observation, None, filtered.process_ids)
+            } else {
+                observation["status"] = json!("complete");
+                (observation, Some(filtered.bytes), filtered.process_ids)
+            }
+        }
+        Err(error) => {
+            observation["status"] = json!("failed");
+            observation["error"] = json!(error);
+            (observation, None, Vec::new())
+        }
+    }
+}
+
+async fn collect_compatibility_sources(
+    state: &AppState,
+    job: &Value,
+    target: EvidenceTarget<'_>,
+    operation: &crate::diagnostics::OperationGuard,
+) -> Result<(Vec<Value>, Vec<(String, Vec<u8>)>)> {
+    let mut process_ids = Vec::new();
+    let mut observations = Vec::new();
+    let mut files = Vec::new();
+    let sources = [
+        (
+            "crash-buffer",
+            vec!["logcat", "-d", "-v", "threadtime", "-b", "crash"],
+            LocalEvidenceFilter::CrashRecord,
+        ),
+        (
+            "dropbox-SYSTEM_TOMBSTONE",
+            vec!["shell", "dumpsys", "dropbox", "--print", "SYSTEM_TOMBSTONE"],
+            LocalEvidenceFilter::DropBoxEntry,
+        ),
+        (
+            "dropbox-data_app_crash",
+            vec!["shell", "dumpsys", "dropbox", "--print", "data_app_crash"],
+            LocalEvidenceFilter::DropBoxEntry,
+        ),
+        (
+            "dropbox-data_app_native_crash",
+            vec![
+                "shell",
+                "dumpsys",
+                "dropbox",
+                "--print",
+                "data_app_native_crash",
+            ],
+            LocalEvidenceFilter::DropBoxEntry,
+        ),
+        (
+            "dropbox-data_app_anr",
+            vec!["shell", "dumpsys", "dropbox", "--print", "data_app_anr"],
+            LocalEvidenceFilter::DropBoxEntry,
+        ),
+    ];
+    for (index, (source, args, filter)) in sources.iter().enumerate() {
+        binding(state, job)?;
+        operation.progress(json!({
+            "phase":"command",
+            "commandIndex":index + 1,
+            "commandCount":sources.len() + 1
+        }));
+        let (observation, output, discovered) =
+            collect_filtered_source(target, &process_ids, args, 20, source, *filter).await;
+        process_ids.extend(discovered);
+        process_ids.sort_unstable();
+        process_ids.dedup();
+        if let Some(output) = output {
+            files.push((format!("{:02}-{source}.txt", files.len()), output));
+        }
+        observations.push(observation);
+    }
+    binding(state, job)?;
+    let args = [
+        "logcat",
+        "-d",
+        "-v",
+        "threadtime",
+        "-b",
+        "events",
+        "-b",
+        "system",
+    ];
+    let (observation, output, _) = collect_filtered_source(
+        target,
+        &process_ids,
+        &args,
+        20,
+        "system-events",
+        LocalEvidenceFilter::SystemEvent,
+    )
+    .await;
+    if let Some(output) = output {
+        files.push((format!("{:02}-system-events.txt", files.len()), output));
+    }
+    observations.push(observation);
+    Ok((observations, files))
+}
+
+async fn collect_crash_or_exit(
+    state: &AppState,
+    job: &Value,
+    item: &str,
+    path: &Path,
+    operation: &crate::diagnostics::OperationGuard,
+) -> Result<(Value, Option<Attachment>)> {
+    let serial = string(job, "serial");
+    let package = string(job, "targetPackage");
+    let uid = job["targetUid"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok());
+    let api = job["androidApiLevel"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok());
+    let mut receipt = json!({
+        "status":"running",
+        "startedAt":now(),
+        "serial":serial,
+        "targetPackage":package,
+        "targetUid":uid,
+        "androidApiLevel":api,
+        "deviceCapabilityProbe":job["deviceCapabilityProbe"],
+        "bugOccurredAt":job["bugOccurredAt"],
+        "timeSemantics":job["timeSemantics"],
+        "commands":[],
+        "attachments":[],
+        "logFilter":{
+            "mode":"localCompleteRecord",
+            "packageName":package,
+            "uid":uid,
+            "rawDeviceLogPersisted":false,
+            "historicalProcessSupported":true
+        }
+    });
+    let mut observations = Vec::new();
+    let mut files = Vec::new();
+    let target = EvidenceTarget {
+        path,
+        serial: &serial,
+        package: &package,
+        uid,
+    };
+    let mut should_collect_compatibility = item == "crash";
+    if item == "exit" {
+        if api.is_some_and(|value| value < 30) {
+            observations.push(json!({
+                "argv":["-s",serial,"shell","dumpsys","activity","exit-info",package],
+                "source":"application-exit-info",
+                "status":"unavailable",
+                "skipped":true,
+                "warning":"Android 10 及以下不支持 ApplicationExitInfo，已改用 Crash buffer、DropBox 和系统事件",
+                "startedAt":now(),
+                "finishedAt":now()
+            }));
+            should_collect_compatibility = true;
+        } else {
+            let args = [
+                "shell",
+                "dumpsys",
+                "activity",
+                "exit-info",
+                package.as_str(),
+            ];
+            let started = now();
+            let output = adb::output(path, Some(&serial), &args, 15).await;
+            let mut observation = json!({
+                "argv":["-s",serial,"shell","dumpsys","activity","exit-info",package],
+                "source":"application-exit-info",
+                "startedAt":started,
+                "finishedAt":now()
+            });
+            match output {
+                Ok(bytes) if String::from_utf8_lossy(&bytes).contains("ApplicationExitInfo #") => {
+                    observation["status"] = json!("complete");
+                    files.push(("00-application-exit-info.txt".into(), bytes));
+                }
+                Ok(_) => {
+                    observation["status"] = json!("unavailable");
+                    observation["error"] = json!(
+                        "系统支持 ApplicationExitInfo，但当前没有目标应用退出记录；已继续兼容补采"
+                    );
+                    should_collect_compatibility = true;
+                }
+                Err(error) => {
+                    observation["status"] = json!("failed");
+                    observation["error"] = json!(error);
+                    observation["warning"] =
+                        json!("ApplicationExitInfo 命令不可用，已继续兼容补采");
+                    should_collect_compatibility = true;
+                }
+            }
+            observations.push(observation);
+        }
+    }
+    if should_collect_compatibility {
+        let (fallback_observations, fallback_files) =
+            collect_compatibility_sources(state, job, target, operation).await?;
+        observations.extend(fallback_observations);
+        files.extend(fallback_files);
+    }
+    let successes = observations
+        .iter()
+        .filter(|value| string(value, "status") == "complete")
+        .count();
+    let failures = observations
+        .iter()
+        .filter(|value| string(value, "status") == "failed")
+        .count();
+    receipt["status"] = json!(if successes == 0 {
+        "unavailable"
+    } else if failures > 0 {
+        "partial"
+    } else {
+        "complete"
+    });
+    receipt["commands"] = json!(observations);
+    receipt["finishedAt"] = json!(now());
+    if successes == 0 {
+        receipt["error"] =
+            json!("未获取到目标应用匹配记录；可能尚无记录、日志已覆盖、权限不足或来源不可用");
+    }
+    let attachment = if files.is_empty() {
+        None
+    } else {
+        let mut attachment = zip_report(
+            &state.store.root,
+            &format!("post-capture-{item}.zip"),
+            &files,
+            &receipt,
+        )?;
+        attachment.source = format!(
+            "事后补采诊断；采集项：{}；完整记录已按目标应用过滤，整机原始输出未保存；时间及范围见 receipt.json",
+            item_name(item)
+        );
+        Some(attachment)
+    };
+    Ok((receipt, attachment))
+}
+
 async fn collect(
     state: &AppState,
     job: &Value,
@@ -568,6 +875,9 @@ async fn collect(
     path: &Path,
     operation: &crate::diagnostics::OperationGuard,
 ) -> Result<(Value, Option<Attachment>)> {
+    if ["crash", "exit"].contains(&item) {
+        return collect_crash_or_exit(state, job, item, path, operation).await;
+    }
     let serial = string(job, "serial");
     let package = string(job, "targetPackage");
     let mut receipt = json!({"status":"running","startedAt":now(),"serial":serial,"targetPackage":package,"bugOccurredAt":job["bugOccurredAt"],"timeSemantics":job["timeSemantics"],"commands":[],"attachments":[]});
@@ -653,7 +963,7 @@ async fn collect(
     let target_uid = job["targetUid"]
         .as_u64()
         .and_then(|uid| u32::try_from(uid).ok());
-    if ["logs", "crash"].contains(&item) {
+    if item == "logs" {
         let uid = target_uid.ok_or("目标应用 UID 缺失，已停止日志采集以避免保存整机日志")?;
         receipt["logFilter"] = json!({"mode":"androidUid","uid":uid,"packageName":package});
     }
@@ -701,7 +1011,7 @@ async fn collect(
                         json!("未获取到有效诊断内容；可能无记录、权限不足或系统不支持");
                     missed = true;
                 }
-                if ["logs", "crash"].contains(&item) {
+                if item == "logs" {
                     observation["logBounds"] = log_bounds(&text).unwrap_or(Value::Null);
                 }
                 if !bytes.is_empty() {
@@ -796,7 +1106,7 @@ async fn collect(
                         interrupted = Some(error);
                         break;
                     }
-                    let fallback_args = logcat_command(item, &format!("--pid={pid}"));
+                    let fallback_args = logcat_command(&format!("--pid={pid}"));
                     let started = now();
                     let refs = fallback_args.iter().map(String::as_str).collect::<Vec<_>>();
                     let fallback_output = adb::output(path, Some(&serial), &refs, 15).await;
@@ -847,7 +1157,7 @@ async fn collect(
                 }
                 if requires_local_filter && !pids.is_empty() {
                     compatibility_complete = false;
-                    let fallback_args = unfiltered_logcat_command(item);
+                    let fallback_args = unfiltered_logcat_command();
                     let started = now();
                     let refs = fallback_args.iter().map(String::as_str).collect::<Vec<_>>();
                     let fallback_output = adb::output(path, Some(&serial), &refs, 15).await;
@@ -907,7 +1217,7 @@ async fn collect(
         .iter()
         .filter(|o| {
             string(o, "status") == "complete"
-                && (!["logs", "crash"].contains(&item)
+                && (item != "logs"
                     || o["argv"]
                         .as_array()
                         .is_some_and(|argv| argv.iter().any(|value| value == "logcat")))

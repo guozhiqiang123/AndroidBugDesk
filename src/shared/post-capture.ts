@@ -90,6 +90,11 @@ export interface CaptureItemResult {
     status?: string;
     error?: string;
     warning?: string;
+    source?: string;
+    matchedRecordCount?: number;
+    discardedRecordCount?: number;
+    rawDeviceLogPersisted?: boolean;
+    skipped?: boolean;
     argv: string[];
   }[];
 }
@@ -100,6 +105,7 @@ export interface PostCaptureJob {
   status: string;
   serial: string;
   targetPackage: string;
+  androidApiLevel?: number | null;
   issueKind: Draft["kind"];
   startedAt: string;
   finishedAt?: string;

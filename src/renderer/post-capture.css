@@ -54,6 +54,16 @@
 .post-capture-result small {
   overflow-wrap: anywhere;
 }
+.post-capture-source {
+  color: #71809a;
+}
+.reproduction-capture-status {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: #f4f7fc;
+  color: #31415f;
+}
 @media (max-width: 700px) {
   .post-capture-options {
     grid-template-columns: repeat(2, minmax(0, 1fr));

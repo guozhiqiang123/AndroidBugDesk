@@ -62,7 +62,11 @@ import "./style.css";
 import { UserProfile } from "./user-profile";
 import { HistoryView } from "./history-view";
 import { ProjectBugsView } from "./project-bugs-view";
-import { EnvironmentSnapshotEntry, PostCaptureEntry } from "./post-capture";
+import {
+  EnvironmentSnapshotEntry,
+  PostCaptureEntry,
+  ReproductionCaptureEntry,
+} from "./post-capture";
 import {
   splitPostCaptureAttachmentDescription,
   type PostCaptureSnapshot,
@@ -238,6 +242,7 @@ function App() {
     [devices, setDevices] = useState<Device[]>([]),
     [serial, setSerial] = useState("");
   const [session, setSession] = useState<Session | null>(null),
+    [sessionMarkedAt, setSessionMarkedAt] = useState<number | null>(null),
     [preview, setPreview] = useState(false),
     [dirty, setDirty] = useState(false);
   const [remoteId, setRemoteId] = useState("");
@@ -599,6 +604,7 @@ function App() {
     setDirty(false);
     setPreview(false);
     setSession(null);
+    setSessionMarkedAt(null);
     setDevices([]);
     selectedSerialRef.current = "";
     setSerial("");
@@ -1218,6 +1224,115 @@ function App() {
       setSerial("");
     }
   };
+  const syncRealtimeResult = async (draftId: string) => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const next = await invoke<Bootstrap>("bootstrap");
+      const pending = (next.captures ?? []).some(
+        (capture) =>
+          capture.draftId === draftId &&
+          capture.kind === "log-window" &&
+          capture.status === "pending",
+      );
+      if (!pending || attempt === 19) {
+        setBoot(next);
+        const stored = next.drafts.find((item) => item.id === draftId);
+        if (stored) {
+          setDraft(stored);
+          setDirty(false);
+        }
+        return;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  };
+  const stopRealtimeCapture = async (automatic = false) => {
+    const draftId = draft?.id;
+    const wasMarked = sessionMarkedAt !== null;
+    await invoke("stop_session");
+    setSession(null);
+    setSessionMarkedAt(null);
+    if (draftId && wasMarked) await syncRealtimeResult(draftId);
+    setNotice(
+      automatic
+        ? "复现采集已完成，日志窗口与回执已加入附件。"
+        : wasMarked
+          ? "复现采集已提前结束，回执已记录实际覆盖范围。"
+          : "复现采集已停止。",
+      automatic ? "success" : "warning",
+    );
+  };
+  const startRealtimeCapture = async () => {
+    if (!draft || !serial) throw "请选择已连接的目标设备";
+    if (dirty) await save(draft);
+    const started = await invoke<Session>("start_session", { serial });
+    setSession(started);
+    setSessionMarkedAt(null);
+    setNotice("复现采集已开始，请在手机上复现问题后标记。", "success");
+  };
+  const markRealtimeProblem = async () => {
+    if (!draft || !session) throw "请先开始复现采集";
+    if (dirty) await save(draft);
+    const marked = await invoke<Draft>("mark_problem", { id: draft.id });
+    setDraft(marked);
+    setBoot((current) =>
+      current
+        ? {
+            ...current,
+            drafts: current.drafts.map((item) =>
+              item.id === marked.id ? marked : item,
+            ),
+          }
+        : current,
+    );
+    setDirty(false);
+    setSessionMarkedAt(Date.now());
+    setNotice("问题已标记，将继续采集 30 秒并自动结束。", "success");
+  };
+  useEffect(() => {
+    if (!session || sessionMarkedAt === null) return;
+    const timer = window.setTimeout(() => {
+      void stopRealtimeCapture(true).catch((failure) =>
+        setError(`自动结束复现采集失败：${String(failure)}`),
+      );
+    }, 31_000);
+    return () => window.clearTimeout(timer);
+  }, [session?.id, sessionMarkedAt]);
+  useEffect(() => {
+    if (!session) return;
+    let active = true;
+    let polling = false;
+    const sessionId = session.id;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const stored = await invoke<Session>("session_status", {
+          id: sessionId,
+        });
+        if (!active || !stored.stoppedAt) return;
+        const wasMarked = sessionMarkedAt !== null;
+        setSession(null);
+        setSessionMarkedAt(null);
+        if (wasMarked && draft?.id) await syncRealtimeResult(draft.id);
+        setNotice(
+          wasMarked
+            ? "复现采集已中断，已按实际覆盖范围生成回执。"
+            : "ADB 日志流已中断，请检查设备连接后重新开始。",
+          "warning",
+        );
+      } catch (failure) {
+        if (active) setError(`读取复现采集状态失败：${String(failure)}`);
+      } finally {
+        polling = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 2000);
+    void poll();
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [session?.id, sessionMarkedAt, draft?.id]);
   useEffect(() => {
     if (tab !== "new") {
       homeDeviceRefreshKey.current = "";
@@ -1361,6 +1476,7 @@ function App() {
     setRememberLogin(false);
     memoryWrite.current = Promise.resolve();
     setSession(null);
+    setSessionMarkedAt(null);
     selectedSerialRef.current = "";
     setSerial("");
     setDevices([]);
@@ -2972,6 +3088,20 @@ function App() {
                   </div>
                 </fieldset>
                 <div className="actions attachment-actions">
+                  <ReproductionCaptureEntry
+                    session={session}
+                    serial={serial}
+                    packageName={draft.app.packageName}
+                    markedAt={sessionMarkedAt}
+                    disabled={
+                      frozen ||
+                      !!busy ||
+                      (!session && (capturePending || !deviceConnected))
+                    }
+                    onStart={startRealtimeCapture}
+                    onMark={markRealtimeProblem}
+                    onStop={() => stopRealtimeCapture(false)}
+                  />
                   <EnvironmentSnapshotEntry
                     key={`environment:${organizationId}:${projectId}:${draft.id}`}
                     draft={draft}

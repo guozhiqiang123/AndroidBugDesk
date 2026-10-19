@@ -33,6 +33,20 @@ elif a[0]=='bugreport':
  if mode=='bad-report':print('failed',file=sys.stderr);sys.exit(1)
  with zipfile.ZipFile(Path(a[1])/'bugreport-fake.zip','w') as z:z.writestr('bugreport.txt','Bugreport for fake Android')
 elif a[0]=='logcat':
+ if 'crash' in a and not any(x.startswith('--uid=') or x.startswith('--pid=') for x in a):
+  print('10-13 14:59:00.000   900   900 F DEBUG: *** *** *** *** *** *** *** ***')
+  print('10-13 14:59:00.001   900   900 F DEBUG: Cmdline: com.other.private')
+  print('10-13 14:59:00.002   900   900 F DEBUG: secret other crash')
+  if mode=='empty':sys.exit(0)
+  print('10-13 15:00:00.000   999   999 F DEBUG: *** *** *** *** *** *** *** ***')
+  print('10-13 15:00:00.001   999   999 F DEBUG: pid: 7777, tid: 7788, name: DefaultDispatcher  >>> com.example.test <<<')
+  print('10-13 15:00:00.002   999   999 F DEBUG: signal 6 (SIGABRT)')
+  print('10-13 15:00:00.003   222   222 F DEBUG: #00 pc findAdMobAdPrices')
+  sys.exit(0)
+ if 'events' in a and 'system' in a and 'main' not in a and not any(x.startswith('--uid=') for x in a):
+  print('10-13 15:00:02.000  1000  1000 I am_proc_died: [0,10124,com.other.private]')
+  if mode!='empty':print('10-13 15:00:01.000  1000  1000 I am_proc_died: [0,10123,com.example.test]')
+  sys.exit(0)
  if mode in ['uid-unsupported','legacy-logcat'] and '--uid=10123' in a:
   print('Unrecognized Option',file=sys.stderr)
   print('Usage: logcat [options] [filterspecs]',file=sys.stderr)
@@ -67,13 +81,25 @@ elif a[:2]==['exec-out','cat']:print('<?xml version="1.0"?><hierarchy><node text
 elif a[:2]==['shell','rm']:assert a[2]=='-f' and a[3].startswith('/sdcard/AndroidBugDesk-')
 elif a[:3]==['shell','dumpsys','meminfo']:
  print('Permission Denial: no diagnostic permission' if mode=='partial' else '** MEMINFO in pid 123 [com.example.test] **')
+elif a[:4]==['shell','dumpsys','dropbox','--print']:
+ print('========================================')
+ print('2026-10-16 '+a[4])
+ print('Cmdline: com.other.private')
+ print('secret other entry')
+ if mode!='empty':
+  print('========================================')
+  print('2026-10-16 '+a[4])
+  print('Cmdline: com.example.test')
+  print('pid: 7777, signal 6 (SIGABRT)')
 elif a[:4]==['shell','dumpsys','activity','exit-info']:
  print('ACTIVITY MANAGER PROCESS EXIT INFO\n' if mode=='empty' else 'ApplicationExitInfo #0:\n reason=CRASH')
 elif a[:4]==['shell','pm','list','packages']:
  assert a[4:]==['-U','--user','0','com.example.test'],a
- print('package:com.example.test uid:10123')
-elif a[:3]==['shell','dumpsys','package']:print('Packages:\nPackage [com.example.test]\n  userId=10123\nversionCode=42 versionName=2.1\n grantedPermissions: android.permission.INTERNET')
+ print('package:com.example.test' if mode=='uid-missing' else 'package:com.example.test uid:10123')
+elif a[:3]==['shell','dumpsys','package']:
+ print('Packages:\nPackage [com.example.test]\n  versionCode=42 versionName=2.1' if mode=='uid-missing' else 'Packages:\nPackage [com.example.test]\n  userId=10123\nversionCode=42 versionName=2.1\n grantedPermissions: android.permission.INTERNET')
 elif a[:3]==['shell','am','get-current-user']:print('0')
+elif a[:3]==['shell','getprop','ro.build.version.sdk']:print('29' if mode=='android10' else '33')
 elif a[:2]==['shell','getprop']:print('Fake Android 13')
 elif a[:2]==['shell','date']:print('1789103000')
 elif a[:2]==['shell','wm']:print('Physical '+a[2]+': 1080x2400')
@@ -663,7 +689,83 @@ async fn absent_history_does_not_claim_coverage_and_missing_mapping_blocks_all_c
 }
 
 #[tokio::test]
-async fn unsupported_uid_logcat_safely_falls_back_to_current_package_pids() {
+async fn android10_skips_exit_info_and_uses_filtered_compatibility_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, original) = app(temp.path(), fake_adb(temp.path()));
+    let state = app.state::<AppState>();
+    let id = string(&original, "id");
+    std::fs::write(temp.path().join("mode"), "android10").unwrap();
+
+    let job = prepare(&state, &id, "USB-A", selected(&["exit"]), None)
+        .await
+        .unwrap();
+    assert_eq!(job["androidApiLevel"], 29);
+    execute(&state, &string(&job, "id")).await.unwrap();
+
+    let calls = trace(temp.path());
+    assert!(!calls.iter().any(|args| {
+        args.windows(3)
+            .any(|window| window == ["dumpsys", "activity", "exit-info"])
+    }));
+    let files = attachments(&state.store.draft(&id).unwrap()).unwrap();
+    let exit = files
+        .iter()
+        .find(|attachment| attachment.name == "post-capture-exit.zip")
+        .unwrap();
+    let result = receipt(exit);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["androidApiLevel"], 29);
+    assert_eq!(result["commands"][0]["skipped"], true);
+    assert!(result["commands"][0]["warning"]
+        .as_str()
+        .unwrap()
+        .contains("不支持 ApplicationExitInfo"));
+    assert!(result["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command["source"] == "crash-buffer" && command["matchedRecordCount"] == 1));
+
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&exit.path).unwrap()).unwrap();
+    let mut combined = String::new();
+    for index in 0..zip.len() {
+        let mut file = zip.by_index(index).unwrap();
+        if file.name().ends_with(".txt") {
+            file.read_to_string(&mut combined).unwrap();
+        }
+    }
+    assert!(combined.contains("com.example.test"));
+    assert!(combined.contains("SIGABRT"));
+    assert!(!combined.contains("com.other.private"));
+    assert!(!combined.contains("secret other"));
+}
+
+#[tokio::test]
+async fn crash_collection_uses_package_anchors_when_uid_cannot_be_resolved() {
+    let temp = tempfile::tempdir().unwrap();
+    let (app, original) = app(temp.path(), fake_adb(temp.path()));
+    let state = app.state::<AppState>();
+    let id = string(&original, "id");
+    std::fs::write(temp.path().join("mode"), "uid-missing").unwrap();
+
+    let job = prepare(&state, &id, "USB-A", selected(&["crash"]), None)
+        .await
+        .unwrap();
+    assert!(job["targetUid"].is_null());
+    execute(&state, &string(&job, "id")).await.unwrap();
+    let files = attachments(&state.store.draft(&id).unwrap()).unwrap();
+    let crash = files
+        .iter()
+        .find(|attachment| attachment.name == "post-capture-crash.zip")
+        .unwrap();
+    let result = receipt(crash);
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["logFilter"]["mode"], "localCompleteRecord");
+    assert!(result["logFilter"]["uid"].is_null());
+}
+
+#[tokio::test]
+async fn unsupported_uid_logs_use_current_pids_while_crash_keeps_historical_records() {
     let temp = tempfile::tempdir().unwrap();
     let (app, original) = app(temp.path(), fake_adb(temp.path()));
     let state = app.state::<AppState>();
@@ -681,32 +783,39 @@ async fn unsupported_uid_logcat_safely_falls_back_to_current_package_pids() {
         assert_eq!(snapshot["jobs"][0]["items"][item]["status"], "complete");
     }
     let files = attachments(&state.store.draft(&id).unwrap()).unwrap();
-    for item in ["logs", "crash"] {
-        let result = receipt(
-            files
-                .iter()
-                .find(|attachment| attachment.name == format!("post-capture-{item}.zip"))
-                .unwrap(),
-        );
-        assert_eq!(result["logFilter"]["fallbackMode"], "currentProcessPid");
-        assert_eq!(result["logFilter"]["historicalCoverageLimited"], true);
-        assert_eq!(result["logFilter"]["processIds"], json!([321]));
-        assert!(result["commands"]
+    let logs = receipt(
+        files
+            .iter()
+            .find(|attachment| attachment.name == "post-capture-logs.zip")
+            .unwrap(),
+    );
+    assert_eq!(logs["logFilter"]["fallbackMode"], "currentProcessPid");
+    assert_eq!(logs["logFilter"]["historicalCoverageLimited"], true);
+    assert_eq!(logs["logFilter"]["processIds"], json!([321]));
+    assert!(logs["commands"].as_array().unwrap().iter().any(|command| {
+        command["argv"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|command| command["argv"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|argument| argument == "--pid=321")));
-        assert_eq!(result["status"], "complete");
-        assert!(result["commands"][0]["warning"]
-            .as_str()
-            .unwrap()
-            .contains("已自动改用"));
-        assert!(result["commands"][0].get("error").is_none());
-    }
+            .any(|argument| argument == "--pid=321")
+    }));
+
+    let crash = receipt(
+        files
+            .iter()
+            .find(|attachment| attachment.name == "post-capture-crash.zip")
+            .unwrap(),
+    );
+    assert_eq!(crash["logFilter"]["mode"], "localCompleteRecord");
+    assert_eq!(crash["logFilter"]["rawDeviceLogPersisted"], false);
+    assert_eq!(crash["logFilter"]["historicalProcessSupported"], true);
+    assert!(crash["commands"].as_array().unwrap().iter().all(|command| {
+        command["argv"].as_array().unwrap().iter().all(|argument| {
+            !argument
+                .as_str()
+                .is_some_and(|value| value.starts_with("--uid=") || value.starts_with("--pid="))
+        })
+    }));
     let calls = trace(temp.path());
     assert!(calls
         .iter()

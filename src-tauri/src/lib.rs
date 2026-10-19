@@ -1,6 +1,7 @@
 pub mod adb;
 pub mod capture;
 pub mod commands;
+pub mod crash_evidence;
 pub mod diagnostics;
 pub mod drafts;
 pub mod evidence;
@@ -73,6 +74,7 @@ pub fn run() {
             commands::list_devices,
             commands::inspect_device,
             commands::start_session,
+            commands::session_status,
             commands::stop_session,
             commands::mark_problem,
             commands::pin_logs,

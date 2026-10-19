@@ -791,6 +791,268 @@ impl BoundaryDeduper {
         std::mem::take(&mut self.pending)
     }
 }
+
+fn unsupported_log_filter_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unrecognized option")
+        || lower.contains("unknown option")
+        || lower.contains("invalid option")
+}
+
+fn pids_from_output(output: &[u8]) -> Vec<u32> {
+    let mut pids = output
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter_map(|part| std::str::from_utf8(part).ok()?.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids.truncate(64);
+    pids
+}
+
+fn pids_from_ps(output: &[u8], package: &str) -> Vec<u32> {
+    let text = String::from_utf8_lossy(output);
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let pid_column = header
+        .split_whitespace()
+        .position(|column| column.eq_ignore_ascii_case("PID"))
+        .unwrap_or(1);
+    let mut pids = lines
+        .filter_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            let process = columns.last().copied()?;
+            (process == package || process.starts_with(&format!("{package}:")))
+                .then(|| columns.get(pid_column)?.parse::<u32>().ok())
+                .flatten()
+        })
+        .filter(|pid| *pid > 0)
+        .collect::<Vec<_>>();
+    pids.sort_unstable();
+    pids.dedup();
+    pids.truncate(64);
+    pids
+}
+
+async fn current_package_pids(path: &Path, serial: &str, package: &str) -> Vec<u32> {
+    if let Ok(output) = output(path, Some(serial), &["shell", "pidof", package], 3).await {
+        let pids = pids_from_output(&output);
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+    output(path, Some(serial), &["shell", "ps"], 3)
+        .await
+        .map(|output| pids_from_ps(&output, package))
+        .unwrap_or_default()
+}
+
+async fn start_locally_filtered_logs(
+    path: PathBuf,
+    serial: String,
+    store: Store,
+    mut session: Value,
+    uid: u32,
+    dir: PathBuf,
+) -> Result<Collector> {
+    let id = string(&session, "id");
+    let package = string(&session, "packageName");
+    let mut process_ids = current_package_pids(&path, &serial, &package).await;
+    let existing_logs = output(
+        &path,
+        Some(&serial),
+        &[
+            "logcat", "-d", "-v", "epoch", "-b", "main", "-b", "system", "-b", "events",
+        ],
+        20,
+    )
+    .await?;
+    let existing_crashes = output(
+        &path,
+        Some(&serial),
+        &["logcat", "-d", "-v", "threadtime", "-b", "crash"],
+        20,
+    )
+    .await?;
+    let mut initial =
+        crate::crash_evidence::filter_log_lines(&existing_logs, &package, Some(uid), &process_ids);
+    let crash = crate::crash_evidence::filter_crash_records(&existing_crashes, &package, Some(uid));
+    if !initial.is_empty() && !initial.ends_with(b"\n") {
+        initial.push(b'\n');
+    }
+    initial.extend_from_slice(&crash.bytes);
+    let initial_path = dir.join("0000-existing.log");
+    std::fs::write(&initial_path, &initial).map_err(|e| e.to_string())?;
+    session["logFiles"] = json!([initial_path]);
+    session["logFilter"] = json!({
+        "mode":"localTargetIdentity",
+        "uid":uid,
+        "packageName":package,
+        "processIds":process_ids,
+        "rawDeviceLogPersisted":false,
+        "historicalOrdinaryLogCoverageLimited":true,
+        "historicalCrashRecordSupported":true
+    });
+    session["gaps"] = json!([
+        "设备 logcat 不支持 UID 过滤；普通日志已按动态目标 PID 过滤，历史普通日志仅覆盖采集时可识别的进程",
+        "Crash 缓冲区按完整记录归属过滤；整机原始输出未写入磁盘"
+    ]);
+    store.put("session", &id, &session)?;
+
+    let mut app_child = command(&path)
+        .args([
+            "-s", &serial, "logcat", "-v", "epoch", "-b", "main", "-b", "system", "-b", "events",
+            "-T", "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "无法启动旧系统应用日志流")?;
+    let mut crash_child = command(&path)
+        .args([
+            "-s",
+            &serial,
+            "logcat",
+            "-v",
+            "threadtime",
+            "-b",
+            "crash",
+            "-T",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "无法启动旧系统崩溃日志流")?;
+    let mut app_stdout = app_child.stdout.take().ok_or("无法读取应用日志流")?;
+    let mut crash_stdout = crash_child.stdout.take().ok_or("无法读取崩溃日志流")?;
+    let (tx, mut rx) = watch::channel(false);
+    let session_id = id.clone();
+    let path_for_task = path.clone();
+    let serial_for_task = serial.clone();
+    let package_for_task = package.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        use std::io::Write;
+        let mut index = 1;
+        let mut bytes = 0u64;
+        let mut total = 0u64;
+        let mut app_buffer = [0u8; 16384];
+        let mut crash_buffer = [0u8; 16384];
+        let mut file: Option<std::fs::File> = None;
+        let mut reason = String::new();
+        let mut app_open = true;
+        let mut crash_open = true;
+        let mut app_stream_ended = false;
+        let mut crash_stream_ended = false;
+        let mut line_filter = crate::crash_evidence::LiveLineFilter::new();
+        let mut crash_filter =
+            crate::crash_evidence::LiveCrashFilter::new(&package_for_task, Some(uid));
+        let mut refresh = tokio::time::interval(std::time::Duration::from_secs(2));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if file.is_none() {
+                let target = dir.join(format!("{index:04}-live.log"));
+                match std::fs::File::create(&target) {
+                    Ok(created) => {
+                        file = Some(created);
+                        session["logFiles"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!(target));
+                        let _ = store.put("session", &session_id, &session);
+                    }
+                    Err(_) => {
+                        reason = "日志文件创建失败，可能磁盘不足".into();
+                        break;
+                    }
+                }
+            }
+            let clean = tokio::select! {
+                _ = rx.changed() => break,
+                _ = refresh.tick() => {
+                    let next = current_package_pids(&path_for_task, &serial_for_task, &package_for_task).await;
+                    if next != process_ids {
+                        process_ids = next;
+                        session["logFilter"]["processIds"] = json!(process_ids);
+                        let _ = store.put("session", &session_id, &session);
+                    }
+                    continue;
+                },
+                read = app_stdout.read(&mut app_buffer), if app_open => match read {
+                    Ok(0) | Err(_) => { app_open = false; app_stream_ended = true; Vec::new() },
+                    Ok(count) => line_filter.push(
+                        &app_buffer[..count],
+                        &package_for_task,
+                        Some(uid),
+                        &process_ids,
+                    ),
+                },
+                read = crash_stdout.read(&mut crash_buffer), if crash_open => match read {
+                    Ok(0) | Err(_) => { crash_open = false; crash_stream_ended = true; Vec::new() },
+                    Ok(count) => crash_filter.push(&crash_buffer[..count]),
+                },
+            };
+            if !app_open && !crash_open {
+                reason = "ADB 日志流断开；没有切换到其他设备".into();
+                break;
+            }
+            if clean.is_empty() {
+                continue;
+            }
+            if file.as_mut().unwrap().write_all(&clean).is_err() {
+                reason = "日志写入失败，请检查剩余磁盘".into();
+                break;
+            }
+            bytes += clean.len() as u64;
+            total += clean.len() as u64;
+            if bytes >= 5_000_000 {
+                if let Some(handle) = file.take() {
+                    let _ = handle.sync_all();
+                }
+                index += 1;
+                bytes = 0;
+            }
+            if total >= 250_000_000 {
+                reason = "会话日志达到 250 MB 本地上限，已停止并保留全部问题证据".into();
+                break;
+            }
+        }
+        let _ = app_child.kill().await;
+        let _ = crash_child.kill().await;
+        let _ = app_child.wait().await;
+        let _ = crash_child.wait().await;
+        if let Some(mut handle) = file.take() {
+            let _ = handle.write_all(&line_filter.finish());
+            let _ = handle.write_all(&crash_filter.finish());
+            let _ = handle.sync_all();
+        }
+        if !reason.is_empty() {
+            session["gaps"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(format!("{}: {reason}", now())));
+        }
+        if app_stream_ended {
+            session["gaps"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("旧系统应用日志流提前结束"));
+        }
+        if crash_stream_ended {
+            session["gaps"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("旧系统 Crash 日志流提前结束"));
+        }
+        session["stoppedAt"] = json!(now());
+        let _ = store.put("session", &session_id, &session);
+    });
+    Ok(Collector { id, stop: tx, task })
+}
+
 pub async fn start_logs(
     path: PathBuf,
     serial: String,
@@ -803,9 +1065,9 @@ pub async fn start_logs(
     let uid_filter = format!("--uid={uid}");
     let dir = store.root.join("sessions").join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Preserve existing buffers before starting and bind both the initial dump and
-    // live stream to the package UID. UID scope survives app process restarts and
-    // includes the package's secondary processes without collecting other apps.
+    // Preserve existing application buffers with UID scope. Crash records are
+    // always read separately and filtered as complete records because Native
+    // continuations are emitted by debuggerd/tombstoned rather than the app UID.
     let initial = output(
         &path,
         Some(&serial),
@@ -819,17 +1081,48 @@ pub async fn start_logs(
             "main",
             "-b",
             "system",
-            "-b",
-            "crash",
         ],
         20,
     )
-    .await?;
+    .await;
+    let mut initial = match initial {
+        Ok(initial) => initial,
+        Err(error) if unsupported_log_filter_error(&error) => {
+            return start_locally_filtered_logs(path, serial, store, session, uid, dir).await;
+        }
+        Err(error) => return Err(error),
+    };
+    let crash_initial_result = output(
+        &path,
+        Some(&serial),
+        &["logcat", "-d", "-v", "threadtime", "-b", "crash"],
+        20,
+    )
+    .await;
+    let crash_initial_error = crash_initial_result.as_ref().err().cloned();
+    let crash_initial = crash_initial_result
+        .map(|bytes| {
+            crate::crash_evidence::filter_crash_records(&bytes, &package_name, Some(uid)).bytes
+        })
+        .unwrap_or_default();
+    if !initial.is_empty() && !initial.ends_with(b"\n") {
+        initial.push(b'\n');
+    }
+    initial.extend_from_slice(&crash_initial);
     let initial_path = dir.join("0000-existing.log");
     std::fs::write(&initial_path, &initial).map_err(|e| e.to_string())?;
     session["logFiles"] = json!([initial_path]);
-    session["logFilter"] = json!({"mode":"androidUid","uid":uid,"packageName":package_name});
-    session["gaps"] = json!(["初始缓冲区覆盖时间尚未逐行解析；持续采集起点以会话开始时间为准"]);
+    session["logFilter"] = json!({"mode":"androidUidAndLocalCrashRecord","uid":uid,"packageName":package_name,"rawDeviceCrashLogPersisted":false});
+    session["gaps"] = json!([
+        "初始缓冲区覆盖时间尚未逐行解析；持续采集起点以会话开始时间为准",
+        "Crash 缓冲区按完整记录归属过滤；整机原始输出未写入磁盘"
+    ]);
+    if let Some(error) = crash_initial_error {
+        session["gaps"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(format!("初始 Crash 缓冲区读取失败：{error}")));
+    }
     store.put("session", &id, &session)?;
     let mut child = command(&path)
         .args([
@@ -843,8 +1136,6 @@ pub async fn start_logs(
             "main",
             "-b",
             "system",
-            "-b",
-            "crash",
             "-T",
             "1",
         ])
@@ -853,6 +1144,23 @@ pub async fn start_logs(
         .spawn()
         .map_err(|_| "无法启动持续日志")?;
     let mut stdout = child.stdout.take().unwrap();
+    let mut crash_child = command(&path)
+        .args([
+            "-s",
+            &serial,
+            "logcat",
+            "-v",
+            "threadtime",
+            "-b",
+            "crash",
+            "-T",
+            "1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "无法启动持续崩溃日志")?;
+    let mut crash_stdout = crash_child.stdout.take().ok_or("无法读取崩溃日志流")?;
     let mut stderr = child.stderr.take().unwrap();
     let (stderr_stop, mut stderr_rx) = watch::channel(false);
     let stderr_task = tauri::async_runtime::spawn(async move {
@@ -866,14 +1174,22 @@ pub async fn start_logs(
     let (tx, mut rx) = watch::channel(false);
     let session_id = id.clone();
     let mut deduper = BoundaryDeduper::new(&initial);
+    let package_for_task = package_name.clone();
     let task = tauri::async_runtime::spawn(async move {
         use std::io::Write;
         let mut index = 1;
         let mut bytes = 0u64;
         let mut total = 0u64;
         let mut buffer = [0u8; 16384];
+        let mut crash_buffer = [0u8; 16384];
         let mut file: Option<std::fs::File> = None;
         let mut reason = String::new();
+        let mut app_open = true;
+        let mut crash_open = true;
+        let mut app_stream_ended = false;
+        let mut crash_stream_ended = false;
+        let mut crash_filter =
+            crate::crash_evidence::LiveCrashFilter::new(&package_for_task, Some(uid));
         loop {
             if file.is_none() {
                 let p = dir.join(format!("{index:04}-live.log"));
@@ -889,27 +1205,51 @@ pub async fn start_logs(
                     }
                 }
             }
-            tokio::select! {
+            let clean = tokio::select! {
                 _=rx.changed()=>break,
-                r=stdout.read(&mut buffer)=>{match r {
-                    Ok(0)=>{reason="ADB 日志流断开；没有切换到其他设备".into();break;},
-                    Ok(n)=>{
-                        let clean = deduper.push(&buffer[..n]);
-                        if file.as_mut().unwrap().write_all(&clean).is_err(){reason="日志写入失败，请检查剩余磁盘".into();break;}
-                        bytes+=clean.len() as u64;total+=clean.len() as u64;
-                        if bytes>=5_000_000 {if let Some(f)=file.take(){let _=f.sync_all();}index+=1;bytes=0;}
-                        if total>=250_000_000{reason="会话日志达到 250 MB 本地上限，已停止并保留全部问题证据".into();break;}
-                    },
-                    Err(_)=>{reason="日志读取中断".into();break;}
-                }}
+                read=stdout.read(&mut buffer), if app_open => match read {
+                    Ok(0) | Err(_) => { app_open=false; app_stream_ended=true; Vec::new() },
+                    Ok(count) => deduper.push(&buffer[..count]),
+                },
+                read=crash_stdout.read(&mut crash_buffer), if crash_open => match read {
+                    Ok(0) | Err(_) => { crash_open=false; crash_stream_ended=true; Vec::new() },
+                    Ok(count) => crash_filter.push(&crash_buffer[..count]),
+                },
+            };
+            if !app_open && !crash_open {
+                reason = "ADB 日志流断开；没有切换到其他设备".into();
+                break;
+            }
+            if clean.is_empty() {
+                continue;
+            }
+            if file.as_mut().unwrap().write_all(&clean).is_err() {
+                reason = "日志写入失败，请检查剩余磁盘".into();
+                break;
+            }
+            bytes += clean.len() as u64;
+            total += clean.len() as u64;
+            if bytes >= 5_000_000 {
+                if let Some(f) = file.take() {
+                    let _ = f.sync_all();
+                }
+                index += 1;
+                bytes = 0;
+            }
+            if total >= 250_000_000 {
+                reason = "会话日志达到 250 MB 本地上限，已停止并保留全部问题证据".into();
+                break;
             }
         }
         let _ = child.kill().await;
+        let _ = crash_child.kill().await;
         let _ = child.wait().await;
+        let _ = crash_child.wait().await;
         let _ = stderr_stop.send(true);
         let stderr = stderr_task.await.unwrap_or_default();
         if let Some(mut f) = file.take() {
             let _ = f.write_all(&deduper.finish());
+            let _ = f.write_all(&crash_filter.finish());
             let _ = f.sync_all();
         }
         if !stderr.is_empty() {
@@ -920,6 +1260,18 @@ pub async fn start_logs(
                 .as_array_mut()
                 .unwrap()
                 .push(json!(format!("{}: {reason}", now())));
+        }
+        if app_stream_ended {
+            session["gaps"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("目标应用日志流提前结束"));
+        }
+        if crash_stream_ended {
+            session["gaps"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("Crash 日志流提前结束"));
         }
         session["stoppedAt"] = json!(now());
         let _ = store.put("session", &session_id, &session);

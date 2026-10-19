@@ -753,6 +753,31 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<()> {
     Ok(())
 }
 #[tauri::command]
+pub async fn session_status(id: String, state: State<'_, AppState>) -> Result<Value> {
+    let mut session: Value = state
+        .store
+        .get("session", &id)?
+        .ok_or_else(|| "采集会话不存在".to_string())?;
+    let should_reap = !session["stoppedAt"].is_null()
+        && state
+            .collector
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|collector| collector.id == id);
+    if should_reap {
+        let collector = { state.collector.lock().unwrap().take() };
+        if let Some(collector) = collector {
+            adb::stop_logs(collector).await;
+        }
+        session = state
+            .store
+            .get("session", &id)?
+            .ok_or_else(|| "采集会话不存在".to_string())?;
+    }
+    Ok(session)
+}
+#[tauri::command]
 pub async fn mark_problem(id: String, state: State<'_, AppState>) -> Result<Value> {
     state.editable(&id)?;
     if crate::capture::pending(&state.store, &id)? {
