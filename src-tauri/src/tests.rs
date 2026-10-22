@@ -2088,7 +2088,25 @@ async fn legacy_realtime_logs_filter_before_disk_and_keep_target_crash_records()
     let collector = crate::adb::start_logs(adb, "legacy-device".into(), store.clone(), session)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let live_crash_persisted = store
+            .get::<Value>("session", "legacy-session")
+            .ok()
+            .flatten()
+            .and_then(|stored| stored["logFiles"].as_array().cloned())
+            .is_some_and(|paths| {
+                paths.iter().any(|path| {
+                    path.as_str()
+                        .and_then(|path| std::fs::read_to_string(path).ok())
+                        .is_some_and(|contents| contents.contains("target live crash"))
+                })
+            });
+        if live_crash_persisted || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     crate::adb::stop_logs(collector).await;
 
     let stored: Value = store.get("session", "legacy-session").unwrap().unwrap();
