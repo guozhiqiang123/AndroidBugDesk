@@ -127,12 +127,22 @@ pub(crate) fn finish(store: &Store, task: &mut Value, interrupted: bool) -> Resu
             return Err("会话日志不在本地证据目录".into());
         }
         if real.metadata().is_ok_and(|m| m.len() > 0) {
-            raw.push(evidence::inspect(
+            let mut attachment = evidence::inspect(
                 &real,
                 "log",
                 "ADB 原始日志固定副本（未自动选择上传）",
                 &root,
-            )?);
+            )?;
+            if evidence::apply_recorded_log_coverage(&mut attachment)? {
+                attachment.source =
+                    "ADB 原始日志固定副本（已按日志内首条和末条记录自动填写覆盖时间；未自动选择上传）"
+                        .into();
+            } else {
+                attachment.source =
+                    "ADB 原始日志固定副本（未识别到可用时间边界，需人工确认；未自动选择上传）"
+                        .into();
+            }
+            raw.push(attachment);
         }
     }
     let mut gaps: Vec<evidence::LogGap> = session["gaps"]

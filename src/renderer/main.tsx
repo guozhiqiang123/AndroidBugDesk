@@ -3855,10 +3855,20 @@ function AttachmentCard({
   const [start, setStart] = useState(a.coverageStart),
     [end, setEnd] = useState(a.coverageEnd);
   const [literal, setLiteral] = useState("");
+  useEffect(() => {
+    setStart(a.coverageStart);
+    setEnd(a.coverageEnd);
+  }, [a.id, a.coverageStart, a.coverageEnd]);
   const attachmentDescription = splitPostCaptureAttachmentDescription(
     a.name,
     a.source,
   );
+  const automaticCoverage =
+    !!a.coverageStart.trim() &&
+    !!a.coverageEnd.trim() &&
+    (a.source.startsWith("ADB 原始日志固定副本") ||
+      a.source.startsWith("ADB 问题日志窗口派生副本") ||
+      a.source.startsWith("文本派生副本"));
   const messages = (suffix: "coverageStart" | "coverageEnd" | "confirmed") =>
     (issueRoutes[attachmentIssueKey(a, suffix)] ?? [])
       .filter(
@@ -3941,40 +3951,60 @@ function AttachmentCard({
                   生成副本
                 </button>
               </details>
-              <div className="grid">
-                <label
-                  className="field"
-                  id={`field-${attachmentIssueKey(a, "coverageStart")}`}
-                >
-                  <span>真实覆盖起点（含时区）</span>
-                  <input
+              {automaticCoverage ? (
+                <div className="automatic-log-coverage" role="status">
+                  <div id={`field-${attachmentIssueKey(a, "coverageStart")}`}>
+                    <span>实际日志起点</span>
+                    <time dateTime={a.coverageStart}>{a.coverageStart}</time>
+                    {messages("coverageStart")}
+                  </div>
+                  <div id={`field-${attachmentIssueKey(a, "coverageEnd")}`}>
+                    <span>实际日志终点</span>
+                    <time dateTime={a.coverageEnd}>{a.coverageEnd}</time>
+                    {messages("coverageEnd")}
+                  </div>
+                  <small>
+                    已根据日志文件内首条和末条记录自动填写，无需手动保存
+                  </small>
+                </div>
+              ) : (
+                <>
+                  <div className="grid">
+                    <label
+                      className="field"
+                      id={`field-${attachmentIssueKey(a, "coverageStart")}`}
+                    >
+                      <span>真实覆盖起点（含时区）</span>
+                      <input
+                        disabled={disabled}
+                        value={start}
+                        placeholder="例如 2026-10-10T14:30:00+08:00"
+                        onChange={(e) => setStart(e.target.value)}
+                      />
+                      {messages("coverageStart")}
+                    </label>
+                    <label
+                      className="field"
+                      id={`field-${attachmentIssueKey(a, "coverageEnd")}`}
+                    >
+                      <span>真实覆盖终点（含时区）</span>
+                      <input
+                        disabled={disabled}
+                        value={end}
+                        placeholder="填写不早于起点的时间，包含时区"
+                        onChange={(e) => setEnd(e.target.value)}
+                      />
+                      {messages("coverageEnd")}
+                    </label>
+                  </div>
+                  <button
                     disabled={disabled}
-                    value={start}
-                    placeholder="例如 2026-10-10T14:30:00+08:00"
-                    onChange={(e) => setStart(e.target.value)}
-                  />
-                  {messages("coverageStart")}
-                </label>
-                <label
-                  className="field"
-                  id={`field-${attachmentIssueKey(a, "coverageEnd")}`}
-                >
-                  <span>真实覆盖终点（含时区）</span>
-                  <input
-                    disabled={disabled}
-                    value={end}
-                    placeholder="填写不早于起点的时间，包含时区"
-                    onChange={(e) => setEnd(e.target.value)}
-                  />
-                  {messages("coverageEnd")}
-                </label>
-              </div>
-              <button
-                disabled={disabled}
-                onClick={() => onSaveCoverage(start, end)}
-              >
-                保存覆盖时间
-              </button>
+                    onClick={() => onSaveCoverage(start, end)}
+                  >
+                    保存覆盖时间
+                  </button>
+                </>
+              )}
             </>
           )}
         </div>

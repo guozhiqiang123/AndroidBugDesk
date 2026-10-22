@@ -73,6 +73,55 @@ pub struct LogWindowCapture {
     pub summary_path: std::path::PathBuf,
 }
 
+/// Populate a generated log attachment from the timestamps actually present in
+/// that immutable file. These bounds describe the stored records themselves;
+/// they do not claim that Android emitted every record between the two times.
+pub fn apply_recorded_log_coverage(attachment: &mut Attachment) -> Result<bool> {
+    use chrono::DateTime;
+    use std::io::BufRead;
+
+    if attachment.role != "log" || attachment.mime != "text/plain" {
+        return Err("只能从文本日志中自动读取覆盖时间".into());
+    }
+    verify_attachment(attachment)?;
+    let mut reader =
+        std::io::BufReader::new(File::open(&attachment.path).map_err(|_| "日志附件无法读取")?);
+    let (mut first, mut last) = (None::<i64>, None::<i64>);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let count = reader
+            .by_ref()
+            .take(1_048_577)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        if count > 1_048_576 {
+            return Err("单条日志超过 1 MiB，无法安全读取时间边界".into());
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        if let Some(at) = epoch_micros(text) {
+            first = Some(first.map_or(at, |value| value.min(at)));
+            last = Some(last.map_or(at, |value| value.max(at)));
+        }
+    }
+    verify_attachment(attachment)?;
+    let Some((first, last)) = first.zip(last) else {
+        return Ok(false);
+    };
+    attachment.coverage_start = DateTime::from_timestamp_micros(first)
+        .ok_or("日志起点超出支持范围")?
+        .to_rfc3339();
+    attachment.coverage_end = DateTime::from_timestamp_micros(last)
+        .ok_or("日志终点超出支持范围")?
+        .to_rfc3339();
+    Ok(true)
+}
+
 /// Summarize immutable pinned logs, not the collector's changing files. Times in output are
 /// host times after applying an explicitly supplied clock estimate; unknown clocks block coverage.
 /// range_covered describes observed timestamp bounds, not proof that every device log was emitted.
@@ -1064,6 +1113,29 @@ mod gap_tests {
         ] {
             assert!(epoch_micros(text).is_none());
         }
+    }
+
+    #[test]
+    fn generated_log_coverage_uses_actual_first_and_last_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut attachment = log(
+            temp.path(),
+            "generated.log",
+            &[
+                "--------- beginning of main\n".into(),
+                line(END, 0, "last record"),
+                line(MARK, 0, "first record"),
+            ]
+            .concat(),
+        );
+        assert!(apply_recorded_log_coverage(&mut attachment).unwrap());
+        assert_eq!(attachment.coverage_start, "2026-10-09T04:00:00+00:00");
+        assert_eq!(attachment.coverage_end, "2026-10-09T04:00:30+00:00");
+
+        let mut unknown = log(temp.path(), "unknown.log", "no timestamp here\n");
+        assert!(!apply_recorded_log_coverage(&mut unknown).unwrap());
+        assert!(unknown.coverage_start.is_empty());
+        assert!(unknown.coverage_end.is_empty());
     }
 
     #[test]

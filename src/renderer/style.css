@@ -1528,6 +1528,35 @@ fieldset {
   color: #8692a6;
   margin: 10px 0;
 }
+.automatic-log-coverage {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 22px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid #d9e6f7;
+  border-radius: 8px;
+  background: #f6f9fd;
+}
+.automatic-log-coverage > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.automatic-log-coverage span {
+  color: #5e6f86;
+  font-size: 11px;
+}
+.automatic-log-coverage time {
+  color: #273b58;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.attachment .automatic-log-coverage small {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #397157;
+}
 .attachment img,
 .attachment video {
   width: 150px;

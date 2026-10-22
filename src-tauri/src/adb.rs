@@ -873,7 +873,7 @@ async fn start_locally_filtered_logs(
     let existing_crashes = output(
         &path,
         Some(&serial),
-        &["logcat", "-d", "-v", "threadtime", "-b", "crash"],
+        &["logcat", "-d", "-v", "epoch", "-b", "crash"],
         20,
     )
     .await?;
@@ -913,15 +913,7 @@ async fn start_locally_filtered_logs(
         .map_err(|_| "无法启动旧系统应用日志流")?;
     let mut crash_child = command(&path)
         .args([
-            "-s",
-            &serial,
-            "logcat",
-            "-v",
-            "threadtime",
-            "-b",
-            "crash",
-            "-T",
-            "1",
+            "-s", &serial, "logcat", "-v", "epoch", "-b", "crash", "-T", "1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1095,7 +1087,7 @@ pub async fn start_logs(
     let crash_initial_result = output(
         &path,
         Some(&serial),
-        &["logcat", "-d", "-v", "threadtime", "-b", "crash"],
+        &["logcat", "-d", "-v", "epoch", "-b", "crash"],
         20,
     )
     .await;
@@ -1146,15 +1138,7 @@ pub async fn start_logs(
     let mut stdout = child.stdout.take().unwrap();
     let mut crash_child = command(&path)
         .args([
-            "-s",
-            &serial,
-            "logcat",
-            "-v",
-            "threadtime",
-            "-b",
-            "crash",
-            "-T",
-            "1",
+            "-s", &serial, "logcat", "-v", "epoch", "-b", "crash", "-T", "1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

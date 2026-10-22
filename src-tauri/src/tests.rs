@@ -2170,10 +2170,19 @@ async fn integrated_tauri_auto_window_redaction_and_all_media_submit() {
     assert!(task["summary"]["selectedRecords"].as_u64().unwrap() > 0);
     // Initial-buffer continuity is uncertain; elapsed time alone must not claim complete coverage.
     assert_eq!(task["summary"]["rangeCovered"], false);
-    assert_eq!(
-        store.draft(&id).unwrap()["title"],
-        "计时期间的人工补充不能丢失"
-    );
+    let completed = store.draft(&id).unwrap();
+    let generated_logs = attachments(&completed)
+        .unwrap()
+        .into_iter()
+        .filter(|attachment| attachment.source.starts_with("ADB 原始日志固定副本"))
+        .collect::<Vec<_>>();
+    assert!(!generated_logs.is_empty());
+    assert!(generated_logs.iter().all(|attachment| {
+        !attachment.coverage_start.is_empty()
+            && !attachment.coverage_end.is_empty()
+            && attachment.source.contains("自动填写覆盖时间")
+    }));
+    assert_eq!(completed["title"], "计时期间的人工补充不能丢失");
     let wid = string(&task, "windowAttachmentId");
     let original = attachments(&store.draft(&id).unwrap())
         .unwrap()
