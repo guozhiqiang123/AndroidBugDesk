@@ -1,0 +1,10 @@
+interface:
+  display_name: "Android Bug Submission"
+  short_description: "Prepare Android Bug Desk drafts via MCP."
+  default_prompt: "Use $android-bug-submission to prepare this Android bug and its evidence in Android Bug Desk."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "android-bug-desk"
+      description: "Local Android Bug Desk draft and evidence tools"
+      transport: "stdio"

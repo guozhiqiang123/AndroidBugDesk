@@ -7,6 +7,7 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   draftSchema,
   type Draft,
@@ -51,7 +52,7 @@ import {
   supportedFormats,
 } from "../shared/validation";
 import { excludedField } from "../shared/submission-fields";
-import { enqueueSelectionWrite, tabForAuth } from "./session";
+import { enqueueSelectionWrite, tabForAuth, type AppTab } from "./session";
 import {
   applySelectionMemory,
   defaultUnchecked,
@@ -93,6 +94,7 @@ import {
   projectsWithEnabledFirst,
 } from "./project-settings";
 import { ShortcutBadge } from "./shortcut-badge";
+import { AiAccessView } from "./ai-access-view";
 
 interface CaptureStatus {
   id: string;
@@ -232,7 +234,7 @@ function recordRendererEvent(
 function App() {
   const [boot, setBoot] = useState<Bootstrap | null>(initialWorkspace),
     [draft, setDraft] = useState<Draft | null>(null);
-  const [tab, setTab] = useState("auth"),
+  const [tab, setTab] = useState<AppTab>("auth"),
     [busy, setBusy] = useState(""),
     [error, setError] = useState("");
   const { notice, setNotice } = useTransientNotice();
@@ -288,6 +290,7 @@ function App() {
     useState<HTMLElement | null>(null);
   const [submitReviewDockHeight, setSubmitReviewDockHeight] = useState(0);
   const activeDraftRef = useRef<Draft | null>(null);
+  const dirtyRef = useRef(false);
   const memoryWrite = useRef<Promise<unknown>>(Promise.resolve());
   const busyGate = useRef(false);
   const workspaceEpoch = useRef(0);
@@ -323,6 +326,58 @@ function App() {
   useEffect(() => {
     activeDraftRef.current = draft;
   }, [draft]);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void listen<{ draftId: string; revision: string; reason: string }>(
+      "agent-draft-updated",
+      (event) => {
+        if (!active) return;
+        const current = activeDraftRef.current;
+        if (current?.id === event.payload.draftId && dirtyRef.current) {
+          setNotice(
+            "AI 已更新当前草稿；请先保存或放弃本地未保存内容，再重新读取草稿。",
+            "warning",
+          );
+          return;
+        }
+        void invoke<Bootstrap>("bootstrap")
+          .then((next) => {
+            if (!active) return;
+            setBoot(next);
+            const stored = next.drafts.find(
+              (item) => item.id === event.payload.draftId,
+            );
+            if (!stored) return;
+            const latest = activeDraftRef.current;
+            if (
+              !latest ||
+              latest.id === stored.id ||
+              event.payload.reason === "created"
+            ) {
+              setDraft(stored);
+              setDirty(false);
+              setPreview(false);
+              setNotice("AI 已更新本机草稿，请核对后继续。", "success");
+            }
+          })
+          .catch((failure) =>
+            setError(`读取 AI 更新后的草稿失败：${String(failure)}`),
+          );
+      },
+    ).then((dispose) => {
+      if (active) unlisten = dispose;
+      else dispose();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
   useEffect(() => {
     const dock = submitReviewDockElement;
     if (tab !== "new" || !dock) {
@@ -581,7 +636,11 @@ function App() {
   };
   const setDebugEnabled = async (debugEnabled: boolean) => {
     const options = await invoke<DeveloperOptions>("set_developer_options", {
-      options: { debugEnabled },
+      options: {
+        ...boot?.developerOptions,
+        debugEnabled,
+        agentAccessEnabled: boot?.developerOptions.agentAccessEnabled ?? false,
+      },
     });
     setBoot((current) =>
       current ? { ...current, developerOptions: options } : current,
@@ -590,6 +649,23 @@ function App() {
       debugEnabled
         ? "调试已开启，后续操作会写入受限轮转日志。"
         : "调试已关闭，已停止写入详细运行日志。",
+    );
+  };
+  const setAgentAccessEnabled = async (agentAccessEnabled: boolean) => {
+    const options = await invoke<DeveloperOptions>("set_developer_options", {
+      options: {
+        ...boot?.developerOptions,
+        debugEnabled: boot?.developerOptions.debugEnabled ?? false,
+        agentAccessEnabled,
+      },
+    });
+    setBoot((current) =>
+      current ? { ...current, developerOptions: options } : current,
+    );
+    setNotice(
+      agentAccessEnabled
+        ? "本机 AI 接入已开启；客户端关闭后本次连接令牌自动失效。"
+        : "本机 AI 接入已关闭。",
     );
   };
   useEffect(() => {
@@ -2208,12 +2284,15 @@ function App() {
             </div>
           </div>
           <nav>
-            {[
-              ["new", "新建提交"],
-              ["bugs", "项目 Bug"],
-              ["history", "历史提交"],
-              ["settings", "设置"],
-            ].map(([id, title]) => (
+            {(
+              [
+                ["new", "新建提交"],
+                ["bugs", "项目 Bug"],
+                ["history", "历史提交"],
+                ["ai", "接入 AI"],
+                ["settings", "设置"],
+              ] satisfies [AppTab, string][]
+            ).map(([id, title]) => (
               <button
                 className={tab === id ? "active" : ""}
                 onClick={() => setTab(id)}
@@ -2770,32 +2849,56 @@ function App() {
                 <div>
                   <h2>开发者选项</h2>
                   <p className="muted-text">
-                    开启后记录跨平台运行阶段、耗时、ADB
-                    超时和采集进度，并在新建提交页提供“软件证据”。
+                    控制运行诊断和本机 AI 接入。AI
+                    接入只开放受限工具，最终提交仍需在客户端确认。
                   </p>
                 </div>
-                <label className="switch-control">
-                  <input
-                    type="checkbox"
-                    role="switch"
-                    aria-label="开启调试"
-                    checked={boot.developerOptions.debugEnabled}
-                    disabled={!!busy}
-                    onChange={(event) =>
-                      void run("更新开发者选项", () =>
-                        setDebugEnabled(event.target.checked),
-                      )
-                    }
-                  />
-                  <span className="switch-track" aria-hidden="true">
-                    <span className="switch-thumb" />
-                  </span>
-                  <strong>
-                    {boot.developerOptions.debugEnabled
-                      ? "调试已开启"
-                      : "开启调试"}
-                  </strong>
-                </label>
+                <div className="developer-option-switches">
+                  <label className="switch-control">
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      aria-label="开启调试"
+                      checked={boot.developerOptions.debugEnabled}
+                      disabled={!!busy}
+                      onChange={(event) =>
+                        void run("更新开发者选项", () =>
+                          setDebugEnabled(event.target.checked),
+                        )
+                      }
+                    />
+                    <span className="switch-track" aria-hidden="true">
+                      <span className="switch-thumb" />
+                    </span>
+                    <strong>
+                      {boot.developerOptions.debugEnabled
+                        ? "调试已开启"
+                        : "开启调试"}
+                    </strong>
+                  </label>
+                  <label className="switch-control">
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      aria-label="允许本机 AI 接入"
+                      checked={boot.developerOptions.agentAccessEnabled}
+                      disabled={!!busy}
+                      onChange={(event) =>
+                        void run("更新 AI 接入", () =>
+                          setAgentAccessEnabled(event.target.checked),
+                        )
+                      }
+                    />
+                    <span className="switch-track" aria-hidden="true">
+                      <span className="switch-thumb" />
+                    </span>
+                    <strong>
+                      {boot.developerOptions.agentAccessEnabled
+                        ? "AI 接入已开启"
+                        : "允许本机 AI 接入"}
+                    </strong>
+                  </label>
+                </div>
               </div>
               <p className="muted-text diagnostics-limit-note">
                 详细日志最多约 20 MB，基础日志最多约 4 MB，保留 7
@@ -2804,6 +2907,17 @@ function App() {
               </p>
             </section>
           </>
+        )}
+        {tab === "ai" && (
+          <AiAccessView
+            enabled={boot.developerOptions.agentAccessEnabled}
+            projectReady={profileConfigured(boot.profile)}
+            busy={!!busy}
+            onToggle={(enabled) =>
+              run("更新 AI 接入", () => setAgentAccessEnabled(enabled))
+            }
+            notify={setNotice}
+          />
         )}
         {tab === "new" &&
           (!mainPackageReady ? (

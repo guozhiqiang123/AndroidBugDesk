@@ -51,6 +51,17 @@ export interface ProjectSettings {
 }
 export interface DeveloperOptions {
   debugEnabled: boolean;
+  agentAccessEnabled: boolean;
+}
+export interface AiIntegrationInfo {
+  platform: string;
+  executablePath: string;
+  bundlePath: string;
+  skillPath: string;
+  mcpServerName: string;
+  mcpAddCommand: string;
+  installPrompt: string;
+  bundleVersion: string;
 }
 export interface DraftProjectScope {
   organizationId: string;
@@ -96,6 +107,8 @@ export interface WorkspaceCommands {
   save_project_settings: ProjectSettings;
   set_developer_options: DeveloperOptions;
   set_shortcut_settings: ShortcutSettings;
+  prepare_ai_integration: AiIntegrationInfo;
+  copy_ai_install_prompt: AiIntegrationInfo;
   load_selection_memory: Partial<SelectionMemory>;
   remember_selections: void;
   list_remote_history: HistoryPage;

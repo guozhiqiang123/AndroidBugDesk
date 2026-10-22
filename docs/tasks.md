@@ -555,3 +555,13 @@ Jenkins 包地址不再参与前端即时核对或 Rust 主进程提交门槛，
 - [x] 按体验反馈移除七个默认组合中的 Shift；导入附件使用 Command/Ctrl+O，继续保留 Command/Ctrl+I 给 Markdown 斜体。新增默认映射断言，8 个快捷键浏览器场景结果位于 `artifacts/shortcuts-no-shift-browser-20261015/`。
 - [x] 用户授权后，固定本机入口从首次 release 构建即使用 ad hoc 签名，约 179 秒一次完成应用、DMG、签名、架构和包内文件校验。直接覆盖 `/Applications/Android Bug Desk.app` 后，原生窗口确认按钮快捷键提示和设置页快捷键卡片均已加载；唯一安装路径进程持续运行至少 187 秒，未新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-macos-arm64-20261015/`，DMG SHA-256 为 `9d4cd98b3ab0471a463b982180bb6ce04119aae619401e8f0c53fb436c2a0573`。
 - [x] 默认组合移除 Shift 后，固定本机入口重新完成 release 编译、ad hoc 签名、ARM64、DMG 和包内文件校验，耗时约 178 秒；直接覆盖安装并启动，设置页实际显示 ⌘N、⌘E、⌘G、⌘O、⌘S、⌘D、⌘Enter，进程持续运行超过 90 秒且没有新增 DiagnosticReports。产物与安装回执位于 `artifacts/local-shortcuts-no-shift-macos-arm64-20261015/`，DMG SHA-256 为 `95e1c64426a4782732e4bd145e35c65687cd988ea6982876dd576b78943d8faa`。
+
+## 客户端内置 AI 接入引导（2026-10-22）
+
+- [x] 形成 [`ai-onboarding-plan.md`](ai-onboarding-plan.md)，确定客户端内置资源、Codex 执行安装和客户端不直接改写 Codex 配置的边界。
+- [x] 侧栏新增“接入 AI”页，展示登录、项目、接入包和 Gateway 开关状态，并提供接入后的使用步骤。
+- [x] 将 Android Bug Submission Skill、Agent 元数据、MCP 示例及说明编译进二进制，释放到固定应用数据目录并生成版本／SHA-256 清单。
+- [x] 按当前安装程序和内置 Skill 的真实路径生成可复制提示语，覆盖同名配置更新、Skill 安装、MCP 登记、会话重开、`workspace_status` 验证和凭据保护。
+- [x] Rust 拒绝符号链接和不可安全表达的资源路径；Linux AppImage 优先使用持久安装路径，macOS、Windows 和 Linux 包使用真实当前可执行文件。
+- [x] 通过 131 项前端测试、219 项 Rust 测试（3 项外部环境测试按设计忽略）、TypeScript、生产构建、Rust 格式、严格 Clippy 和 56 个完整 React/mock IPC 场景。结果位于 `artifacts/ai-onboarding-20261022/browser/`。
+- [x] 使用固定本机流程构建、签名并校验 macOS ARM64 应用和 DMG，覆盖安装到 `/Applications/Android Bug Desk.app`。原生窗口确认“接入 AI”、真实安装路径、内置 Skill 状态和复制成功提示；安装后没有新增崩溃报告。产物和回执位于 `artifacts/local-ai-onboarding-macos-arm64-20261022/`，DMG SHA-256 为 `6aecc4a03c650c9735ea1d57207acfc2453ae0ae4a711ddd7c00b72534f4929f`。

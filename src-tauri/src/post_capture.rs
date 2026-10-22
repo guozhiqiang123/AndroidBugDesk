@@ -2,7 +2,7 @@
 use crate::{adb, commands::AppState, evidence, model::*, workspace};
 use serde_json::{json, Value};
 use std::{collections::HashSet, io::Write, path::Path, sync::atomic::Ordering};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[cfg(test)]
 #[path = "post_capture_tests.rs"]
@@ -202,7 +202,19 @@ pub async fn start_post_capture(
     items: Vec<String>,
     retry_of: Option<String>,
 ) -> Result<Value> {
-    let job = prepare(&state, &id, &serial, items, retry_of).await?;
+    start_for_state(app, &state, id, serial, items, retry_of, false).await
+}
+
+pub(crate) async fn start_for_state<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: &AppState,
+    id: String,
+    serial: String,
+    items: Vec<String>,
+    retry_of: Option<String>,
+    notify_agent_update: bool,
+) -> Result<Value> {
+    let job = prepare(state, &id, &serial, items, retry_of).await?;
     let job_id = string(&job, "id");
     tauri::async_runtime::spawn(async move {
         let worker_app = app.clone();
@@ -220,12 +232,29 @@ pub async fn start_post_capture(
             let state = app.state::<AppState>();
             let _ = interrupted(&state, &job_id, &error);
         }
+        if notify_agent_update {
+            let state = app.state::<AppState>();
+            if let Ok(draft) = state.store.draft(&id) {
+                let _ = app.emit(
+                    "agent-draft-updated",
+                    json!({
+                        "draftId":id,
+                        "revision":string(&draft, "updatedAt"),
+                        "reason":"capture-finished"
+                    }),
+                );
+            }
+        }
     });
     Ok(job)
 }
 #[tauri::command]
 pub async fn post_capture_status(state: State<'_, AppState>, id: String) -> Result<Value> {
-    let current_scope = scope(&state, &id)?;
+    status_for_state(&state, &id)
+}
+
+pub(crate) fn status_for_state(state: &AppState, id: &str) -> Result<Value> {
+    let current_scope = scope(state, id)?;
     let mut seen_items = HashSet::new();
     let jobs: Vec<Value> = state
         .store
@@ -243,7 +272,7 @@ pub async fn post_capture_status(state: State<'_, AppState>, id: String) -> Resu
             contributes || string(job, "status") == "pending"
         })
         .collect();
-    Ok(json!({"draft":state.store.draft(&id)?,"jobs":jobs}))
+    Ok(json!({"draft":state.store.draft(id)?,"jobs":jobs}))
 }
 fn interrupted(state: &AppState, job_id: &str, error: &str) -> Result<()> {
     let _write = state.store.writes.lock().unwrap();

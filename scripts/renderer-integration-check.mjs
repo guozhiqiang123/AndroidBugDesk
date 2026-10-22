@@ -145,7 +145,22 @@ checks: try {
             },
           ],
         },
-        developerOptions: { debugEnabled: false },
+        developerOptions: { debugEnabled: false, agentAccessEnabled: false },
+        aiIntegrationInfo: {
+          platform: "macos",
+          executablePath:
+            "/Applications/Android Bug Desk.app/Contents/MacOS/android-bug-desk",
+          bundlePath:
+            "/Users/mock/Library/Application Support/com.qa.androidbugdesk/ai-integration/codex",
+          skillPath:
+            "/Users/mock/Library/Application Support/com.qa.androidbugdesk/ai-integration/codex/skills/android-bug-submission",
+          mcpServerName: "android-bug-desk",
+          mcpAddCommand:
+            "codex mcp add android-bug-desk -- '/Applications/Android Bug Desk.app/Contents/MacOS/android-bug-desk' --mcp-bridge",
+          installPrompt:
+            "请安装内置 Skill android-bug-submission，并登记 android-bug-desk MCP；连接后调用 workspace_status 验证。不要读取、复制、打印任何云效 PAT。",
+          bundleVersion: "0.3.7",
+        },
         shortcutSettings: { version: 1, overrides: {} },
         settingsByOrg: {
           "test-org": {
@@ -225,6 +240,8 @@ checks: try {
         unregisterCallback,
         invoke: async (cmd, args = {}) => {
           q.calls.push({ cmd, args: clone(args) });
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return;
           if (cmd === "bootstrap")
             return clone({
               ...q,
@@ -237,6 +254,11 @@ checks: try {
             q.developerOptions = clone(args.options);
             return clone(q.developerOptions);
           }
+          if (
+            cmd === "prepare_ai_integration" ||
+            cmd === "copy_ai_install_prompt"
+          )
+            return clone(q.aiIntegrationInfo);
           if (cmd === "set_shortcut_settings") {
             q.shortcutSettings = clone(args.settings);
             return clone(q.shortcutSettings);
@@ -3030,6 +3052,16 @@ checks: try {
     await page.evaluate(() => window.__qa.developerOptions.debugEnabled),
     true,
   );
+  const agentAccessSwitch = page.getByRole("switch", {
+    name: "允许本机 AI 接入",
+    exact: true,
+  });
+  assert.equal(await agentAccessSwitch.isChecked(), false);
+  await agentAccessSwitch.check();
+  assert.equal(
+    await page.evaluate(() => window.__qa.developerOptions.agentAccessEnabled),
+    true,
+  );
   await updateCard
     .getByRole("button", { name: "打开 Release 页面", exact: true })
     .click();
@@ -3436,6 +3468,50 @@ checks: try {
       .isDisabled(),
     false,
   );
+  await page.locator("nav button").filter({ hasText: "接入 AI" }).click();
+  await page.getByRole("heading", { name: "接入 AI", exact: true }).waitFor();
+  await page.getByText("内置接入包已就绪", { exact: true }).waitFor();
+  assert.match(
+    await page.getByLabel("Codex 安装提示语").innerText(),
+    /android-bug-submission.*workspace_status/s,
+  );
+  assert.match(
+    await page.locator(".ai-integration-paths").innerText(),
+    /Android Bug Desk\.app.*android-bug-submission.*android-bug-desk/s,
+  );
+  await page.locator(".ai-access-page").screenshot({
+    path: path.join(output, "ai-access.png"),
+  });
+  await page.getByRole("button", { name: "复制给 Codex", exact: true }).click();
+  await page
+    .getByText("已复制安装提示语，请直接粘贴到 Codex。", {
+      exact: true,
+    })
+    .waitFor();
+  assert.equal(
+    await page.evaluate(
+      () =>
+        window.__qa.calls.filter(
+          (call) => call.cmd === "copy_ai_install_prompt",
+        ).length,
+    ),
+    1,
+  );
+  const aiSwitch = page.getByRole("switch", {
+    name: "允许本机 AI 接入",
+    exact: true,
+  });
+  assert.equal(await aiSwitch.isChecked(), true);
+  await aiSwitch.uncheck();
+  assert.equal(
+    await page.evaluate(() => window.__qa.developerOptions.agentAccessEnabled),
+    false,
+  );
+  await aiSwitch.check();
+  assert.equal(
+    await page.evaluate(() => window.__qa.developerOptions.agentAccessEnabled),
+    true,
+  );
   await page.evaluate(() => {
     window.__qa.authFailure = true;
   });
@@ -3497,6 +3573,7 @@ checks: try {
           "settings page owns organization and logout controls",
           "settings update card checks the GitHub Release list only on demand and opens the fixed release page",
           "developer diagnostics persist a custom switch and expose one software-evidence action with explicit disk limits",
+          "AI access tab exposes the embedded Skill prompt and installation paths, copies through native IPC, and shares the gateway switch",
           "project settings save filters homepage projects",
           "all projects disabled shows recovery banner",
           "failed settings save preserves edited values and applied state",

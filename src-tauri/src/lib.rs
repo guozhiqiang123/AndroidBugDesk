@@ -1,4 +1,8 @@
 pub mod adb;
+pub mod agent_gateway;
+pub mod agent_mcp;
+pub mod agent_service;
+pub mod ai_onboarding;
 pub mod capture;
 pub mod commands;
 pub mod crash_evidence;
@@ -41,6 +45,8 @@ pub fn run() {
             commands::bootstrap,
             commands::set_developer_options,
             commands::set_shortcut_settings,
+            ai_onboarding::prepare_ai_integration,
+            ai_onboarding::copy_ai_install_prompt,
             commands::record_renderer_event,
             commands::check_auth,
             commands::login,
@@ -106,6 +112,7 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 use tauri::Manager;
+                app.state::<agent_gateway::AgentGateway>().stop();
                 let state = app.state::<commands::AppState>();
                 if let Some(c) = state.collector.lock().unwrap().as_ref() {
                     let _ = c.stop.send(true);

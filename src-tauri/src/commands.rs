@@ -162,13 +162,35 @@ pub fn bootstrap(state: State<AppState>) -> Result<Value> {
     )
 }
 #[tauri::command]
-pub fn set_developer_options(
+pub async fn set_developer_options(
     options: DeveloperOptions,
-    state: State<AppState>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    gateway: State<'_, crate::agent_gateway::AgentGateway>,
 ) -> Result<DeveloperOptions> {
-    state.store.put("settings", "developer_options", &options)?;
-    crate::diagnostics::set_debug_enabled(options.debug_enabled);
+    let previous = state
+        .store
+        .get::<DeveloperOptions>("settings", "developer_options")?
+        .unwrap_or_default();
+    persist_developer_options(&options, &state)?;
+    if options.agent_access_enabled {
+        if let Err(error) = gateway.start(app).await {
+            persist_developer_options(&previous, &state)?;
+            return Err(error);
+        }
+    } else {
+        gateway.stop();
+    }
     Ok(options)
+}
+
+pub(crate) fn persist_developer_options(
+    options: &DeveloperOptions,
+    state: &AppState,
+) -> Result<()> {
+    state.store.put("settings", "developer_options", options)?;
+    crate::diagnostics::set_debug_enabled(options.debug_enabled);
+    Ok(())
 }
 
 #[tauri::command]
@@ -495,23 +517,52 @@ pub async fn import_profile(state: State<'_, AppState>) -> Result<Profile> {
 }
 #[tauri::command]
 pub fn new_draft(state: State<AppState>) -> Result<Value> {
-    let scope = crate::workspace::current_scope(&state, "")?;
+    new_draft_for_state(&state)
+}
+
+pub(crate) fn new_draft_for_state(state: &AppState) -> Result<Value> {
+    let scope = crate::workspace::current_scope(state, "")?;
     let mut d: Value =
         serde_json::from_str(include_str!("../../schemas/empty-draft.json")).unwrap();
     d["id"] = json!(uuid());
     d["createdAt"] = json!(now());
     d["updatedAt"] = json!(now());
-    crate::project_settings::apply_current_package(&state, &mut d)?;
+    crate::project_settings::apply_current_package(state, &mut d)?;
     state.store.put("draft", &string(&d, "id"), &d)?;
     state.store.put("draft_scope", &string(&d, "id"), &scope)?;
     Ok(d)
 }
 #[tauri::command]
-pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
+pub fn save_draft(draft: Value, state: State<AppState>) -> Result<Value> {
+    save_draft_for_state(draft, &state)
+}
+
+pub(crate) fn save_draft_for_state(draft: Value, state: &AppState) -> Result<Value> {
     let _write = state.store.writes.lock().unwrap();
+    save_draft_locked(draft, state)
+}
+
+pub(crate) fn save_draft_if_revision(
+    draft: Value,
+    expected_revision: &str,
+    state: &AppState,
+) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
+    let id = string(&draft, "id");
+    let current = state.store.draft(&id)?;
+    let latest = string(&current, "updatedAt");
+    if latest != expected_revision {
+        return Err(format!(
+            "草稿已被其他操作更新，请重新读取后再修改；latestRevision={latest}"
+        ));
+    }
+    save_draft_locked(draft, state)
+}
+
+fn save_draft_locked(mut draft: Value, state: &AppState) -> Result<Value> {
     let incoming_page = string(&draft, "bugPage");
     let incoming_page_source = draft["sources"]["bugPage"].clone();
-    crate::project_settings::apply_current_package(&state, &mut draft)?;
+    crate::project_settings::apply_current_package(state, &mut draft)?;
     let id = string(&draft, "id");
     state.editable(&id)?;
     let old = state.store.draft(&id)?;
@@ -579,7 +630,7 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
     }
     // Protected sources were restored from storage above, so stamp the
     // authoritative mapping again immediately before persistence.
-    crate::project_settings::apply_current_package(&state, &mut draft)?;
+    crate::project_settings::apply_current_package(state, &mut draft)?;
     draft["updatedAt"] = json!(now());
     state.assert_no_token(&draft)?;
     state.store.put("draft", &id, &draft)?;
@@ -588,7 +639,11 @@ pub fn save_draft(mut draft: Value, state: State<AppState>) -> Result<Value> {
 }
 #[tauri::command]
 pub fn validate_draft(id: String, state: State<AppState>) -> Result<Vec<Issue>> {
-    let d = state.store.draft(&id)?;
+    validate_draft_for_state(&id, &state)
+}
+
+pub(crate) fn validate_draft_for_state(id: &str, state: &AppState) -> Result<Vec<Issue>> {
+    let d = state.store.draft(id)?;
     Ok(validation::validate(
         &d,
         &state.profile.lock().unwrap(),
@@ -1043,9 +1098,36 @@ pub(crate) fn import_attachment_paths(
     paths: &[PathBuf],
 ) -> Result<Value> {
     let _write = state.store.writes.lock().unwrap();
+    import_attachment_paths_locked(state, id, paths, None)
+}
+
+pub(crate) fn import_attachment_paths_if_revision(
+    state: &AppState,
+    id: &str,
+    paths: &[PathBuf],
+    expected_revision: &str,
+) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
+    import_attachment_paths_locked(state, id, paths, Some(expected_revision))
+}
+
+fn import_attachment_paths_locked(
+    state: &AppState,
+    id: &str,
+    paths: &[PathBuf],
+    expected_revision: Option<&str>,
+) -> Result<Value> {
     state.editable(id)?;
     check_attachment_scope(state, id)?;
     let mut d = state.store.draft(id)?;
+    if let Some(expected) = expected_revision {
+        let latest = string(&d, "updatedAt");
+        if latest != expected {
+            return Err(format!(
+                "草稿已被其他操作更新，请重新读取后再修改；latestRevision={latest}"
+            ));
+        }
+    }
     for path in paths {
         let a = evidence::inspect_import(path, &state.store.root).map_err(|error| {
             format!(
@@ -1059,6 +1141,7 @@ pub(crate) fn import_attachment_paths(
             .push(serde_json::to_value(a).unwrap());
     }
     d["previewConfirmed"] = json!(false);
+    d["updatedAt"] = json!(now());
     state.store.put("draft", id, &d)?;
     Ok(d)
 }
@@ -1265,9 +1348,44 @@ pub fn remove_attachment(
     attachment_id: String,
     state: State<AppState>,
 ) -> Result<Value> {
+    remove_attachment_for_state(&id, &attachment_id, &state)
+}
+
+pub(crate) fn remove_attachment_for_state(
+    id: &str,
+    attachment_id: &str,
+    state: &AppState,
+) -> Result<Value> {
     let _write = state.store.writes.lock().unwrap();
-    state.editable(&id)?;
-    let mut d = state.store.draft(&id)?;
+    remove_attachment_locked(id, attachment_id, None, state)
+}
+
+pub(crate) fn remove_attachment_if_revision(
+    id: &str,
+    attachment_id: &str,
+    expected_revision: &str,
+    state: &AppState,
+) -> Result<Value> {
+    let _write = state.store.writes.lock().unwrap();
+    remove_attachment_locked(id, attachment_id, Some(expected_revision), state)
+}
+
+fn remove_attachment_locked(
+    id: &str,
+    attachment_id: &str,
+    expected_revision: Option<&str>,
+    state: &AppState,
+) -> Result<Value> {
+    state.editable(id)?;
+    let mut d = state.store.draft(id)?;
+    if let Some(expected) = expected_revision {
+        let latest = string(&d, "updatedAt");
+        if latest != expected {
+            return Err(format!(
+                "草稿已被其他操作更新，请重新读取后再修改；latestRevision={latest}"
+            ));
+        }
+    }
     let files = attachments(&d)?;
     let target = files
         .iter()
@@ -1285,7 +1403,7 @@ pub fn remove_attachment(
         .iter()
         .filter(|a| {
             a.id == attachment_id
-                || (a.role == "report" && a.derived_from.as_deref() == Some(&attachment_id))
+                || (a.role == "report" && a.derived_from.as_deref() == Some(attachment_id))
         })
         .cloned()
         .collect();
@@ -1294,8 +1412,9 @@ pub fn remove_attachment(
             && !(string(a, "role") == "report" && string(a, "derivedFrom") == attachment_id)
     });
     d["previewConfirmed"] = json!(false);
-    state.store.put("draft", &id, &d)?;
-    crate::software_diagnostics::cleanup_removed(&state.store, &id, &removed)?;
+    d["updatedAt"] = json!(now());
+    state.store.put("draft", id, &d)?;
+    crate::software_diagnostics::cleanup_removed(&state.store, id, &removed)?;
     Ok(d)
 }
 #[tauri::command]
@@ -1450,8 +1569,23 @@ pub fn open_receipt(id: String, state: State<AppState>) -> Result<()> {
 pub fn setup(app: &mut tauri::App) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let root = app.path().app_local_data_dir()?;
     crate::diagnostics::init(&root)?;
-    let state = AppState::new(root).map_err(std::io::Error::other)?;
+    let state = AppState::new(root.clone()).map_err(std::io::Error::other)?;
+    let agent_enabled = state
+        .store
+        .get::<DeveloperOptions>("settings", "developer_options")?
+        .unwrap_or_default()
+        .agent_access_enabled;
     app.manage(state);
+    app.manage(crate::agent_gateway::AgentGateway::new(root));
+    if agent_enabled {
+        let handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let gateway = handle.state::<crate::agent_gateway::AgentGateway>();
+            if let Err(error) = gateway.start(handle.clone()).await {
+                crate::diagnostics::event("agent_gateway", &format!("startup failed: {error}"));
+            }
+        });
+    }
     crate::diagnostics::start_main_thread_watchdog(app.handle().clone());
     Ok(())
 }

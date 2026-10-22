@@ -167,10 +167,15 @@ try {
         updatedAt: "2026-10-10",
       });
       window.isTauri = true;
+      let nextCallbackId = 1;
       window.__TAURI_INTERNALS__ = {
         convertFileSrc: () => "",
+        transformCallback: () => nextCallbackId++,
+        unregisterCallback: () => {},
         invoke: async (cmd, args = {}) => {
           q.calls.push({ cmd, args: clone(args) });
+          if (cmd === "plugin:event|listen") return 1;
+          if (cmd === "plugin:event|unlisten") return;
           if (cmd === "bootstrap")
             return clone({
               profile: q.profile,
@@ -179,7 +184,7 @@ try {
               authorized: q.authorized,
               rememberLogin: q.rememberLogin,
               adbPath: null,
-              developerOptions: { debugEnabled: false },
+              developerOptions: { debugEnabled: false, agentAccessEnabled: false },
               shortcutSettings: { version: 1, overrides: {} },
               drafts: q.drafts,
               draftScopes: q.draftScopes,

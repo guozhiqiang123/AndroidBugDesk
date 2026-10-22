@@ -52,14 +52,13 @@ fn developer_options_are_persisted_outside_login_state() {
         .manage(state)
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    let saved = crate::commands::set_developer_options(
-        DeveloperOptions {
-            debug_enabled: true,
-        },
-        app.state(),
-    )
-    .unwrap();
+    let saved = DeveloperOptions {
+        debug_enabled: true,
+        agent_access_enabled: false,
+    };
+    crate::commands::persist_developer_options(&saved, &app.state()).unwrap();
     assert!(saved.debug_enabled);
+    assert!(!saved.agent_access_enabled);
     let stored: DeveloperOptions = app
         .state::<crate::commands::AppState>()
         .store
@@ -67,6 +66,7 @@ fn developer_options_are_persisted_outside_login_state() {
         .unwrap()
         .unwrap();
     assert!(stored.debug_enabled);
+    assert!(!stored.agent_access_enabled);
     assert_eq!(
         crate::commands::bootstrap(app.state()).unwrap()["developerOptions"]["debugEnabled"],
         true

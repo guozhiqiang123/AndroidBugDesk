@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "android-bug-desk": {
+      "command": "/absolute/path/to/android-bug-desk",
+      "args": ["--mcp-bridge"]
+    }
+  }
+}

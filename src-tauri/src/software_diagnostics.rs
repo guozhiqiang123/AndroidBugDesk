@@ -661,6 +661,7 @@ mod tests {
                 "developer_options",
                 &DeveloperOptions {
                     debug_enabled: true,
+                    agent_access_enabled: false,
                 },
             )
             .unwrap();

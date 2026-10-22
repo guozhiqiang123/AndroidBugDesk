@@ -726,3 +726,13 @@ DMG：`artifacts/local-dialog-refresh-macos-arm64-20261010/Android Bug Desk_0.1.
 补传和创建结果核对会保存部分提交记录。此前这两条链路会把授权过期写入记录后按成功结果返回，界面只显示“授权失效”而不会退出。本次在提交命令边界检查已落盘结果：保留草稿、证据包和部分提交记录，同时把授权失效重新返回给统一登录处理；设备“尚未授权”不参与云效退出判断。
 
 验证通过：198 项前端测试、186 项 Rust 测试（3 项外部环境测试按设计忽略）、TypeScript、生产构建、Rust 格式、严格 Clippy、Prettier、差异检查和 55 个完整 React/mock IPC 场景。新增 Rust 回归覆盖“先因 403 保持部分提交，再在补传时收到 401”的真实状态转换，确认授权和元数据被清空、提交锁释放、部分提交及证据包保留。
+
+## 客户端内置 AI 接入引导验收（2026-10-22）
+
+- 登录后侧栏显示独立“接入 AI”页；离开新建提交页后不会显示主页标题、草稿控件或底部核对卡片。
+- 页面显示客户端登录、当前项目、内置接入包和本机 Gateway 状态；AI 开关与设置页使用同一持久配置。
+- 当前版本的 `android-bug-submission` Skill、`agents/openai.yaml`、MCP 示例和 README 均由二进制内置并释放到应用本地数据目录，不依赖源码仓库。
+- 页面展示当前系统真实可执行文件和 Skill 路径；复制提示语通过 Rust 系统剪贴板完成，Codex 可据此安装／更新 Skill、去重登记 MCP 并调用 `workspace_status` 验证。
+- 提示语明确禁止读取或输出云效凭据、应用数据库和附件内部路径，且不允许绕过客户端直接提交；最终云效创建继续要求用户在客户端预览弹窗确认。
+- 资源释放测试覆盖内容一致性、版本清单、提示语和符号链接拒绝；完整自动化通过 131 项前端测试、219 项 Rust 测试（3 项外部环境测试按设计忽略）、TypeScript、生产构建、Rust 格式、严格 Clippy 和 56 个实际 React/mock IPC 场景。截图和结果位于 `artifacts/ai-onboarding-20261022/browser/`。
+- 固定本机流程一次完成 macOS ARM64 release 编译、完整 ad hoc 签名、DMG、架构和包内文件校验。覆盖 `/Applications/Android Bug Desk.app` 后，账号与项目恢复成功，原生窗口显示“接入 AI”和内置接入包已就绪，复制动作出现成功提示；安装文件与构建产物一致，内置 Skill 哈希一致，运行进程来自唯一安装路径且没有新增 DiagnosticReports。产物和回执位于 `artifacts/local-ai-onboarding-macos-arm64-20261022/`，DMG SHA-256 为 `6aecc4a03c650c9735ea1d57207acfc2453ae0ae4a711ddd7c00b72534f4929f`。未访问真实云效或 USB。

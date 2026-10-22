@@ -24,7 +24,10 @@ pub fn uuid() -> String {
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeveloperOptions {
+    #[serde(default)]
     pub debug_enabled: bool,
+    #[serde(default)]
+    pub agent_access_enabled: bool,
 }
 
 pub const SHORTCUT_ACTIONS: [&str; 7] = [
